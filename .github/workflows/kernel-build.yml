@@ -325,22 +325,25 @@ jobs:
 
 
       
-      
+     
       - name: Generate SELinux headers before KernelSU
         run: |
           set -euo pipefail
 
-          # Build the kernel's actual SELinux header generator.
-          make ARCH=arm64 scripts/selinux/genheaders/genheaders \
+          # Build host-side kernel scripts, including genheaders.
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 scripts \
             2>&1 | tee selinux-genheaders-build.log
 
-          # Generate both headers using the source tree's generator.
+          # Verify the generator exists before running it.
+          test -x scripts/selinux/genheaders/genheaders
+
+          # Generate the headers expected by SELinux.
           scripts/selinux/genheaders/genheaders \
             security/selinux/flask.h \
             security/selinux/av_permissions.h \
             2>&1 | tee selinux-genheaders-run.log
 
-          # Verify that both files were created.
+          # Fail here with a clear message if generation failed.
           test -s security/selinux/flask.h
           test -s security/selinux/av_permissions.h
 
@@ -348,6 +351,8 @@ jobs:
             security/selinux/flask.h
 
           echo "SELinux headers generated successfully."
+ 
+    
 
 
 
