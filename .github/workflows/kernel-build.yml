@@ -1,0 +1,63 @@
+name: A13 KernelSU Next Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ksu-next-v3.4.1
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio curl flex \
+            git libelf-dev libncurses-dev libssl-dev \
+            lld llvm clang python3 python-is-python3 \
+            rsync dwarves
+
+      - name: Integrate KernelSU Next v3.4.1
+        run: |
+          curl -fL \
+            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.4.1/kernel/setup.sh \
+            -o /tmp/ksu-setup.sh
+          bash /tmp/ksu-setup.sh v3.4.1
+
+      - name: Configure kernel
+        run: |
+          make ARCH=arm64 exynos850-a13nsxx_defconfig
+
+          grep -q '^CONFIG_KSU=y' .config
+          grep -q '^CONFIG_KPROBES=y' .config
+          grep -q '^CONFIG_KPROBE_EVENTS=y' .config
+          grep -q '^CONFIG_EXT4_FS=y' .config
+
+          echo "KernelSU and required config options verified."
+
+      - name: Build kernel
+        run: |
+          make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            Image.gz dtbs
+
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A13-KernelSU-Next-v3.4.1
+          path: |
+            arch/arm64/boot/Image.gz
+            arch/arm64/boot/dts/
+            .config
+          if-no-files-found: error
+          retention-days: 7
