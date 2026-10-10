@@ -288,6 +288,95 @@ jobs:
           print("Mount namespace compatibility patch applied.")
           PY
 
+      
+      - name: Patch KernelSU package observer for Linux 4.19
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("drivers/kernelsu/manager/pkg_observer.c")
+
+          if not path.is_file():
+              raise SystemExit(f"Missing source file: {path}")
+
+          s = path.read_text()
+
+          # Linux 4.19 task_work_add() expects a bool notify argument.
+          if "TWA_RESUME" in s:
+              s, count = re.subn(
+                  r'\bTWA_RESUME\b',
+                  'true',
+                  s,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit("Could not patch TWA_RESUME.")
+
+          # Adapt the observer callback to the Linux 4.19 fsnotify API.
+          pattern = (
+              r'static int ksu_handle_inode_event\(.*?'
+              r'static const struct fsnotify_ops ksu_ops = '
+              r'\{.*?\};'
+          )
+
+          replacement = r'''static int ksu_handle_event(
+              struct fsnotify_group *group,
+              struct inode *inode,
+              u32 mask,
+              const void *data,
+              int data_type,
+              const unsigned char *file_name,
+              u32 cookie,
+              struct fsnotify_iter_info *iter_info)
+          {
+              if (!file_name)
+                  return 0;
+
+              if (mask & FS_ISDIR)
+                  return 0;
+
+              if (!strcmp((const char *)file_name, "packages.list")) {
+                  pr_info("packages.list detected: %u\n", mask);
+                  ksu_defer_track_throne();
+              }
+
+              return 0;
+          }
+
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_event = ksu_handle_event,
+          };'''
+
+          s, count = re.subn(
+              pattern,
+              lambda _match: replacement,
+              s,
+              count=1,
+              flags=re.S,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  "Could not safely replace the fsnotify callback."
+              )
+
+          if "TWA_RESUME" in s:
+              raise SystemExit("TWA_RESUME remains in source.")
+
+          if ".handle_inode_event" in s:
+              raise SystemExit("Modern fsnotify field remains.")
+
+          if ".handle_event = ksu_handle_event" not in s:
+              raise SystemExit("Legacy fsnotify callback not installed.")
+
+          path.write_text(s)
+          print("Linux 4.19 package observer patch applied.")
+          PY
+
+
       - name: Configure kernel
         run: |
           set -e
