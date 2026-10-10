@@ -37,7 +37,7 @@ jobs:
             -o /tmp/ksu-setup.sh
           bash /tmp/ksu-setup.sh v3.4.1
 
-      - name: Patch KernelSU Next for Linux 4.19
+      - name: Patch KernelSU Next file wrapper for Linux 4.19
         run: |
           set -e
           python3 - <<'PY'
@@ -45,7 +45,6 @@ jobs:
           import re
 
           path = Path("drivers/kernelsu/infra/file_wrapper.c")
-
           if not path.is_file():
               raise SystemExit(f"Missing source file: {path}")
 
@@ -62,7 +61,7 @@ jobs:
                   )
               s = updated
 
-          # Remove iopoll wrapper unsupported by this kernel API.
+          # Linux 4.19 file_operations has no iopoll member.
           replace_once(
               r'#if LINUX_VERSION_CODE >= '
               r'KERNEL_VERSION\(6, 1, 0\)\s+'
@@ -82,14 +81,13 @@ jobs:
               re.M,
           )
 
-          # Replace unsupported remap_file_range operations
-          # with clone_file_range and dedupe_file_range.
+          # Use clone/dedupe callbacks available in this kernel tree.
           replace_once(
               r'// no REMAP_FILE_DEDUP: use file_in.*?'
               r'(?=static int ksu_wrapper_fadvise)',
               '''static int ksu_wrapper_clone_file_range(
-                  struct file *file_in, loff_t pos_in,
-                  struct file *file_out, loff_t pos_out, u64 len)
+              struct file *file_in, loff_t pos_in,
+              struct file *file_out, loff_t pos_out, u64 len)
           {
               struct ksu_file_wrapper *data = file_in->private_data;
               struct file *orig = data->orig;
@@ -98,8 +96,8 @@ jobs:
           }
 
           static int ksu_wrapper_dedupe_file_range(
-                  struct file *file_in, loff_t pos_in,
-                  struct file *file_out, loff_t pos_out, u64 len)
+              struct file *file_in, loff_t pos_in,
+              struct file *file_out, loff_t pos_out, u64 len)
           {
               struct ksu_file_wrapper *data = file_out->private_data;
               struct file *orig = data->orig;
@@ -135,13 +133,9 @@ jobs:
               'p->ops.remap_file_range',
               'fp->f_op->remap_file_range',
           )
-
           remaining = [item for item in forbidden if item in s]
-
           if remaining:
-              raise SystemExit(
-                  f"Verification failed: {remaining}"
-              )
+              raise SystemExit(f"Verification failed: {remaining}")
 
           path.write_text(s)
           print("file_wrapper compatibility patch applied.")
@@ -154,19 +148,14 @@ jobs:
           from pathlib import Path
 
           path = Path("drivers/kernelsu/infra/seccomp_cache.c")
-
           if not path.is_file():
               raise SystemExit(f"Missing source file: {path}")
 
           source = path.read_text()
-
           if "SECCOMP_ARCH_NATIVE_NR" not in source:
-              raise SystemExit(
-                  "Expected seccomp macro use was not found."
-              )
+              raise SystemExit("Expected seccomp macro use was not found.")
 
           marker = "#include <linux/seccomp.h>"
-
           fallback = """
           #ifndef SECCOMP_ARCH_NATIVE_NR
           #define SECCOMP_ARCH_NATIVE_NR NR_syscalls
@@ -175,23 +164,133 @@ jobs:
 
           if "#ifndef SECCOMP_ARCH_NATIVE_NR" not in source:
               if marker not in source:
-                  raise SystemExit(
-                      "Could not find seccomp include."
-                  )
-
+                  raise SystemExit("Could not find seccomp include.")
               source = source.replace(
                   marker, marker + "\n" + fallback, 1
               )
-
               path.write_text(source)
 
           print("Seccomp compatibility fallback verified.")
           PY
 
+      - name: Patch mount namespace for Linux 4.19
+        run: |
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("drivers/kernelsu/infra/su_mount_ns.c")
+          if not path.is_file():
+              raise SystemExit(f"Missing source file: {path}")
+
+          s = path.read_text()
+
+          # Remove the mount UAPI header absent from this kernel tree.
+          s, count = re.subn(
+              r'(?m)^#include[ \t]*<uapi/linux/mount\.h>[ \t]*\n',
+              '',
+              s,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(
+                  "Could not remove missing mount UAPI header."
+              )
+
+          # The existing linux/fs.h supplies MS_PRIVATE and MS_REC.
+          # Add uaccess declarations for the Linux 4.19 set_fs API.
+          if "#include <linux/uaccess.h>" not in s:
+              marker = "#include <linux/syscalls.h>"
+              if marker not in s:
+                  raise SystemExit(
+                      "Could not find syscalls include marker."
+                  )
+              s = s.replace(
+                  marker, marker + "\n#include <linux/uaccess.h>", 1
+              )
+
+          # path_mount() is not available in this kernel version.
+          decl_pattern = (
+              r'extern int path_mount\s*\(\s*'
+              r'const char \*dev_name,\s*'
+              r'struct path \*path,\s*'
+              r'const char \*type_page,\s*'
+              r'unsigned long flags,\s*'
+              r'void \*data_page\s*\);'
+          )
+          s, count = re.subn(decl_pattern, '', s, count=1)
+          if count != 1:
+              raise SystemExit(
+                  "Could not remove path_mount declaration."
+              )
+
+          # Replace the individual mount namespace function with the
+          # legacy ksys_mount interface available in Linux 4.19.
+          function_pattern = (
+              r'static void ksu_mnt_ns_individual\(void\)\s*'
+              r'\{.*?\n\}'
+          )
+
+          function_replacement = '''static void ksu_mnt_ns_individual(void)
+          {
+              long ret;
+              mm_segment_t old_fs;
+              int pm_ret;
+
+              ret = ksys_unshare(CLONE_NEWNS);
+              if (ret) {
+                  pr_warn("call ksys_unshare failed: %ld\\n", ret);
+                  return;
+              }
+
+              /* Linux 4.19 mount API: make this process root private. */
+              old_fs = get_fs();
+              set_fs(KERNEL_DS);
+              pm_ret = ksys_mount(
+                  NULL, (char __user *)"/", NULL,
+                  MS_PRIVATE | MS_REC, NULL);
+              set_fs(old_fs);
+
+              if (pm_ret < 0) {
+                  pr_err("failed to make root private, err: %d\\n", pm_ret);
+              }
+          }'''
+
+          s, count = re.subn(
+              function_pattern,
+              lambda _match: function_replacement,
+              s,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit(
+                  "Could not patch mount namespace function."
+              )
+
+          forbidden = ("path_mount(", "uapi/linux/mount.h")
+          remaining = [item for item in forbidden if item in s]
+          if remaining:
+              raise SystemExit(
+                  f"Mount patch verification failed: {remaining}"
+              )
+
+          if (
+              "ksys_mount(" not in s
+              or "set_fs(KERNEL_DS)" not in s
+          ):
+              raise SystemExit(
+                  "Linux 4.19 mount API verification failed."
+              )
+
+          path.write_text(s)
+          print("Mount namespace compatibility patch applied.")
+          PY
+
       - name: Configure kernel
         run: |
           set -e
-
           make ARCH=arm64 exynos850-a13nsxx_defconfig
 
           grep -q '^CONFIG_KSU=y' .config
@@ -205,16 +304,13 @@ jobs:
         run: |
           set -e
 
-          # Confirm setup script created the expected symlink.
           test -L drivers/kernelsu
-
-          # Confirm KernelSU source and required files exist.
           test -f drivers/kernelsu/Kbuild
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/infra/file_wrapper.c
           test -f drivers/kernelsu/infra/seccomp_cache.c
+          test -f drivers/kernelsu/infra/su_mount_ns.c
 
-          # Confirm KernelSU was connected to kernel Kbuild.
           grep -Fq \
             'obj-$(CONFIG_KSU) += kernelsu/' \
             drivers/Makefile
@@ -227,14 +323,19 @@ jobs:
 
           echo "KernelSU integration verified."
 
+      - name: Preflight compile KernelSU directory
+        run: |
+          set -o pipefail
+          make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            drivers/kernelsu/ 2>&1 | tee ksu-preflight.log
+
       - name: Build kernel
         run: |
-          set -e
-
+          set -o pipefail
           make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            Image.gz dtbs
+            Image.gz dtbs 2>&1 | tee kernel-build.log
 
-      - name: Upload build artifacts
+      - name: Upload kernel artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -244,4 +345,16 @@ jobs:
             arch/arm64/boot/dts/
             .config
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A13-KSU-Build-Diagnostics
+          path: |
+            ksu-preflight.log
+            kernel-build.log
+            .config
+          if-no-files-found: warn
           retention-days: 7
