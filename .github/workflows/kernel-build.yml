@@ -179,11 +179,18 @@ jobs:
 
           echo "KernelSU and required config options verified."
 
+      
       - name: Preflight compile KernelSU objects
         run: |
+          set -e
+
+          test -f drivers/kernelsu/Kbuild
+          test -f drivers/kernelsu/infra/file_wrapper.c
+          test -f drivers/kernelsu/infra/seccomp_cache.c
+
           make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            drivers/kernelsu/infra/seccomp_cache.o \
-            drivers/kernelsu/infra/file_wrapper.o
+            drivers/kernelsu/kernelsu.o
+
 
       - name: Build kernel
         run: |
