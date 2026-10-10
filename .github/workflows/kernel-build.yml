@@ -323,6 +323,20 @@ jobs:
 
           echo "KernelSU integration verified."
 
+
+      
+      - name: Generate SELinux headers before KernelSU
+        run: |
+          set -e
+
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            security/selinux/flask.h
+
+          test -f security/selinux/flask.h
+
+          echo "SELinux flask.h generated successfully."
+
+
       - name: Preflight compile KernelSU directory
         run: |
           set -o pipefail
