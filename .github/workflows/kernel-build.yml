@@ -1,5 +1,4 @@
-
-name: A13 KernelSU Next Build
+name: A13 KernelSU-Next SUSFS 4.19 Build
 
 on:
   workflow_dispatch:
@@ -10,601 +9,243 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: a13-ksun-susfs-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    env:
+      ARCH: arm64
+      DEFCONFIG: exynos850-a13nsxx_defconfig
+      KSU_REPO: https://github.com/SuleMareVientu/KernelSU-Next.git
+      KSU_BRANCH: next-susfs-4.19
+      SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+      SUSFS_BRANCH: kernel-4.19
+      CROSS_COMPILE: aarch64-linux-gnu-
+      LLVM: "1"
+      LLVM_IAS: "1"
 
     steps:
       - name: Checkout kernel source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install build dependencies
         run: |
-          set -e
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential cpio curl flex \
-            git libelf-dev libncurses-dev libssl-dev \
-            lld llvm clang python3 python-is-python3 \
-            rsync dwarves
+            bc bison build-essential cpio curl flex git patch \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libelf-dev libncurses-dev libssl-dev python3 python-is-python3 \
+            rsync dwarves zstd lz4 zip unzip xz-utils
 
-      
-      - name: Integrate KernelSU-Next for Linux 4.19
+      - name: Install Android Clang r450784e
         run: |
           set -euo pipefail
+          CLANG_DIR="$RUNNER_TEMP/clang-r450784e"
+          mkdir -p "$CLANG_DIR"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784e.tar.gz' \
+            -o "$RUNNER_TEMP/clang-r450784e.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang-r450784e.tar.gz" -C "$CLANG_DIR"
+          test -x "$CLANG_DIR/bin/clang"
+          test -x "$CLANG_DIR/bin/ld.lld"
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "$CLANG_DIR/bin/clang" --version
+          "$CLANG_DIR/bin/ld.lld" --version
 
+      - name: Verify target kernel source
+        run: |
+          set -euo pipefail
+          test -f Makefile
+          test -f "arch/arm64/configs/$DEFCONFIG"
+          KERNEL_VERSION="$(make -s kernelversion)"
+          echo "Target kernel version: $KERNEL_VERSION"
+          if [ "$KERNEL_VERSION" != "4.19.325" ]; then
+            echo "Expected Linux 4.19.325, got $KERNEL_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Integrate Linux 4.19-compatible KernelSU-Next source
+        run: |
+          set -euo pipefail
           rm -rf KernelSU-Next
-
-          git clone \
-            --depth=1 \
-            --single-branch \
-            --branch next-susfs-4.19 \
-            https://github.com/SuleMareVientu/KernelSU-Next.git \
-            KernelSU-Next
+          git clone --single-branch --branch "$KSU_BRANCH" \
+            "$KSU_REPO" KernelSU-Next
 
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Makefile
-          test -f KernelSU-Next/kernel/selinux/rules.c
+          test -f KernelSU-Next/kernel/ksu.c
 
-          rm -f drivers/kernelsu
+          # This source tree carries the expected KernelSU-Next Manager signature.
+          grep -Fq \
+            '79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7' \
+            KernelSU-Next/kernel/Makefile || {
+              echo "Manager v3.4.1 signature hash not found in selected KernelSU source" >&2
+              exit 1
+            }
+
+          # Remove only the old integration link/directory in the working tree.
+          if [ -L drivers/kernelsu ] || [ -d drivers/kernelsu ]; then
+            rm -rf drivers/kernelsu
+          fi
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
 
-          grep -qxF 'obj-$(CONFIG_KSU) += kernelsu/' \
-            drivers/Makefile || \
-            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' \
-            >> drivers/Makefile
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
 
-          grep -q 'source "drivers/kernelsu/Kconfig"' \
-            drivers/Kconfig || \
-            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' \
-            drivers/Kconfig
-
-          echo "KernelSU-Next source commit:"
-          git -C KernelSU-Next log -1 --oneline
-
-
-      - name: Patch KernelSU Next file wrapper for Linux 4.19
-        run: |
-          set -e
-          python3 - <<'PY'
+          python3 - <<'PYKCONFIG'
           from pathlib import Path
-          import re
+          path = Path("drivers/Kconfig")
+          data = path.read_text()
+          source_line = 'source "drivers/kernelsu/Kconfig"'
+          if source_line not in data:
+              marker = "endmenu"
+              index = data.rfind(marker)
+              if index < 0:
+                  raise SystemExit("Could not find final endmenu in drivers/Kconfig")
+              data = data[:index] + source_line + "\n" + data[index:]
+              path.write_text(data)
+          PYKCONFIG
 
-          path = Path("drivers/kernelsu/infra/file_wrapper.c")
-          if not path.is_file():
-              raise SystemExit(f"Missing source file: {path}")
+          echo "KernelSU-Next branch: $KSU_BRANCH"
+          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
+          echo "KernelSU-Next commit count: $(git -C KernelSU-Next rev-list --count HEAD)"
 
-          s = path.read_text()
-
-          def replace_once(pattern, replacement, label, flags=0):
-              global s
-              updated, count = re.subn(
-                  pattern, replacement, s, count=1, flags=flags
-              )
-              if count != 1:
-                  raise SystemExit(
-                      f"Patch stopped at {label}: matches={count}"
-                  )
-              s = updated
-
-          # Linux 4.19 file_operations has no iopoll member.
-          replace_once(
-              r'#if LINUX_VERSION_CODE >= '
-              r'KERNEL_VERSION\(6, 1, 0\)\s+'
-              r'static int ksu_wrapper_iopoll\b'
-              r'.*?#endif\s*',
-              '',
-              'iopoll wrapper',
-              re.S,
-          )
-
-          replace_once(
-              r'^[ \t]*p->ops\.iopoll = '
-              r'fp->f_op->iopoll \? '
-              r'ksu_wrapper_iopoll : NULL;\n',
-              '',
-              'iopoll assignment',
-              re.M,
-          )
-
-          # Use clone/dedupe callbacks available in this kernel tree.
-          replace_once(
-              r'// no REMAP_FILE_DEDUP: use file_in.*?'
-              r'(?=static int ksu_wrapper_fadvise)',
-              '''static int ksu_wrapper_clone_file_range(
-              struct file *file_in, loff_t pos_in,
-              struct file *file_out, loff_t pos_out, u64 len)
-          {
-              struct ksu_file_wrapper *data = file_in->private_data;
-              struct file *orig = data->orig;
-              return orig->f_op->clone_file_range(
-                  orig, pos_in, file_out, pos_out, len);
-          }
-
-          static int ksu_wrapper_dedupe_file_range(
-              struct file *file_in, loff_t pos_in,
-              struct file *file_out, loff_t pos_out, u64 len)
-          {
-              struct ksu_file_wrapper *data = file_out->private_data;
-              struct file *orig = data->orig;
-              return orig->f_op->dedupe_file_range(
-                  file_in, pos_in, orig, pos_out, len);
-          }
-
-          ''',
-              'legacy file-range wrappers',
-              re.S,
-          )
-
-          replace_once(
-              r'^[ \t]*p->ops\.remap_file_range =\n'
-              r'[ \t]*fp->f_op->remap_file_range \? '
-              r'ksu_wrapper_remap_file_range : NULL;\n',
-              '''    p->ops.clone_file_range =
-                  fp->f_op->clone_file_range
-                      ? ksu_wrapper_clone_file_range : NULL;
-              p->ops.dedupe_file_range =
-                  fp->f_op->dedupe_file_range
-                      ? ksu_wrapper_dedupe_file_range : NULL;
-          ''',
-              'file-range assignments',
-              re.M,
-          )
-
-          forbidden = (
-              'ksu_wrapper_iopoll',
-              'p->ops.iopoll',
-              'fp->f_op->iopoll',
-              'ksu_wrapper_remap_file_range',
-              'p->ops.remap_file_range',
-              'fp->f_op->remap_file_range',
-          )
-          remaining = [item for item in forbidden if item in s]
-          if remaining:
-              raise SystemExit(f"Verification failed: {remaining}")
-
-          path.write_text(s)
-          print("file_wrapper compatibility patch applied.")
-          PY
-
-      - name: Patch missing ARM64 seccomp macro
-        run: |
-          set -e
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("drivers/kernelsu/infra/seccomp_cache.c")
-          if not path.is_file():
-              raise SystemExit(f"Missing source file: {path}")
-
-          source = path.read_text()
-          if "SECCOMP_ARCH_NATIVE_NR" not in source:
-              raise SystemExit("Expected seccomp macro use was not found.")
-
-          marker = "#include <linux/seccomp.h>"
-          fallback = """
-          #ifndef SECCOMP_ARCH_NATIVE_NR
-          #define SECCOMP_ARCH_NATIVE_NR NR_syscalls
-          #endif
-          """
-
-          if "#ifndef SECCOMP_ARCH_NATIVE_NR" not in source:
-              if marker not in source:
-                  raise SystemExit("Could not find seccomp include.")
-              source = source.replace(
-                  marker, marker + "\n" + fallback, 1
-              )
-              path.write_text(source)
-
-          print("Seccomp compatibility fallback verified.")
-          PY
-
-      - name: Patch mount namespace for Linux 4.19
-        run: |
-          set -e
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path("drivers/kernelsu/infra/su_mount_ns.c")
-          if not path.is_file():
-              raise SystemExit(f"Missing source file: {path}")
-
-          s = path.read_text()
-
-          # Remove the mount UAPI header absent from this kernel tree.
-          s, count = re.subn(
-              r'(?m)^#include[ \t]*<uapi/linux/mount\.h>[ \t]*\n',
-              '',
-              s,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit(
-                  "Could not remove missing mount UAPI header."
-              )
-
-          # The existing linux/fs.h supplies MS_PRIVATE and MS_REC.
-          # Add uaccess declarations for the Linux 4.19 set_fs API.
-          if "#include <linux/uaccess.h>" not in s:
-              marker = "#include <linux/syscalls.h>"
-              if marker not in s:
-                  raise SystemExit(
-                      "Could not find syscalls include marker."
-                  )
-              s = s.replace(
-                  marker, marker + "\n#include <linux/uaccess.h>", 1
-              )
-
-          # path_mount() is not available in this kernel version.
-          decl_pattern = (
-              r'extern int path_mount\s*\(\s*'
-              r'const char \*dev_name,\s*'
-              r'struct path \*path,\s*'
-              r'const char \*type_page,\s*'
-              r'unsigned long flags,\s*'
-              r'void \*data_page\s*\);'
-          )
-          s, count = re.subn(decl_pattern, '', s, count=1)
-          if count != 1:
-              raise SystemExit(
-                  "Could not remove path_mount declaration."
-              )
-
-          # Replace the individual mount namespace function with the
-          # legacy ksys_mount interface available in Linux 4.19.
-          function_pattern = (
-              r'static void ksu_mnt_ns_individual\(void\)\s*'
-              r'\{.*?\n\}'
-          )
-
-          function_replacement = '''static void ksu_mnt_ns_individual(void)
-          {
-              long ret;
-              mm_segment_t old_fs;
-              int pm_ret;
-
-              ret = ksys_unshare(CLONE_NEWNS);
-              if (ret) {
-                  pr_warn("call ksys_unshare failed: %ld\\n", ret);
-                  return;
-              }
-
-              /* Linux 4.19 mount API: make this process root private. */
-              old_fs = get_fs();
-              set_fs(KERNEL_DS);
-              pm_ret = ksys_mount(
-                  NULL, (char __user *)"/", NULL,
-                  MS_PRIVATE | MS_REC, NULL);
-              set_fs(old_fs);
-
-              if (pm_ret < 0) {
-                  pr_err("failed to make root private, err: %d\\n", pm_ret);
-              }
-          }'''
-
-          s, count = re.subn(
-              function_pattern,
-              lambda _match: function_replacement,
-              s,
-              count=1,
-              flags=re.S,
-          )
-          if count != 1:
-              raise SystemExit(
-                  "Could not patch mount namespace function."
-              )
-
-          forbidden = ("path_mount(", "uapi/linux/mount.h")
-          remaining = [item for item in forbidden if item in s]
-          if remaining:
-              raise SystemExit(
-                  f"Mount patch verification failed: {remaining}"
-              )
-
-          if (
-              "ksys_mount(" not in s
-              or "set_fs(KERNEL_DS)" not in s
-          ):
-              raise SystemExit(
-                  "Linux 4.19 mount API verification failed."
-              )
-
-          path.write_text(s)
-          print("Mount namespace compatibility patch applied.")
-          PY
-
-      
-      - name: Patch KernelSU package observer for Linux 4.19
+      - name: Fetch SUSFS kernel-4.19 sources
         run: |
           set -euo pipefail
+          rm -rf SUSFS
+          git clone --depth=1 --single-branch --branch "$SUSFS_BRANCH" \
+            "$SUSFS_REPO" SUSFS
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          test -f SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
+          test -f SUSFS/kernel_patches/fs/susfs.c
+          test -f SUSFS/kernel_patches/include/linux/susfs.h
+          test -f SUSFS/kernel_patches/include/linux/susfs_def.h
 
-          path = Path("drivers/kernelsu/manager/pkg_observer.c")
+          install -m 0644 SUSFS/kernel_patches/fs/susfs.c fs/susfs.c
+          install -m 0644 SUSFS/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+          install -m 0644 SUSFS/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
 
-          if not path.is_file():
-              raise SystemExit(f"Missing source file: {path}")
+          # SUSFS 4.19 patches are applied only after a successful dry-run.
+          PATCH_FILE="SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+          if grep -Fq 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile \
+             && grep -Fq 'susfs_task_state' include/linux/sched.h \
+             && grep -Fq 'susfs_mnt_id_backup' include/linux/mount.h \
+             && grep -Fq 'CONFIG_KSU_SUSFS_SUS_PATH' fs/dcache.c; then
+            echo "SUSFS kernel patch markers already present; skipping duplicate application."
+          else
+            if grep -Fq 'susfs_task_state' include/linux/sched.h \
+               || grep -Fq 'susfs_mnt_id_backup' include/linux/mount.h \
+               || grep -Fq 'CONFIG_KSU_SUSFS_SUS_PATH' fs/dcache.c; then
+              echo "Partial SUSFS patch detected. Refusing to apply on top of a partial patch." >&2
+              exit 1
+            fi
+            patch --batch --forward --dry-run -p1 < "$PATCH_FILE"
+            patch --batch --forward -p1 < "$PATCH_FILE"
+          fi
 
-          s = path.read_text()
+          grep -Fq 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+          test -s fs/susfs.c
+          test -s include/linux/susfs.h
+          test -s include/linux/susfs_def.h
+          echo "SUSFS kernel-4.19 patch and source files verified."
 
-          # Linux 4.19 task_work_add() expects a bool notify argument.
-          if "TWA_RESUME" in s:
-              s, count = re.subn(
-                  r'\bTWA_RESUME\b',
-                  'true',
-                  s,
-                  count=1,
-              )
-              if count != 1:
-                  raise SystemExit("Could not patch TWA_RESUME.")
-
-          # Adapt the observer callback to the Linux 4.19 fsnotify API.
-          pattern = (
-              r'static int ksu_handle_inode_event\(.*?'
-              r'static const struct fsnotify_ops ksu_ops = '
-              r'\{.*?\};'
-          )
-
-          replacement = r'''static int ksu_handle_event(
-              struct fsnotify_group *group,
-              struct inode *inode,
-              u32 mask,
-              const void *data,
-              int data_type,
-              const unsigned char *file_name,
-              u32 cookie,
-              struct fsnotify_iter_info *iter_info)
-          {
-              if (!file_name)
-                  return 0;
-
-              if (mask & FS_ISDIR)
-                  return 0;
-
-              if (!strcmp((const char *)file_name, "packages.list")) {
-                  pr_info("packages.list detected: %u\n", mask);
-                  ksu_defer_track_throne();
-              }
-
-              return 0;
-          }
-
-          static const struct fsnotify_ops ksu_ops = {
-              .handle_event = ksu_handle_event,
-          };'''
-
-          s, count = re.subn(
-              pattern,
-              lambda _match: replacement,
-              s,
-              count=1,
-              flags=re.S,
-          )
-
-          if count != 1:
-              raise SystemExit(
-                  "Could not safely replace the fsnotify callback."
-              )
-
-          if "TWA_RESUME" in s:
-              raise SystemExit("TWA_RESUME remains in source.")
-
-          if ".handle_inode_event" in s:
-              raise SystemExit("Modern fsnotify field remains.")
-
-          if ".handle_event = ksu_handle_event" not in s:
-              raise SystemExit("Legacy fsnotify callback not installed.")
-
-          path.write_text(s)
-          print("Linux 4.19 package observer patch applied.")
-          PY
-
-
-      
-      - name: Patch remaining KernelSU APIs for Linux 4.19
+      - name: Configure kernel and KernelSU-Next
         run: |
           set -euo pipefail
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          # Keep the user's requested local version and ensure required dependencies.
+          scripts/config --file .config --enable KSU
+          scripts/config --file .config --enable OVERLAY_FS
+          scripts/config --file .config --enable KPROBES
+          scripts/config --file .config --enable KPROBE_EVENTS
+          scripts/config --file .config --enable EXT4_FS
+          scripts/config --file .config --enable KSU_SUSFS
+          scripts/config --file .config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+          scripts/config --file .config --set-str LOCALVERSION '-MAX-ARAF'
+          scripts/config --file .config --disable LOCALVERSION_AUTO
 
-          root = Path("drivers/kernelsu")
-          allowlist = root / "policy/allowlist.c"
-          app_profile = root / "policy/app_profile.c"
-          seccomp_header = Path("include/linux/seccomp.h")
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
 
-          for path in (allowlist, app_profile, seccomp_header):
-              if not path.is_file():
-                  raise SystemExit(f"Required file missing: {path}")
+          for option in \
+            CONFIG_KSU=y \
+            CONFIG_OVERLAY_FS=y \
+            CONFIG_KPROBES=y \
+            CONFIG_KPROBE_EVENTS=y \
+            CONFIG_EXT4_FS=y \
+            CONFIG_KSU_SUSFS=y \
+            CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y; do
+            if ! grep -qx "$option" .config; then
+              echo "Required kernel config is missing: $option" >&2
+              exit 1
+            fi
+          done
 
-          # 1. Linux 4.19 task_work_add() takes a bool notify argument.
-          patched_count = 0
+          grep -q '^CONFIG_LOCALVERSION="-MAX-ARAF"$' .config
+          echo "KernelSU-Next, SUSFS and required kernel configs verified."
 
-          for path in root.rglob("*"):
-              if not path.is_file() or path.suffix not in {".c", ".h"}:
-                  continue
-
-              source = path.read_text()
-              updated, count = re.subn(
-                  r"\bTWA_RESUME\b",
-                  "true",
-                  source,
-              )
-
-              if count:
-                  path.write_text(updated)
-                  patched_count += count
-
-          # 2. Ensure put_task_struct() is declared.
-          source = allowlist.read_text()
-          required_include = "#include <linux/sched/task.h>"
-
-          if required_include not in source:
-              anchor = "#include <linux/task_work.h>"
-
-              if anchor not in source:
-                  raise SystemExit(
-                      "Cannot safely add sched/task.h to allowlist.c"
-                  )
-
-              source = source.replace(
-                  anchor,
-                  anchor + "\n" + required_include,
-                  1,
-              )
-              allowlist.write_text(source)
-
-          if "TWA_RESUME" in allowlist.read_text():
-              raise SystemExit("TWA_RESUME remains in allowlist.c")
-
-          # 3. Reset filter_count only when the target kernel has that field.
-          header = seccomp_header.read_text()
-          profile = app_profile.read_text()
-
-          has_filter_count = bool(
-              re.search(r"\batomic_t\s+filter_count\s*;", header)
-          )
-
-          if not has_filter_count:
-              pattern = (
-                  r"^[ \t]*atomic_set\("
-                  r"&current->seccomp\.filter_count,[ \t]*0[ \t]*"
-                  r"\);[ \t]*$"
-              )
-
-              profile, count = re.subn(
-                  pattern,
-                  "",
-                  profile,
-                  count=1,
-                  flags=re.M,
-              )
-
-              if count == 1:
-                  app_profile.write_text(profile)
-              elif "current->seccomp.filter_count" in profile:
-                  raise SystemExit(
-                      "Cannot safely remove unsupported filter_count access"
-                  )
-
-          if (
-              not has_filter_count
-              and "current->seccomp.filter_count" in app_profile.read_text()
-          ):
-              raise SystemExit("Unsupported seccomp.filter_count remains")
-
-          print("Linux 4.19 KernelSU compatibility patches applied.")
-          print(f"TWA_RESUME replacements: {patched_count}")
-          print(f"seccomp.filter_count available: {has_filter_count}")
-          PY
-
-
-
-      - name: Configure kernel
-        run: |
-          set -e
-          make ARCH=arm64 exynos850-a13nsxx_defconfig
-
-          grep -q '^CONFIG_KSU=y' .config
-          grep -q '^CONFIG_KPROBES=y' .config
-          grep -q '^CONFIG_KPROBE_EVENTS=y' .config
-          grep -q '^CONFIG_EXT4_FS=y' .config
-
-          echo "KernelSU and required config options verified."
-
-      - name: Verify KernelSU integration
-        run: |
-          set -e
-
-          test -L drivers/kernelsu
-          test -f drivers/kernelsu/Kbuild
-          test -f drivers/kernelsu/Kconfig
-          test -f drivers/kernelsu/infra/file_wrapper.c
-          test -f drivers/kernelsu/infra/seccomp_cache.c
-          test -f drivers/kernelsu/infra/su_mount_ns.c
-
-          grep -Fq \
-            'obj-$(CONFIG_KSU) += kernelsu/' \
-            drivers/Makefile
-
-          grep -Fq \
-            'source "drivers/kernelsu/Kconfig"' \
-            drivers/Kconfig
-
-          grep -q '^CONFIG_KSU=y' .config
-
-          echo "KernelSU integration verified."
-
-
-      
-     
-      - name: Generate SELinux headers before KernelSU
+      - name: Generate SELinux headers
         run: |
           set -euo pipefail
+          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" scripts 2>&1 | tee scripts-build.log
 
-          # Build host-side kernel scripts, including genheaders.
-          make ARCH=arm64 LLVM=1 LLVM_IAS=1 scripts \
-            2>&1 | tee selinux-genheaders-build.log
-
-          # Verify the generator exists before running it.
           test -x scripts/selinux/genheaders/genheaders
-
-          # Generate the headers expected by SELinux.
           scripts/selinux/genheaders/genheaders \
-            security/selinux/flask.h \
-            security/selinux/av_permissions.h \
-            2>&1 | tee selinux-genheaders-run.log
-
-          # Fail here with a clear message if generation failed.
+            security/selinux/flask.h security/selinux/av_permissions.h
           test -s security/selinux/flask.h
           test -s security/selinux/av_permissions.h
-
-          grep -q '_SELINUX_FLASK_H_' \
-            security/selinux/flask.h
-
           echo "SELinux headers generated successfully."
- 
-    
 
-
-
-      - name: Preflight compile KernelSU directory
+      - name: Preflight compile KernelSU-Next
         run: |
-          set -o pipefail
-          make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            drivers/kernelsu/ 2>&1 | tee ksu-preflight.log
+          set -euo pipefail
+          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ \
+            2>&1 | tee ksu-preflight.log
 
-      - name: Build kernel
+      - name: Build kernel Image.gz and DTBs
         run: |
-          set -o pipefail
-          make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            Image.gz dtbs 2>&1 | tee kernel-build.log
+          set -euo pipefail
+          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" Image.gz dtbs \
+            2>&1 | tee kernel-build.log
+          test -s arch/arm64/boot/Image.gz
 
       - name: Upload kernel artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: A13-KernelSU-Next-v3.4.1
+          name: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}
           path: |
             arch/arm64/boot/Image.gz
             arch/arm64/boot/dts/
             .config
+            ksu-preflight.log
+            kernel-build.log
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload build diagnostics
+      - name: Upload diagnostics even on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: A13-KSU-Build-Diagnostics
+          name: A13-KernelSU-Next-SUSFS-diagnostics-${{ github.run_number }}
           path: |
+            scripts-build.log
             ksu-preflight.log
             kernel-build.log
             .config
+            SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
           if-no-files-found: warn
           retention-days: 7
