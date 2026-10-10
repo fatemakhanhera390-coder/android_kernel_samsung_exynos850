@@ -21,6 +21,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential cpio curl flex \
@@ -30,6 +31,7 @@ jobs:
 
       - name: Integrate KernelSU Next v3.4.1
         run: |
+          set -e
           curl -fL \
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.4.1/kernel/setup.sh \
             -o /tmp/ksu-setup.sh
@@ -37,11 +39,13 @@ jobs:
 
       - name: Patch KernelSU Next for Linux 4.19
         run: |
+          set -e
           python3 - <<'PY'
           from pathlib import Path
           import re
 
           path = Path("drivers/kernelsu/infra/file_wrapper.c")
+
           if not path.is_file():
               raise SystemExit(f"Missing source file: {path}")
 
@@ -58,7 +62,7 @@ jobs:
                   )
               s = updated
 
-          # Remove the iopoll wrapper for this older kernel API.
+          # Remove iopoll wrapper unsupported by this kernel API.
           replace_once(
               r'#if LINUX_VERSION_CODE >= '
               r'KERNEL_VERSION\(6, 1, 0\)\s+'
@@ -78,13 +82,14 @@ jobs:
               re.M,
           )
 
-          # Use the clone/dedupe operations available in this tree.
+          # Replace unsupported remap_file_range operations
+          # with clone_file_range and dedupe_file_range.
           replace_once(
               r'// no REMAP_FILE_DEDUP: use file_in.*?'
               r'(?=static int ksu_wrapper_fadvise)',
               '''static int ksu_wrapper_clone_file_range(
-              struct file *file_in, loff_t pos_in,
-              struct file *file_out, loff_t pos_out, u64 len)
+                  struct file *file_in, loff_t pos_in,
+                  struct file *file_out, loff_t pos_out, u64 len)
           {
               struct ksu_file_wrapper *data = file_in->private_data;
               struct file *orig = data->orig;
@@ -93,8 +98,8 @@ jobs:
           }
 
           static int ksu_wrapper_dedupe_file_range(
-              struct file *file_in, loff_t pos_in,
-              struct file *file_out, loff_t pos_out, u64 len)
+                  struct file *file_in, loff_t pos_in,
+                  struct file *file_out, loff_t pos_out, u64 len)
           {
               struct ksu_file_wrapper *data = file_out->private_data;
               struct file *orig = data->orig;
@@ -130,9 +135,13 @@ jobs:
               'p->ops.remap_file_range',
               'fp->f_op->remap_file_range',
           )
+
           remaining = [item for item in forbidden if item in s]
+
           if remaining:
-              raise SystemExit(f"Verification failed: {remaining}")
+              raise SystemExit(
+                  f"Verification failed: {remaining}"
+              )
 
           path.write_text(s)
           print("file_wrapper compatibility patch applied.")
@@ -140,16 +149,24 @@ jobs:
 
       - name: Patch missing ARM64 seccomp macro
         run: |
+          set -e
           python3 - <<'PY'
           from pathlib import Path
 
           path = Path("drivers/kernelsu/infra/seccomp_cache.c")
+
+          if not path.is_file():
+              raise SystemExit(f"Missing source file: {path}")
+
           source = path.read_text()
 
           if "SECCOMP_ARCH_NATIVE_NR" not in source:
-              raise SystemExit("Expected seccomp macro use was not found.")
+              raise SystemExit(
+                  "Expected seccomp macro use was not found."
+              )
 
           marker = "#include <linux/seccomp.h>"
+
           fallback = """
           #ifndef SECCOMP_ARCH_NATIVE_NR
           #define SECCOMP_ARCH_NATIVE_NR NR_syscalls
@@ -158,11 +175,14 @@ jobs:
 
           if "#ifndef SECCOMP_ARCH_NATIVE_NR" not in source:
               if marker not in source:
-                  raise SystemExit("Could not find seccomp include.")
+                  raise SystemExit(
+                      "Could not find seccomp include."
+                  )
 
               source = source.replace(
                   marker, marker + "\n" + fallback, 1
               )
+
               path.write_text(source)
 
           print("Seccomp compatibility fallback verified.")
@@ -170,6 +190,8 @@ jobs:
 
       - name: Configure kernel
         run: |
+          set -e
+
           make ARCH=arm64 exynos850-a13nsxx_defconfig
 
           grep -q '^CONFIG_KSU=y' .config
@@ -179,21 +201,36 @@ jobs:
 
           echo "KernelSU and required config options verified."
 
-      
-      - name: Preflight compile KernelSU objects
+      - name: Verify KernelSU integration
         run: |
           set -e
 
+          # Confirm setup script created the expected symlink.
+          test -L drivers/kernelsu
+
+          # Confirm KernelSU source and required files exist.
           test -f drivers/kernelsu/Kbuild
+          test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/infra/file_wrapper.c
           test -f drivers/kernelsu/infra/seccomp_cache.c
 
-          make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            drivers/kernelsu/kernelsu.o
+          # Confirm KernelSU was connected to kernel Kbuild.
+          grep -Fq \
+            'obj-$(CONFIG_KSU) += kernelsu/' \
+            drivers/Makefile
 
+          grep -Fq \
+            'source "drivers/kernelsu/Kconfig"' \
+            drivers/Kconfig
+
+          grep -q '^CONFIG_KSU=y' .config
+
+          echo "KernelSU integration verified."
 
       - name: Build kernel
         run: |
+          set -e
+
           make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             Image.gz dtbs
 
