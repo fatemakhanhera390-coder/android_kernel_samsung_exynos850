@@ -32,7 +32,146 @@ jobs:
           curl -fL \
             https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.4.1/kernel/setup.sh \
             -o /tmp/ksu-setup.sh
+
           bash /tmp/ksu-setup.sh v3.4.1
+
+      - name: Patch KernelSU Next for Linux 4.19
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("drivers/kernelsu/infra/file_wrapper.c")
+
+          if not path.is_file():
+              raise SystemExit(
+                  f"KernelSU source file not found: {path}"
+              )
+
+          s = path.read_text()
+
+          def replace_once(pattern, replacement, label, flags=0):
+              global s
+
+              updated, count = re.subn(
+                  pattern,
+                  replacement,
+                  s,
+                  count=1,
+                  flags=flags,
+              )
+
+              if count != 1:
+                  raise SystemExit(
+                      f"Patch stopped at '{label}': "
+                      f"expected 1 match, got {count}"
+                  )
+
+              s = updated
+
+          # Linux 4.19 file_operations has no iopoll member.
+          replace_once(
+              r'#if LINUX_VERSION_CODE >= '
+              r'KERNEL_VERSION\(6, 1, 0\)\s+'
+              r'static int ksu_wrapper_iopoll\b'
+              r'.*?#endif\s*',
+              '',
+              'remove iopoll compatibility block',
+              re.S,
+          )
+
+          replace_once(
+              r'^[ \t]*p->ops\.iopoll = '
+              r'fp->f_op->iopoll \? '
+              r'ksu_wrapper_iopoll : NULL;\n',
+              '',
+              'remove iopoll assignment',
+              re.M,
+          )
+
+          # Linux 4.19 source provides clone_file_range and
+          # dedupe_file_range instead of remap_file_range.
+          replace_once(
+              r'// no REMAP_FILE_DEDUP: use file_in.*?'
+              r'(?=static int ksu_wrapper_fadvise)',
+              '''static int ksu_wrapper_clone_file_range(
+              struct file *file_in, loff_t pos_in,
+              struct file *file_out, loff_t pos_out, u64 len)
+          {
+              struct ksu_file_wrapper *data = file_in->private_data;
+              struct file *orig = data->orig;
+
+              return orig->f_op->clone_file_range(
+                  orig, pos_in, file_out, pos_out, len);
+          }
+
+          static int ksu_wrapper_dedupe_file_range(
+              struct file *file_in, loff_t pos_in,
+              struct file *file_out, loff_t pos_out, u64 len)
+          {
+              struct ksu_file_wrapper *data = file_out->private_data;
+              struct file *orig = data->orig;
+
+              return orig->f_op->dedupe_file_range(
+                  file_in, pos_in, orig, pos_out, len);
+          }
+
+          ''',
+              'replace remap wrapper with legacy operations',
+              re.S,
+          )
+
+          replace_once(
+              r'^[ \t]*p->ops\.remap_file_range =\n'
+              r'[ \t]*fp->f_op->remap_file_range \? '
+              r'ksu_wrapper_remap_file_range : NULL;\n',
+              '''    p->ops.clone_file_range =
+                  fp->f_op->clone_file_range
+                      ? ksu_wrapper_clone_file_range : NULL;
+              p->ops.dedupe_file_range =
+                  fp->f_op->dedupe_file_range
+                      ? ksu_wrapper_dedupe_file_range : NULL;
+          ''',
+              'replace remap assignment',
+              re.M,
+          )
+
+          forbidden = (
+              'ksu_wrapper_iopoll',
+              'p->ops.iopoll',
+              'fp->f_op->iopoll',
+              'ksu_wrapper_remap_file_range',
+              'p->ops.remap_file_range',
+              'fp->f_op->remap_file_range',
+          )
+
+          remaining = [item for item in forbidden if item in s]
+
+          if remaining:
+              raise SystemExit(
+                  f"Patch verification failed: {remaining}"
+              )
+
+          required = (
+              'ksu_wrapper_clone_file_range',
+              'ksu_wrapper_dedupe_file_range',
+              'p->ops.clone_file_range',
+              'p->ops.dedupe_file_range',
+          )
+
+          missing = [item for item in required if item not in s]
+
+          if missing:
+              raise SystemExit(
+                  f"Patch verification failed: {missing}"
+              )
+
+          path.write_text(s)
+
+          print("KernelSU Linux 4.19 compatibility patch applied.")
+          print("iopoll and remap_file_range references removed.")
+          print("clone_file_range and dedupe_file_range verified.")
+          PY
 
       - name: Configure kernel
         run: |
