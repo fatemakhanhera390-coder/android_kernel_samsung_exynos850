@@ -377,6 +377,107 @@ jobs:
           PY
 
 
+      
+      - name: Patch remaining KernelSU APIs for Linux 4.19
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("drivers/kernelsu")
+          allowlist = root / "policy/allowlist.c"
+          app_profile = root / "policy/app_profile.c"
+          seccomp_header = Path("include/linux/seccomp.h")
+
+          for path in (allowlist, app_profile, seccomp_header):
+              if not path.is_file():
+                  raise SystemExit(f"Required file missing: {path}")
+
+          # 1. Linux 4.19 task_work_add() takes a bool notify argument.
+          patched_count = 0
+
+          for path in root.rglob("*"):
+              if not path.is_file() or path.suffix not in {".c", ".h"}:
+                  continue
+
+              source = path.read_text()
+              updated, count = re.subn(
+                  r"\bTWA_RESUME\b",
+                  "true",
+                  source,
+              )
+
+              if count:
+                  path.write_text(updated)
+                  patched_count += count
+
+          # 2. Ensure put_task_struct() is declared.
+          source = allowlist.read_text()
+          required_include = "#include <linux/sched/task.h>"
+
+          if required_include not in source:
+              anchor = "#include <linux/task_work.h>"
+
+              if anchor not in source:
+                  raise SystemExit(
+                      "Cannot safely add sched/task.h to allowlist.c"
+                  )
+
+              source = source.replace(
+                  anchor,
+                  anchor + "\n" + required_include,
+                  1,
+              )
+              allowlist.write_text(source)
+
+          if "TWA_RESUME" in allowlist.read_text():
+              raise SystemExit("TWA_RESUME remains in allowlist.c")
+
+          # 3. Reset filter_count only when the target kernel has that field.
+          header = seccomp_header.read_text()
+          profile = app_profile.read_text()
+
+          has_filter_count = bool(
+              re.search(r"\batomic_t\s+filter_count\s*;", header)
+          )
+
+          if not has_filter_count:
+              pattern = (
+                  r"^[ \t]*atomic_set\("
+                  r"&current->seccomp\.filter_count,[ \t]*0[ \t]*"
+                  r"\);[ \t]*$"
+              )
+
+              profile, count = re.subn(
+                  pattern,
+                  "",
+                  profile,
+                  count=1,
+                  flags=re.M,
+              )
+
+              if count == 1:
+                  app_profile.write_text(profile)
+              elif "current->seccomp.filter_count" in profile:
+                  raise SystemExit(
+                      "Cannot safely remove unsupported filter_count access"
+                  )
+
+          if (
+              not has_filter_count
+              and "current->seccomp.filter_count" in app_profile.read_text()
+          ):
+              raise SystemExit("Unsupported seccomp.filter_count remains")
+
+          print("Linux 4.19 KernelSU compatibility patches applied.")
+          print(f"TWA_RESUME replacements: {patched_count}")
+          print(f"seccomp.filter_count available: {has_filter_count}")
+          PY
+
+
+
       - name: Configure kernel
         run: |
           set -e
