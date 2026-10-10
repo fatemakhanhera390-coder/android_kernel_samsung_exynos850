@@ -44,20 +44,26 @@ jobs:
             libelf-dev libncurses-dev libssl-dev python3 python-is-python3 \
             rsync dwarves zstd lz4 zip unzip xz-utils
 
+      
       - name: Install Android Clang r450784e
         run: |
           set -euo pipefail
           CLANG_DIR="$RUNNER_TEMP/clang-r450784e"
           mkdir -p "$CLANG_DIR"
+
           curl --fail --location --retry 3 --retry-delay 2 \
-            'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784e.tar.gz' \
+            'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r450784e.tar.gz' \
             -o "$RUNNER_TEMP/clang-r450784e.tar.gz"
+
           tar -xzf "$RUNNER_TEMP/clang-r450784e.tar.gz" -C "$CLANG_DIR"
+
           test -x "$CLANG_DIR/bin/clang"
           test -x "$CLANG_DIR/bin/ld.lld"
+
           echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
           "$CLANG_DIR/bin/clang" --version
           "$CLANG_DIR/bin/ld.lld" --version
+
 
       - name: Verify target kernel source
         run: |
