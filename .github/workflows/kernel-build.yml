@@ -355,62 +355,80 @@ jobs:
           print("SUSFS compatible hunks applied and manual anchors verified.")
           PYSUSFS
 
+      
       - name: Align KernelSU SUS_PATH marker with SUSFS task state
         shell: bash
-    run: |
+        run: |
           set -Eeuo pipefail
-          trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
+          echo "=== Inspect KernelSU and SUSFS hook sources ==="
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import sys
+          test -d drivers/kernelsu
+          test -s include/linux/susfs_def.h
 
-          root = Path("drivers/kernelsu")
-          susfs_header = Path("include/linux/susfs_def.h")
+          echo "KernelSU source files referencing SUS_PATH or SUSFS:"
+          grep -RInE 'SUS_PATH|susfs_task_state|TASK_STRUCT_NON_ROOT_USER_APP_PROC' \
+            drivers/kernelsu --include='*.c' --include='*.h' || true
 
-          print("=== Locate KernelSU hook sources ===")
-          for p in root.rglob("*"):
-              if p.is_file() and p.suffix in {".c", ".h"}:
-                  try:
-                      content = p.read_text(errors="ignore")
-                  except OSError:
-                      continue
-                  if "susfs" in content.lower() or "SUS_PATH" in content:
-                      print(f"Found relevant source: {p}")
+          echo "SUSFS task-state definitions:"
+          grep -n 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' \
+            include/linux/susfs_def.h
 
-          print("=== Verify SUSFS definitions ===")
-          if not susfs_header.is_file():
-              sys.exit("ERROR: include/linux/susfs_def.h is missing")
-
-          header = susfs_header.read_text(errors="ignore")
-          if "TASK_STRUCT_NON_ROOT_USER_APP_PROC" not in header:
-              sys.exit("ERROR: SUSFS task-state marker is missing")
-
-          candidates = [
-              root / "core_hook.c",
-              root / "core_hook.h",
-              root / "ksu.c",
-          ]
-
-          found = [p for p in candidates if p.is_file()]
-          if not found:
-              sys.exit(
-                  "ERROR: No recognized KernelSU hook source found. "
-                  "Cannot safely align SUS_PATH automatically."
-              )
-
-          print("Relevant KernelSU source files:")
-          for p in found:
-              print(f" - {p}")
-
-          print(
-              "Inspection passed. No automatic source rewrite performed; "
-              "the legacy hook implementation must be matched explicitly."
-          )
-          PY
+          echo "Inspection complete. No automatic hook rewrite was performed."
+          echo "Do not treat this inspection as proof that SUS_PATH integration works."
 
       - name: Configure kernel and KernelSU-Next SUSFS
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
+
+          scripts/config --file .config --enable KSU
+          scripts/config --file .config --enable OVERLAY_FS
+          scripts/config --file .config --enable KPROBES
+          scripts/config --file .config --enable KPROBE_EVENTS
+          scripts/config --file .config --enable EXT4_FS
+          scripts/config --file .config --enable KSU_SUSFS
+          scripts/config --file .config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_PATH
+          scripts/config --file .config --disable KSU_SUSFS_SUS_MOUNT
+          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_KSTAT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_OVERLAYFS
+          scripts/config --file .config --disable KSU_SUSFS_TRY_UMOUNT
+          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          scripts/config --file .config --enable KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file .config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          scripts/config --file .config --enable KSU_SUSFS_OPEN_REDIRECT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_SU
+          scripts/config --file .config --enable KSU_SUSFS_ENABLE_LOG
+          scripts/config --file .config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file .config --set-str LOCALVERSION '-MAX-ARAF'
+          scripts/config --file .config --disable LOCALVERSION_AUTO
+
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+
+          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" \
+            LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+
+          echo "Configured kernel release: $KERNELRELEASE"
+
+          case "$KERNELRELEASE" in
+            *MAX-ARAF*) ;;
+            *)
+              echo "MAX-ARAF missing from kernel release: $KERNELRELEASE" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Kernel configuration completed."
+
+        
+      - name: Configure kernel and KernelSU-Next SUSFS
+    run: |
           set -euo pipefail
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
