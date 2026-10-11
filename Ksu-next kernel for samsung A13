@@ -1,0 +1,612 @@
+name: A13 KernelSU-Next SUSFS Safe Build - MAX ARAF
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ksu-next-v3.4.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a13-ksun-susfs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      ARCH: arm64
+      DEFCONFIG: exynos850-a13nsxx_defconfig
+      KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+      KSU_BRANCH: legacy
+      KSU_EXPECTED_VERSION: "33333"
+      SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+      SUSFS_BRANCH: kernel-4.19
+      CROSS_COMPILE: aarch64-linux-gnu-
+      LLVM: "1"
+      LLVM_IAS: "1"
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio curl flex git patch \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libelf-dev libncurses-dev libssl-dev python3 python-is-python3 \
+            rsync dwarves zstd lz4 zip unzip xz-utils
+
+      - name: Restore Android Clang archive cache
+        id: clang-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/clang-r450784e.tar.gz
+          key: a13-clang-r450784e-android14-release-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Download Android Clang r450784e
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/clang-r450784e.tar.gz"
+          curl --fail --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r450784e.tar.gz' \
+            -o "$ARCHIVE"
+          test -s "$ARCHIVE"
+
+      - name: Save Android Clang archive cache
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/clang-r450784e.tar.gz
+          key: a13-clang-r450784e-android14-release-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Extract and verify Android Clang
+        run: |
+          set -euo pipefail
+          CLANG_DIR="$RUNNER_TEMP/clang-r450784e"
+          mkdir -p "$CLANG_DIR"
+          tar -xzf "$RUNNER_TEMP/clang-r450784e.tar.gz" -C "$CLANG_DIR"
+          test -x "$CLANG_DIR/bin/clang"
+          test -x "$CLANG_DIR/bin/ld.lld"
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "$CLANG_DIR/bin/clang" --version
+          "$CLANG_DIR/bin/ld.lld" --version
+
+      - name: Verify target kernel source
+        run: |
+          set -euo pipefail
+          test -f Makefile
+          test -f "arch/arm64/configs/$DEFCONFIG"
+          KERNEL_VERSION="$(make -s kernelversion)"
+          echo "Target kernel version: $KERNEL_VERSION"
+          if [ "$KERNEL_VERSION" != "4.19.325" ]; then
+            echo "Expected Linux 4.19.325, got $KERNEL_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Integrate Linux 4.19-compatible KernelSU-Next
+        run: |
+          set -euo pipefail
+          rm -rf KernelSU-Next
+          git clone --depth=1 --single-branch --branch "$KSU_BRANCH" \
+            "$KSU_REPO" KernelSU-Next
+
+          test -f KernelSU-Next/kernel/Kconfig
+          test -f KernelSU-Next/kernel/Makefile
+          test -f KernelSU-Next/kernel/ksu.c
+          grep -Fq \
+            '79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7' \
+            KernelSU-Next/kernel/Makefile || {
+              echo "Manager v3.4.1 signature hash missing from selected source" >&2
+              exit 1
+            }
+
+          if [ -L drivers/kernelsu ] || [ -d drivers/kernelsu ]; then
+            rm -rf drivers/kernelsu
+          fi
+          ln -s ../KernelSU-Next/kernel drivers/kernelsu
+
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+
+          python3 - <<'PYKCONFIG'
+          from pathlib import Path
+          path = Path("drivers/Kconfig")
+          data = path.read_text()
+          source_line = 'source "drivers/kernelsu/Kconfig"'
+          if source_line not in data:
+              marker = "endmenu"
+              index = data.rfind(marker)
+              if index < 0:
+                  raise SystemExit("Could not find final endmenu in drivers/Kconfig")
+              data = data[:index] + source_line + "\n" + data[index:]
+              path.write_text(data)
+          PYKCONFIG
+
+          echo "KernelSU source: $KSU_REPO"
+          echo "KernelSU branch: $KSU_BRANCH"
+          echo "KernelSU commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
+          echo "KernelSU Manager signature hash is present; runtime version will be verified after preflight."
+
+      - name: Apply SUSFS with conservative compatibility mode
+        run: |
+          set -euo pipefail
+          rm -rf SUSFS
+          git clone --depth=1 --single-branch --branch "$SUSFS_BRANCH" \
+            "$SUSFS_REPO" SUSFS
+
+          PATCH_FILE="SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
+          test -s "$PATCH_FILE"
+          test -s SUSFS/kernel_patches/fs/susfs.c
+          test -s SUSFS/kernel_patches/include/linux/susfs.h
+          test -s SUSFS/kernel_patches/include/linux/susfs_def.h
+
+          install -m 0644 SUSFS/kernel_patches/fs/susfs.c fs/susfs.c
+          install -m 0644 SUSFS/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+          install -m 0644 SUSFS/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
+
+          python3 - <<'PYPATCH'
+          from pathlib import Path
+
+          source = Path("SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch")
+          target = Path("susfs-kernel-4.19-adapted.patch")
+          skip_files = {"fs/namespace.c", "include/linux/mount.h"}
+          skip_hunks = {
+              "fs/dcache.c": {2189},
+              "fs/proc/task_mmu.c": {20},
+              "include/linux/sched.h": {1509},
+              "kernel/sys.c": {1240},
+          }
+          skipped_files = set()
+          skipped_hunks = {name: 0 for name in skip_hunks}
+          current_file = ""
+          skip_file = False
+          skip_hunk = False
+          output = []
+
+          for line in source.read_text().splitlines(keepends=True):
+              if line.startswith("diff --git "):
+                  current_file = line.split(" b/", 1)[1].strip()
+                  skip_file = current_file in skip_files
+                  skip_hunk = False
+                  if skip_file:
+                      skipped_files.add(current_file)
+                  else:
+                      output.append(line)
+                  continue
+
+              if skip_file:
+                  continue
+
+              if line.startswith("@@ "):
+                  skip_hunk = False
+                  fields = line.split()
+                  old_token = fields[1] if len(fields) > 1 else ""
+                  try:
+                      old_start = int(old_token.split(",", 1)[0].lstrip("-"))
+                  except ValueError:
+                      old_start = -1
+
+                  if old_start in skip_hunks.get(current_file, set()):
+                      skipped_hunks[current_file] += 1
+                      skip_hunk = True
+                      continue
+                  output.append(line)
+                  continue
+
+              if not skip_hunk:
+                  output.append(line)
+
+          if skipped_files != skip_files:
+              raise SystemExit(
+                  f"Patch layout changed; skipped file sections {skipped_files}, expected {skip_files}"
+              )
+          for name, count in skipped_hunks.items():
+              if count != 1:
+                  raise SystemExit(
+                      f"Patch layout changed for {name}: skipped {count} hunks, expected exactly 1"
+                  )
+
+          target.write_text("".join(output))
+          print("Prepared conservative SUSFS patch; omitted known incompatible hooks.")
+          print(f"Omitted file sections: {', '.join(sorted(skipped_files))}")
+          for name, count in skipped_hunks.items():
+              print(f"Omitted {name} hunk(s): {count}")
+          PYPATCH
+
+          if ! patch --batch --forward --fuzz=2 -p1 \
+              --dry-run < susfs-kernel-4.19-adapted.patch > susfs-patch-dry-run.log 2>&1; then
+            cat susfs-patch-dry-run.log
+            echo "Compatible SUSFS hunks still fail dry-run; kernel source was not patched by this step." >&2
+            exit 1
+          fi
+          cat susfs-patch-dry-run.log
+          patch --batch --forward --fuzz=2 -p1 \
+            < susfs-kernel-4.19-adapted.patch 2>&1 | tee susfs-patch.log
+
+          python3 - <<'PYSUSFS'
+          from pathlib import Path
+          import re
+
+          def read(name):
+              p = Path(name)
+              if not p.is_file():
+                  raise SystemExit(f"Required source missing: {name}")
+              return p.read_text()
+
+          def write(name, content):
+              Path(name).write_text(content)
+
+          name = "fs/dcache.c"
+          s = read(name)
+          if "#include <linux/susfs_def.h>" not in s:
+              anchor = "#include <linux/list_lru.h>"
+              if anchor not in s:
+                  raise SystemExit("dcache.c: include anchor not found")
+              s = s.replace(
+                  anchor,
+                  anchor + "\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n#include <linux/susfs_def.h>\n#endif",
+                  1,
+              )
+          fn = re.search(
+              r"struct dentry \*__d_lookup_rcu\b.*?\n\}", s, flags=re.S
+          )
+          if not fn:
+              raise SystemExit("dcache.c: __d_lookup_rcu() not found")
+          body = fn.group(0)
+          marker = "TASK_STRUCT_NON_ROOT_USER_APP_PROC"
+          if marker not in body:
+              anchor = re.search(
+                  r"if \(dentry_cmp\(dentry, str, hashlen_len\(hashlen\)\) != 0\)\s*\n\s*continue;\s*\n",
+                  body,
+              )
+              if not anchor:
+                  raise SystemExit("dcache.c: dentry_cmp() insertion anchor not found")
+              check = (
+                  "\t\t#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
+                  "\t\tif (dentry->d_inode && unlikely(dentry->d_inode->i_state & INODE_STATE_SUS_PATH) && "
+                  "likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)) {\n"
+                  "\t\t\tcontinue;\n"
+                  "\t\t}\n"
+                  "\t\t#endif\n"
+              )
+              body = body[:anchor.end()] + check + body[anchor.end():]
+              s = s[:fn.start()] + body + s[fn.end():]
+          write(name, s)
+
+          name = "fs/proc/task_mmu.c"
+          s = read(name)
+          if "#include <linux/susfs_def.h>" not in s:
+              anchor = "#include <linux/mm_inline.h>"
+              if anchor in s:
+                  s = s.replace(anchor, anchor + "\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif", 1)
+              else:
+                  anchor = "#include <asm/elf.h>"
+                  if anchor not in s:
+                      raise SystemExit("task_mmu.c: no known include anchor found")
+                  s = s.replace(anchor, "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n" + anchor, 1)
+          write(name, s)
+
+          name = "kernel/sys.c"
+          s = read(name)
+          marker = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)"
+          start = s.find(marker)
+          if start < 0:
+              raise SystemExit("sys.c: newuname syscall anchor not found")
+          old_uname = s.find("#ifdef __ARCH_WANT_SYS_OLD_UNAME", start)
+          if old_uname < 0:
+              old_uname = len(s)
+          body = s[start:old_uname]
+          if "susfs_spoof_uname(&tmp);" not in body:
+              if "extern void susfs_spoof_uname(struct new_utsname *tmp);" not in s:
+                  prototype = (
+                      "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+                      "extern void susfs_spoof_uname(struct new_utsname *tmp);\n"
+                      "#endif\n\n"
+                  )
+                  s = s[:start] + prototype + s[start:]
+                  start = s.find(marker)
+                  old_uname = s.find("#ifdef __ARCH_WANT_SYS_OLD_UNAME", start)
+                  if old_uname < 0:
+                      old_uname = len(s)
+                  body = s[start:old_uname]
+              up = re.search(r"^[ \t]*up_read\(&uts_sem\);", body, flags=re.M)
+              if not up:
+                  raise SystemExit("sys.c: up_read(&uts_sem) anchor not found in newuname")
+              call = (
+                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+                  "\tsusfs_spoof_uname(&tmp);\n"
+                  "#endif\n"
+              )
+              body = body[:up.start()] + call + body[up.start():]
+              s = s[:start] + body + s[old_uname:]
+          write(name, s)
+
+          for marker_file, marker in {
+              "fs/Makefile": "obj-$(CONFIG_KSU_SUSFS) += susfs.o",
+              "fs/dcache.c": "TASK_STRUCT_NON_ROOT_USER_APP_PROC",
+              "fs/proc/task_mmu.c": "#include <linux/susfs_def.h>",
+              "kernel/sys.c": "susfs_spoof_uname(&tmp);",
+              "include/linux/sched.h": "susfs_task_state",
+          }.items():
+              if marker not in read(marker_file):
+                  raise SystemExit(f"SUSFS verification failed: {marker_file}: {marker}")
+
+          if Path("include/linux/mount.h").read_text().find("susfs_mnt_id_backup") >= 0:
+              raise SystemExit("Mount-ID field unexpectedly present in conservative mode")
+          if list(Path(".").rglob("*.rej")):
+              raise SystemExit("Unresolved patch reject files remain")
+
+          write(
+              "susfs-compatibility.log",
+              "SUSFS conservative mode: SUS_PATH, SUS_KSTAT, overlayfs/uname/open-redirect patches enabled; mount-ID spoofing and namespace-dependent features intentionally disabled for this non-GKI kernel.\n",
+          )
+          print("SUSFS compatible hunks applied and manual anchors verified.")
+          PYSUSFS
+
+      - name: Align KernelSU SUS_PATH marker with SUSFS task state
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          source_path = Path("drivers/kernelsu/core_hook.c")
+          header_path = Path("include/linux/susfs_def.h")
+
+          if not source_path.is_file():
+              raise SystemExit(f"KernelSU source missing: {source_path}")
+          if not header_path.is_file():
+              raise SystemExit(f"SUSFS definitions missing: {header_path}")
+
+          source = source_path.read_text()
+          header = header_path.read_text()
+
+          if "TASK_STRUCT_NON_ROOT_USER_APP_PROC" not in header:
+              raise SystemExit("SUSFS task-state marker is missing from susfs_def.h")
+
+          old = (
+              r"new->user->android_kabi_reserved2\s*\|=\s*"
+              r"USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE\s*;"
+          )
+          replacement = "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
+
+          if replacement not in source:
+              source, count = re.subn(old, replacement, source, count=1)
+              if count != 1:
+                  raise SystemExit(
+                      "Could not safely replace the mismatched user_struct KABI marker in core_hook.c"
+                  )
+
+          include = "#include <linux/susfs_def.h>"
+          if include not in source:
+              anchor = "#include <linux/susfs.h>"
+              if anchor not in source:
+                  raise SystemExit("Could not find the CONFIG_KSU_SUSFS include anchor")
+              source = source.replace(anchor, anchor + "\n" + include, 1)
+
+          if "new->user->android_kabi_reserved2" in source:
+              raise SystemExit("Old user_struct KABI access remains")
+          if replacement not in source:
+              raise SystemExit("SUSFS task-state marker was not installed")
+
+          source_path.write_text(source)
+          print("KernelSU SUS_PATH marker now uses current->susfs_task_state, matching SUSFS hooks.")
+          PY
+
+      - name: Configure kernel and KernelSU-Next SUSFS
+        run: |
+          set -euo pipefail
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
+
+          scripts/config --file .config --enable KSU
+          scripts/config --file .config --enable OVERLAY_FS
+          scripts/config --file .config --enable KPROBES
+          scripts/config --file .config --enable KPROBE_EVENTS
+          scripts/config --file .config --enable EXT4_FS
+          scripts/config --file .config --enable KSU_SUSFS
+          scripts/config --file .config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_PATH
+          scripts/config --file .config --disable KSU_SUSFS_SUS_MOUNT
+          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_KSTAT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_OVERLAYFS
+          scripts/config --file .config --disable KSU_SUSFS_TRY_UMOUNT
+          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          scripts/config --file .config --enable KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file .config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          scripts/config --file .config --enable KSU_SUSFS_OPEN_REDIRECT
+          scripts/config --file .config --enable KSU_SUSFS_SUS_SU
+          scripts/config --file .config --enable KSU_SUSFS_ENABLE_LOG
+          scripts/config --file .config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file .config --set-str LOCALVERSION '-MAX-ARAF'
+          scripts/config --file .config --disable LOCALVERSION_AUTO
+
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+
+          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+          echo "Configured kernel release: $KERNELRELEASE"
+          case "$KERNELRELEASE" in
+            *MAX-ARAF*) ;;
+            *) echo "MAX-ARAF is missing from kernel release: $KERNELRELEASE" >&2; exit 1 ;;
+          esac
+
+          for option in \
+            CONFIG_KSU=y \
+            CONFIG_KPROBES=y \
+            CONFIG_KPROBE_EVENTS=y \
+            CONFIG_EXT4_FS=y \
+            CONFIG_OVERLAY_FS=y \
+            CONFIG_KSU_SUSFS=y \
+            CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y \
+            CONFIG_KSU_SUSFS_SUS_PATH=y \
+            CONFIG_KSU_SUSFS_SUS_KSTAT=y \
+            CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y \
+            CONFIG_KSU_SUSFS_SPOOF_UNAME=y \
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y \
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT=y; do
+            if ! grep -qx "$option" .config; then
+              echo "Required kernel config is missing: $option" >&2
+              exit 1
+            fi
+          done
+
+          for option in \
+            CONFIG_KSU_SUSFS_SUS_MOUNT \
+            CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            CONFIG_KSU_SUSFS_TRY_UMOUNT \
+            CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT; do
+            if grep -qx "$option=y" .config; then
+              echo "Unsafe namespace-dependent feature unexpectedly enabled: $option" >&2
+              exit 1
+            fi
+          done
+
+          grep -q '^CONFIG_LOCALVERSION="-MAX-ARAF"$' .config
+          echo "KernelSU and conservative SUSFS feature configs verified."
+
+      - name: Generate SELinux headers
+        run: |
+          set -euo pipefail
+          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" scripts 2>&1 | tee scripts-build.log
+          test -x scripts/selinux/genheaders/genheaders
+          scripts/selinux/genheaders/genheaders \
+            security/selinux/flask.h security/selinux/av_permissions.h
+          test -s security/selinux/flask.h
+          test -s security/selinux/av_permissions.h
+          echo "SELinux headers generated successfully."
+
+      - name: Preflight compile KernelSU-Next and SUSFS
+        run: |
+          set -euo pipefail
+          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ \
+            2>&1 | tee ksu-preflight.log
+          if ! grep -Eq -- "-- KernelSU(-Next)? version: ${KSU_EXPECTED_VERSION}([[:space:]]|$)" ksu-preflight.log; then
+            echo "Wrong KernelSU driver version. Expected ${KSU_EXPECTED_VERSION} (Manager v3.4.1 build), refusing to package." >&2
+            grep -E -- "KernelSU(-Next)? version:|Manager signature hash|Manager signature size" ksu-preflight.log || true
+            exit 1
+          fi
+          echo "KernelSU driver version ${KSU_EXPECTED_VERSION} verified for Manager v3.4.1."
+
+      - name: Build kernel Image and DTBs
+        run: |
+          set -euo pipefail
+          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" Image Image.gz dtbs \
+            2>&1 | tee kernel-build.log
+          test -s arch/arm64/boot/Image
+          test -s arch/arm64/boot/Image.gz
+          test -s arch/arm64/boot/dts/exynos/exynos3830.dtb
+          test -s arch/arm64/boot/dts/samsung/a13/a13_eur_open_w00_r00.dtbo
+          test -s arch/arm64/boot/dts/samsung/a13/a13_eur_open_w00_r06.dtbo
+          grep -aFq 'Linux version 4.19.325' arch/arm64/boot/Image
+          grep -aFq 'MAX-ARAF' arch/arm64/boot/Image
+          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+          case "$KERNELRELEASE" in
+            *MAX-ARAF*) echo "Verified final kernel release: $KERNELRELEASE" ;;
+            *) echo "Final kernel release is missing MAX-ARAF: $KERNELRELEASE" >&2; exit 1 ;;
+          esac
+          echo "Kernel Image, version, MAX-ARAF localversion, A13 DTB and DTBO outputs verified."
+
+      - name: Package TWRP flashable kernel ZIP
+        run: |
+          set -euo pipefail
+          AK3_SOURCE="$RUNNER_TEMP/AnyKernel3-source"
+          AK3_STAGE="$RUNNER_TEMP/a13-anykernel-package"
+          OUTPUT="$GITHUB_WORKSPACE/A13-KernelSU-Next-SUSFS-MAX-ARAF-${GITHUB_RUN_NUMBER}-TWRP.zip"
+
+          test -s arch/arm64/boot/Image
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_SOURCE"
+          test -s "$AK3_SOURCE/tools/ak3-core.sh"
+          test -s "$AK3_SOURCE/META-INF/com/google/android/update-binary"
+          test -s "$AK3_SOURCE/LICENSE"
+
+          rm -rf "$AK3_STAGE"
+          mkdir -p "$AK3_STAGE"
+          cp -a "$AK3_SOURCE/META-INF" "$AK3_SOURCE/tools" "$AK3_SOURCE/LICENSE" "$AK3_STAGE/"
+          cp arch/arm64/boot/Image "$AK3_STAGE/Image"
+
+          cat > "$AK3_STAGE/anykernel.sh" <<'ANYKERNEL'
+          ### AnyKernel3 install script for Samsung Galaxy A13 SM-A135F
+          properties() { '
+          kernel.string=KernelSU-Next + SUSFS - MAX ARAF
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a13
+          device.name2=a13nsxx
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+          ui_print "MAX ARAF KernelSU-Next + SUSFS";
+          ui_print "Installing kernel only; retaining current ramdisk and DTB.";
+          dump_boot;
+          write_boot;
+          ANYKERNEL
+
+          chmod 0644 "$AK3_STAGE/Image"
+          cd "$AK3_STAGE"
+          zip -r9 "$OUTPUT" META-INF tools LICENSE Image anykernel.sh 2>&1 | tee "$GITHUB_WORKSPACE/package-build.log"
+          unzip -t "$OUTPUT"
+          unzip -Z1 "$OUTPUT" | grep -Fxq 'Image'
+          unzip -Z1 "$OUTPUT" | grep -Fxq 'anykernel.sh'
+          unzip -Z1 "$OUTPUT" | grep -Fxq 'META-INF/com/google/android/update-binary'
+          unzip -p "$OUTPUT" anykernel.sh > "$RUNNER_TEMP/verify-anykernel.sh"
+          grep -Fq 'BLOCK=boot;' "$RUNNER_TEMP/verify-anykernel.sh"
+          grep -Fq 'device.name1=a13' "$RUNNER_TEMP/verify-anykernel.sh"
+          if unzip -Z1 "$OUTPUT" | grep -Eq '(^|/)(dtbo\.img|dtb\.img|boot\.img)$'; then
+            echo "Unexpected standalone DTB/DTBO/boot image included in kernel-only package." >&2
+            exit 1
+          fi
+          echo "Validated flashable ZIP: $OUTPUT"
+
+      - name: Upload TWRP flashable kernel ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-TWRP
+          path: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-TWRP.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A13-KernelSU-Next-SUSFS-diagnostics-${{ github.run_number }}
+          path: |
+            susfs-patch.log
+            susfs-patch-dry-run.log
+            susfs-compatibility.log
+            scripts-build.log
+            ksu-preflight.log
+            kernel-build.log
+            package-build.log
+            .config
+            SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
+            susfs-kernel-4.19-adapted.patch
+          if-no-files-found: warn
+          retention-days: 7
