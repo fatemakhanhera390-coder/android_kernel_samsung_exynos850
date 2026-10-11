@@ -94,34 +94,47 @@ jobs:
             exit 1
           fi
 
+
       - name: Integrate Linux 4.19-compatible KernelSU-Next
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
+
+          echo "=== KernelSU-Next integration ==="
 
           rm -rf KernelSU-Next
 
-          curl -fsSL \
+          curl -fL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             -o "$RUNNER_TEMP/ksu-next-setup.sh"
 
           bash "$RUNNER_TEMP/ksu-next-setup.sh" legacy
 
+          echo "=== Verify KernelSU-Next files ==="
+
+          test -d KernelSU-Next/kernel
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Makefile
           test -f KernelSU-Next/kernel/ksu.c
 
-                    echo "Checking KernelSU-Next source..."
-          grep -nE 'ksu|VERSION|HASH|hash' KernelSU-Next/kernel/Makefile || true
+          echo "=== Verify setup integration ==="
 
           test -L drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
+
           grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
           grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-          echo "KernelSU-Next integration verified."
-          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
-          echo "KernelSU-Next ref: $(git -C KernelSU-Next describe --tags --always)"
-          echo "Manager signature hash: verified."
+          echo "=== Verify KernelSU configuration support ==="
+
+          grep -Eq 'config KSU([[:space:]]|$)' drivers/kernelsu/Kconfig
+
+          echo "=== Source information ==="
+          git -C KernelSU-Next rev-parse --short HEAD
+          git -C KernelSU-Next branch --show-current
+
+          echo "KernelSU-Next integration checks passed."
 
       - name: Apply SUSFS with conservative compatibility mode
         run: |
