@@ -97,46 +97,36 @@ jobs:
       - name: Integrate Linux 4.19-compatible KernelSU-Next
         run: |
           set -euo pipefail
+
           rm -rf KernelSU-Next
-          git clone --depth=1 --single-branch --branch "$KSU_BRANCH" \
-            "$KSU_REPO" KernelSU-Next
+
+          curl -fsSL \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            -o "$RUNNER_TEMP/ksu-next-setup.sh"
+
+          bash "$RUNNER_TEMP/ksu-next-setup.sh" legacy
 
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Makefile
           test -f KernelSU-Next/kernel/ksu.c
-          grep -Fq \
+
+          if ! grep -Fq \
             '79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7' \
-            KernelSU-Next/kernel/Makefile || {
-              echo "Manager v3.4.1 signature hash missing from selected source" >&2
-              exit 1
-            }
-
-          if [ -L drivers/kernelsu ] || [ -d drivers/kernelsu ]; then
-            rm -rf drivers/kernelsu
+            KernelSU-Next/kernel/Makefile; then
+            echo "ERROR: Required KernelSU-Next Manager signature hash is missing." >&2
+            echo "The selected KernelSU-Next source is not compatible with this check." >&2
+            exit 1
           fi
-          ln -s ../KernelSU-Next/kernel drivers/kernelsu
 
-          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
-            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          test -L drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
+          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-          python3 - <<'PYKCONFIG'
-          from pathlib import Path
-          path = Path("drivers/Kconfig")
-          data = path.read_text()
-          source_line = 'source "drivers/kernelsu/Kconfig"'
-          if source_line not in data:
-              marker = "endmenu"
-              index = data.rfind(marker)
-              if index < 0:
-                  raise SystemExit("Could not find final endmenu in drivers/Kconfig")
-              data = data[:index] + source_line + "\n" + data[index:]
-              path.write_text(data)
-          PYKCONFIG
-
-          echo "KernelSU source: $KSU_REPO"
-          echo "KernelSU branch: $KSU_BRANCH"
-          echo "KernelSU commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
-          echo "KernelSU Manager signature hash is present; runtime version will be verified after preflight."
+          echo "KernelSU-Next integration verified."
+          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
+          echo "KernelSU-Next ref: $(git -C KernelSU-Next describe --tags --always)"
+          echo "Manager signature hash: verified."
 
       - name: Apply SUSFS with conservative compatibility mode
         run: |
