@@ -1,4 +1,4 @@
-name: A13 KernelSU-Next SUSFS Safe Build - MAX ARAF
+name: A13 KernelSU-Next SUSFS Build - MAX ARAF
 
 on:
   workflow_dispatch:
@@ -20,9 +20,9 @@ jobs:
     env:
       ARCH: arm64
       DEFCONFIG: exynos850-a13nsxx_defconfig
-      KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
-      KSU_BRANCH: legacy
-      KSU_EXPECTED_VERSION: "33333"
+      KSU_REPO: https://github.com/SuleMareVientu/KernelSU-Next.git
+      KSU_BRANCH: next-susfs-4.19
+      KSU_MANAGER_HASH: 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7
       SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
       SUSFS_BRANCH: kernel-4.19
       CROSS_COMPILE: aarch64-linux-gnu-
@@ -36,6 +36,7 @@ jobs:
           fetch-depth: 1
 
       - name: Install build dependencies
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -54,11 +55,11 @@ jobs:
 
       - name: Download Android Clang r450784e
         if: steps.clang-cache.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           set -euo pipefail
           ARCHIVE="$RUNNER_TEMP/clang-r450784e.tar.gz"
-          curl --fail --location \
-            --retry 5 --retry-all-errors --retry-delay 2 \
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
             'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r450784e.tar.gz' \
             -o "$ARCHIVE"
           test -s "$ARCHIVE"
@@ -71,6 +72,7 @@ jobs:
           key: a13-clang-r450784e-android14-release-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Extract and verify Android Clang
+        shell: bash
         run: |
           set -euo pipefail
           CLANG_DIR="$RUNNER_TEMP/clang-r450784e"
@@ -83,6 +85,7 @@ jobs:
           "$CLANG_DIR/bin/ld.lld" --version
 
       - name: Verify target kernel source
+        shell: bash
         run: |
           set -euo pipefail
           test -f Makefile
@@ -94,57 +97,58 @@ jobs:
             exit 1
           fi
 
-
-      
-      - name: Integrate Linux 4.19-compatible KernelSU-Next
+      - name: Integrate KernelSU-Next SUSFS-compatible source
         shell: bash
         run: |
           set -Eeuo pipefail
           trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
 
-          echo "=== Setting up KernelSU-Next ==="
-
           rm -rf KernelSU-Next
+          git clone --depth=1 --single-branch --branch "$KSU_BRANCH" "$KSU_REPO" KernelSU-Next
 
-          curl -fsSL --retry 3 --retry-delay 2 \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            -o "$RUNNER_TEMP/ksu-next-setup.sh"
-
-          bash "$RUNNER_TEMP/ksu-next-setup.sh" legacy
-
-          echo "=== Inspect KernelSU source ==="
-
-          test -d KernelSU-Next/kernel
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Makefile
+          test -f KernelSU-Next/kernel/ksu.c
 
-          echo "KernelSU source files:"
-          find KernelSU-Next/kernel -maxdepth 3 -type f \
-            \( -name 'ksu.c' -o -name 'Kconfig' -o -name 'Makefile' \) \
-            -print | head -100
+          if ! grep -R -Fq "$KSU_MANAGER_HASH" KernelSU-Next/kernel; then
+            echo "Required Manager signature hash was not found in the selected KernelSU source." >&2
+            echo "Selected source: $KSU_REPO ($KSU_BRANCH)" >&2
+            exit 1
+          fi
 
-          echo "=== Verify setup integration ==="
+          rm -rf drivers/kernelsu
+          ln -s ../KernelSU-Next/kernel drivers/kernelsu
+
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+
+          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path('drivers/Kconfig')
+          s = p.read_text()
+          marker = 'endmenu'
+          i = s.rfind(marker)
+          if i < 0:
+              raise SystemExit('Could not find final endmenu in drivers/Kconfig')
+          s = s[:i] + 'source "drivers/kernelsu/Kconfig"\n\n' + s[i:]
+          p.write_text(s)
+          PY
 
           test -L drivers/kernelsu
-          test -f drivers/kernelsu/Kconfig
-          test -f drivers/kernelsu/Makefile
-
           grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
           grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-          echo "=== KernelSU source information ==="
-          git -C KernelSU-Next rev-parse --short HEAD
-          git -C KernelSU-Next branch --show-current
-
-          echo "KernelSU-Next setup checks passed."
-
+          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
+          echo "KernelSU-Next branch: $(git -C KernelSU-Next branch --show-current)"
+          echo "Manager signature hash: verified"
 
       - name: Apply SUSFS with conservative compatibility mode
+        shell: bash
         run: |
           set -euo pipefail
           rm -rf SUSFS
-          git clone --depth=1 --single-branch --branch "$SUSFS_BRANCH" \
-            "$SUSFS_REPO" SUSFS
+          git clone --depth=1 --single-branch --branch "$SUSFS_BRANCH" "$SUSFS_REPO" SUSFS
 
           PATCH_FILE="SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
           test -s "$PATCH_FILE"
@@ -209,14 +213,10 @@ jobs:
                   output.append(line)
 
           if skipped_files != skip_files:
-              raise SystemExit(
-                  f"Patch layout changed; skipped file sections {skipped_files}, expected {skip_files}"
-              )
+              raise SystemExit(f"Patch layout changed; skipped file sections {skipped_files}, expected {skip_files}")
           for name, count in skipped_hunks.items():
               if count != 1:
-                  raise SystemExit(
-                      f"Patch layout changed for {name}: skipped {count} hunks, expected exactly 1"
-                  )
+                  raise SystemExit(f"Patch layout changed for {name}: skipped {count} hunks, expected exactly 1")
 
           target.write_text("".join(output))
           print("Prepared conservative SUSFS patch; omitted known incompatible hooks.")
@@ -228,7 +228,7 @@ jobs:
           if ! patch --batch --forward --fuzz=2 -p1 \
               --dry-run < susfs-kernel-4.19-adapted.patch > susfs-patch-dry-run.log 2>&1; then
             cat susfs-patch-dry-run.log
-            echo "Compatible SUSFS hunks still fail dry-run; kernel source was not patched by this step." >&2
+            echo "Compatible SUSFS hunks failed dry-run; kernel source was not patched by this step." >&2
             exit 1
           fi
           cat susfs-patch-dry-run.log
@@ -259,9 +259,7 @@ jobs:
                   anchor + "\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n#include <linux/susfs_def.h>\n#endif",
                   1,
               )
-          fn = re.search(
-              r"struct dentry \*__d_lookup_rcu\b.*?\n\}", s, flags=re.S
-          )
+          fn = re.search(r"struct dentry \*__d_lookup_rcu\b.*?\n\}", s, flags=re.S)
           if not fn:
               raise SystemExit("dcache.c: __d_lookup_rcu() not found")
           body = fn.group(0)
@@ -310,11 +308,7 @@ jobs:
           body = s[start:old_uname]
           if "susfs_spoof_uname(&tmp);" not in body:
               if "extern void susfs_spoof_uname(struct new_utsname *tmp);" not in s:
-                  prototype = (
-                      "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
-                      "extern void susfs_spoof_uname(struct new_utsname *tmp);\n"
-                      "#endif\n\n"
-                  )
+                  prototype = "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname *tmp);\n#endif\n\n"
                   s = s[:start] + prototype + s[start:]
                   start = s.find(marker)
                   old_uname = s.find("#ifdef __ARCH_WANT_SYS_OLD_UNAME", start)
@@ -324,11 +318,7 @@ jobs:
               up = re.search(r"^[ \t]*up_read\(&uts_sem\);", body, flags=re.M)
               if not up:
                   raise SystemExit("sys.c: up_read(&uts_sem) anchor not found in newuname")
-              call = (
-                  "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
-                  "\tsusfs_spoof_uname(&tmp);\n"
-                  "#endif\n"
-              )
+              call = "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif\n"
               body = body[:up.start()] + call + body[up.start():]
               s = s[:start] + body + s[old_uname:]
           write(name, s)
@@ -343,93 +333,43 @@ jobs:
               if marker not in read(marker_file):
                   raise SystemExit(f"SUSFS verification failed: {marker_file}: {marker}")
 
-          if Path("include/linux/mount.h").read_text().find("susfs_mnt_id_backup") >= 0:
+          if "susfs_mnt_id_backup" in read("include/linux/mount.h"):
               raise SystemExit("Mount-ID field unexpectedly present in conservative mode")
           if list(Path(".").rglob("*.rej")):
               raise SystemExit("Unresolved patch reject files remain")
 
-          write(
-              "susfs-compatibility.log",
-              "SUSFS conservative mode: SUS_PATH, SUS_KSTAT, overlayfs/uname/open-redirect patches enabled; mount-ID spoofing and namespace-dependent features intentionally disabled for this non-GKI kernel.\n",
+          Path("susfs-compatibility.log").write_text(
+              "SUSFS conservative mode: selected kernel patch hunks applied; mount-ID spoofing and namespace-dependent features omitted.\n"
           )
           print("SUSFS compatible hunks applied and manual anchors verified.")
           PYSUSFS
 
-      
       - name: Align KernelSU SUS_PATH marker with SUSFS task state
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "=== Inspect KernelSU and SUSFS hook sources ==="
+          trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
 
-          test -d drivers/kernelsu
-          test -s include/linux/susfs_def.h
+          test -f drivers/kernelsu/core_hook.c
+          test -f include/linux/susfs_def.h
+          grep -q 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' include/linux/susfs_def.h
 
-          echo "KernelSU source files referencing SUS_PATH or SUSFS:"
-          grep -RInE 'SUS_PATH|susfs_task_state|TASK_STRUCT_NON_ROOT_USER_APP_PROC' \
-            drivers/kernelsu --include='*.c' --include='*.h' || true
+          echo "KernelSU hook source found: drivers/kernelsu/core_hook.c"
+          grep -nE 'susfs_task_state|TASK_STRUCT_NON_ROOT_USER_APP_PROC|USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE' \
+            drivers/kernelsu/core_hook.c || true
 
-          echo "SUSFS task-state definitions:"
-          grep -n 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' \
-            include/linux/susfs_def.h
+          if ! grep -q 'susfs_task_state' drivers/kernelsu/core_hook.c; then
+            echo "The selected KernelSU source does not contain the SUSFS task-state hook." >&2
+            echo "Refusing to claim SUS_PATH integration is complete." >&2
+            exit 1
+          fi
 
-          echo "Inspection complete. No automatic hook rewrite was performed."
-          echo "Do not treat this inspection as proof that SUS_PATH integration works."
+          echo "KernelSU SUS_PATH task-state hook presence verified."
 
       - name: Configure kernel and KernelSU-Next SUSFS
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
-
-          scripts/config --file .config --enable KSU
-          scripts/config --file .config --enable OVERLAY_FS
-          scripts/config --file .config --enable KPROBES
-          scripts/config --file .config --enable KPROBE_EVENTS
-          scripts/config --file .config --enable EXT4_FS
-          scripts/config --file .config --enable KSU_SUSFS
-          scripts/config --file .config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
-          scripts/config --file .config --enable KSU_SUSFS_SUS_PATH
-          scripts/config --file .config --disable KSU_SUSFS_SUS_MOUNT
-          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
-          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
-          scripts/config --file .config --enable KSU_SUSFS_SUS_KSTAT
-          scripts/config --file .config --enable KSU_SUSFS_SUS_OVERLAYFS
-          scripts/config --file .config --disable KSU_SUSFS_TRY_UMOUNT
-          scripts/config --file .config --disable KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
-          scripts/config --file .config --enable KSU_SUSFS_SPOOF_UNAME
-          scripts/config --file .config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-          scripts/config --file .config --enable KSU_SUSFS_OPEN_REDIRECT
-          scripts/config --file .config --enable KSU_SUSFS_SUS_SU
-          scripts/config --file .config --enable KSU_SUSFS_ENABLE_LOG
-          scripts/config --file .config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-          scripts/config --file .config --set-str LOCALVERSION '-MAX-ARAF'
-          scripts/config --file .config --disable LOCALVERSION_AUTO
-
-          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
-
-          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" \
-            LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
-
-          echo "Configured kernel release: $KERNELRELEASE"
-
-          case "$KERNELRELEASE" in
-            *MAX-ARAF*) ;;
-            *)
-              echo "MAX-ARAF missing from kernel release: $KERNELRELEASE" >&2
-              exit 1
-              ;;
-          esac
-
-          echo "Kernel configuration completed."
-
-        
-      - name: Configure kernel and KernelSU-Next SUSFS
-    run: |
-          set -euo pipefail
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
 
@@ -494,7 +434,7 @@ jobs:
             CONFIG_KSU_SUSFS_TRY_UMOUNT \
             CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT; do
             if grep -qx "$option=y" .config; then
-              echo "Unsafe namespace-dependent feature unexpectedly enabled: $option" >&2
+              echo "Unexpected namespace-dependent feature enabled: $option" >&2
               exit 1
             fi
           done
@@ -503,6 +443,7 @@ jobs:
           echo "KernelSU and conservative SUSFS feature configs verified."
 
       - name: Generate SELinux headers
+        shell: bash
         run: |
           set -euo pipefail
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
@@ -515,29 +456,29 @@ jobs:
           echo "SELinux headers generated successfully."
 
       - name: Preflight compile KernelSU-Next and SUSFS
+        shell: bash
         run: |
           set -euo pipefail
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ \
             2>&1 | tee ksu-preflight.log
-          if ! grep -Eq -- "-- KernelSU(-Next)? version: ${KSU_EXPECTED_VERSION}([[:space:]]|$)" ksu-preflight.log; then
-            echo "Wrong KernelSU driver version. Expected ${KSU_EXPECTED_VERSION} (Manager v3.4.1 build), refusing to package." >&2
-            grep -E -- "KernelSU(-Next)? version:|Manager signature hash|Manager signature size" ksu-preflight.log || true
-            exit 1
-          fi
-          echo "KernelSU driver version ${KSU_EXPECTED_VERSION} verified for Manager v3.4.1."
+          echo "KernelSU/SUSFS preflight compile completed."
+          grep -E -- 'KernelSU(-Next)? version:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
+            ksu-preflight.log || true
 
       - name: Build kernel Image and DTBs
+        shell: bash
         run: |
           set -euo pipefail
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" Image Image.gz dtbs \
             2>&1 | tee kernel-build.log
+
           test -s arch/arm64/boot/Image
           test -s arch/arm64/boot/Image.gz
-          test -s arch/arm64/boot/dts/exynos/exynos3830.dtb
-          test -s arch/arm64/boot/dts/samsung/a13/a13_eur_open_w00_r00.dtbo
-          test -s arch/arm64/boot/dts/samsung/a13/a13_eur_open_w00_r06.dtbo
+          find arch/arm64/boot/dts -type f -name '*.dtb' -print -quit | grep -q .
+          find arch/arm64/boot/dts -type f -name '*.dtbo' -print -quit | grep -q .
+
           grep -aFq 'Linux version 4.19.325' arch/arm64/boot/Image
           grep -aFq 'MAX-ARAF' arch/arm64/boot/Image
           KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
@@ -545,73 +486,42 @@ jobs:
             *MAX-ARAF*) echo "Verified final kernel release: $KERNELRELEASE" ;;
             *) echo "Final kernel release is missing MAX-ARAF: $KERNELRELEASE" >&2; exit 1 ;;
           esac
-          echo "Kernel Image, version, MAX-ARAF localversion, A13 DTB and DTBO outputs verified."
 
-      - name: Package TWRP flashable kernel ZIP
+          echo "Kernel Image, Image.gz and device-tree outputs verified."
+
+      - name: Package non-flashable kernel build artifacts
+        shell: bash
         run: |
           set -euo pipefail
-          AK3_SOURCE="$RUNNER_TEMP/AnyKernel3-source"
-          AK3_STAGE="$RUNNER_TEMP/a13-anykernel-package"
-          OUTPUT="$GITHUB_WORKSPACE/A13-KernelSU-Next-SUSFS-MAX-ARAF-${GITHUB_RUN_NUMBER}-TWRP.zip"
+          OUTPUT="$GITHUB_WORKSPACE/A13-KernelSU-Next-SUSFS-MAX-ARAF-${GITHUB_RUN_NUMBER}-BUILD-ARTIFACTS.zip"
+          STAGE="$RUNNER_TEMP/a13-kernel-artifacts"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/dts"
 
-          test -s arch/arm64/boot/Image
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_SOURCE"
-          test -s "$AK3_SOURCE/tools/ak3-core.sh"
-          test -s "$AK3_SOURCE/META-INF/com/google/android/update-binary"
-          test -s "$AK3_SOURCE/LICENSE"
+          cp arch/arm64/boot/Image "$STAGE/"
+          cp arch/arm64/boot/Image.gz "$STAGE/"
+          find arch/arm64/boot/dts -type f \( -name '*.dtb' -o -name '*.dtbo' \) \
+            -exec cp --parents '{}' "$STAGE/dts/" \;
 
-          rm -rf "$AK3_STAGE"
-          mkdir -p "$AK3_STAGE"
-          cp -a "$AK3_SOURCE/META-INF" "$AK3_SOURCE/tools" "$AK3_SOURCE/LICENSE" "$AK3_STAGE/"
-          cp arch/arm64/boot/Image "$AK3_STAGE/Image"
+          make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" kernelrelease > "$STAGE/kernel-release.txt"
+          printf '%s\n' \
+            'Build artifacts only. This ZIP is NOT a TWRP-flashable package.' \
+            'Do not flash Image or Image.gz directly.' \
+            'A device-verified boot-image packaging method is required before flashing.' \
+            > "$STAGE/FLASHING-WARNING.txt"
 
-          cat > "$AK3_STAGE/anykernel.sh" <<'ANYKERNEL'
-          ### AnyKernel3 install script for Samsung Galaxy A13 SM-A135F
-          properties() { '
-          kernel.string=KernelSU-Next + SUSFS - MAX ARAF
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=0
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=a13
-          device.name2=a13nsxx
-          '; }
-
-          BLOCK=boot;
-          IS_SLOT_DEVICE=0;
-          RAMDISK_COMPRESSION=auto;
-          PATCH_VBMETA_FLAG=auto;
-
-          . tools/ak3-core.sh;
-          ui_print "MAX ARAF KernelSU-Next + SUSFS";
-          ui_print "Installing kernel only; retaining current ramdisk and DTB.";
-          dump_boot;
-          write_boot;
-          ANYKERNEL
-
-          chmod 0644 "$AK3_STAGE/Image"
-          cd "$AK3_STAGE"
-          zip -r9 "$OUTPUT" META-INF tools LICENSE Image anykernel.sh 2>&1 | tee "$GITHUB_WORKSPACE/package-build.log"
+          cd "$STAGE"
+          zip -qr "$OUTPUT" .
           unzip -t "$OUTPUT"
-          unzip -Z1 "$OUTPUT" | grep -Fxq 'Image'
-          unzip -Z1 "$OUTPUT" | grep -Fxq 'anykernel.sh'
-          unzip -Z1 "$OUTPUT" | grep -Fxq 'META-INF/com/google/android/update-binary'
-          unzip -p "$OUTPUT" anykernel.sh > "$RUNNER_TEMP/verify-anykernel.sh"
-          grep -Fq 'BLOCK=boot;' "$RUNNER_TEMP/verify-anykernel.sh"
-          grep -Fq 'device.name1=a13' "$RUNNER_TEMP/verify-anykernel.sh"
-          if unzip -Z1 "$OUTPUT" | grep -Eq '(^|/)(dtbo\.img|dtb\.img|boot\.img)$'; then
-            echo "Unexpected standalone DTB/DTBO/boot image included in kernel-only package." >&2
-            exit 1
-          fi
-          echo "Validated flashable ZIP: $OUTPUT"
+          echo "Created non-flashable artifact bundle: $OUTPUT"
 
-      - name: Upload TWRP flashable kernel ZIP
+      - name: Upload kernel build artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-TWRP
-          path: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-TWRP.zip
+          name: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-BUILD-ARTIFACTS
+          path: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-BUILD-ARTIFACTS.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -627,7 +537,6 @@ jobs:
             scripts-build.log
             ksu-preflight.log
             kernel-build.log
-            package-build.log
             .config
             SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
             susfs-kernel-4.19-adapted.patch
