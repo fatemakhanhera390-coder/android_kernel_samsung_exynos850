@@ -22,7 +22,8 @@ jobs:
       DEFCONFIG: exynos850-a13nsxx_defconfig
       KSU_REPO: https://github.com/SuleMareVientu/KernelSU-Next.git
       KSU_BRANCH: next-susfs-4.19
-      KSU_MANAGER_HASH: 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7
+      KSU_NEXT_EXPECTED_SIZE: "0x3e6"
+      KSU_NEXT_EXPECTED_HASH: 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7
       SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
       SUSFS_BRANCH: kernel-4.19
       CROSS_COMPILE: aarch64-linux-gnu-
@@ -110,8 +111,11 @@ jobs:
           test -f KernelSU-Next/kernel/Makefile
           test -f KernelSU-Next/kernel/ksu.c
 
-          if ! grep -R -Fq "$KSU_MANAGER_HASH" KernelSU-Next/kernel; then
-            echo "Required Manager signature hash was not found in the selected KernelSU source." >&2
+          KSU_MAKEFILE="KernelSU-Next/kernel/Makefile"
+          grep -Fq 'KSU_NEXT_EXPECTED_SIZE' "$KSU_MAKEFILE"
+          grep -Fq 'KSU_NEXT_EXPECTED_HASH' "$KSU_MAKEFILE"
+          if ! grep -Fq '79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7' "$KSU_MAKEFILE"; then
+            echo "The selected KernelSU-Next source does not contain the expected Manager signing hash." >&2
             echo "Selected source: $KSU_REPO ($KSU_BRANCH)" >&2
             exit 1
           fi
@@ -141,7 +145,8 @@ jobs:
 
           echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
           echo "KernelSU-Next branch: $(git -C KernelSU-Next branch --show-current)"
-          echo "Manager signature hash: verified"
+          echo "Manager signature compatibility: v3.4.1 target (size ${KSU_NEXT_EXPECTED_SIZE}, hash ${KSU_NEXT_EXPECTED_HASH})"
+          echo "Kernel driver source remains the 4.19 SUSFS-compatible branch: ${KSU_BRANCH}"
 
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
@@ -349,22 +354,71 @@ jobs:
         run: |
           set -Eeuo pipefail
           trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-          test -f drivers/kernelsu/core_hook.c
-          test -f include/linux/susfs_def.h
-          grep -q 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' include/linux/susfs_def.h
+          source_path = Path("drivers/kernelsu/core_hook.c")
+          susfs_defs = Path("include/linux/susfs_def.h")
+          sched_header = Path("include/linux/sched.h")
 
-          echo "KernelSU hook source found: drivers/kernelsu/core_hook.c"
-          grep -nE 'susfs_task_state|TASK_STRUCT_NON_ROOT_USER_APP_PROC|USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE' \
-            drivers/kernelsu/core_hook.c || true
+          for path in (source_path, susfs_defs, sched_header):
+              if not path.is_file():
+                  raise SystemExit(f"Required SUS_PATH source/header missing: {path}")
 
-          if ! grep -q 'susfs_task_state' drivers/kernelsu/core_hook.c; then
-            echo "The selected KernelSU source does not contain the SUSFS task-state hook." >&2
-            echo "Refusing to claim SUS_PATH integration is complete." >&2
-            exit 1
-          fi
+          source = source_path.read_text()
+          defs = susfs_defs.read_text()
+          sched = sched_header.read_text()
 
-          echo "KernelSU SUS_PATH task-state hook presence verified."
+          if "TASK_STRUCT_NON_ROOT_USER_APP_PROC" not in defs:
+              raise SystemExit("SUSFS task-state flag is absent from susfs_def.h")
+          if "susfs_task_state" not in sched:
+              raise SystemExit("SUSFS task-state field is absent from include/linux/sched.h")
+          if "#include <linux/susfs.h>" not in source:
+              raise SystemExit("KernelSU core_hook.c no longer includes linux/susfs.h")
+
+          # The selected KernelSU branch marks a user_struct KABI reserve, while
+          # this SUSFS 4.19 patch consumes task_struct->susfs_task_state. Align
+          # the actual setuid hook instead of weakening the CI check.
+          func_match = re.search(
+              r"\bint\s+ksu_handle_setuid\s*\(.*?\n\}", source, flags=re.S
+          )
+          if not func_match:
+              raise SystemExit("Could not locate the complete ksu_handle_setuid() function")
+
+          func = func_match.group(0)
+          old_marker = re.compile(
+              r"new->user->android_kabi_reserved2\s*\|=\s*"
+              r"USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE\s*;"
+          )
+          task_marker = "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
+
+          if task_marker not in func:
+              if not old_marker.search(func):
+                  raise SystemExit(
+                      "Neither the expected user_struct marker nor the SUSFS task marker "
+                      "was found in ksu_handle_setuid(); refusing an unsafe automatic edit."
+                  )
+              func, count = old_marker.subn(task_marker, func, count=1)
+              if count != 1:
+                  raise SystemExit("Failed to replace the old SUS_PATH marker exactly once")
+              source = source[:func_match.start()] + func + source[func_match.end():]
+
+          if "USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE" in source:
+              raise SystemExit("Obsolete USER_STRUCT_KABI2 marker remains in core_hook.c")
+
+          source_path.write_text(source)
+          verify = source_path.read_text()
+          m = re.search(r"\bint\s+ksu_handle_setuid\s*\(.*?\n\}", verify, flags=re.S)
+          if not m or task_marker not in m.group(0):
+              raise SystemExit("SUS_PATH task marker verification failed inside ksu_handle_setuid()")
+
+          print("KernelSU SUS_PATH marker aligned with SUSFS task_struct state.")
+          PY
+
+          grep -Fq 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' drivers/kernelsu/core_hook.c
+          ! grep -Fq 'USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE' drivers/kernelsu/core_hook.c
+          echo "SUS_PATH source alignment verified."
 
       - name: Configure kernel and KernelSU-Next SUSFS
         shell: bash
@@ -465,6 +519,9 @@ jobs:
           echo "KernelSU/SUSFS preflight compile completed."
           grep -E -- 'KernelSU(-Next)? version:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
             ksu-preflight.log || true
+          grep -Fq -- "-- KernelSU-Next Manager signature size: ${KSU_NEXT_EXPECTED_SIZE}" ksu-preflight.log
+          grep -Fq -- "-- KernelSU-Next Manager signature hash: ${KSU_NEXT_EXPECTED_HASH}" ksu-preflight.log
+          echo "KernelSU-Next Manager signing compatibility verified in compiler output."
 
       - name: Build kernel Image and DTBs
         shell: bash
@@ -540,5 +597,10 @@ jobs:
             .config
             SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
             susfs-kernel-4.19-adapted.patch
+            KernelSU-Next/kernel/Makefile
+            drivers/kernelsu/core_hook.c
+            fs/dcache.c
+            include/linux/sched.h
+            include/linux/susfs_def.h
           if-no-files-found: warn
           retention-days: 7
