@@ -44,7 +44,6 @@ jobs:
             libelf-dev libncurses-dev libssl-dev python3 python-is-python3 \
             rsync dwarves zstd lz4 zip unzip xz-utils
 
-      # Cache the compressed archive (smaller/faster than caching the extracted tree).
       - name: Restore Android Clang archive cache
         id: clang-cache
         uses: actions/cache/restore@v4
@@ -154,10 +153,6 @@ jobs:
           install -m 0644 SUSFS/kernel_patches/include/linux/susfs.h include/linux/susfs.h
           install -m 0644 SUSFS/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
 
-          # This Exynos 4.19.325 tree uses fs_context-based mount creation, while
-          # the upstream 4.19 SUSFS patch hooks vfs_kern_mount and adds mount-ID
-          # fields. Its README warns mount-ID reordering can bootloop non-GKI
-          # devices. Keep the independent SUSFS features, but disable that path.
           python3 - <<'PYPATCH'
           from pathlib import Path
 
@@ -227,9 +222,8 @@ jobs:
               print(f"Omitted {name} hunk(s): {count}")
           PYPATCH
 
-          # Never partially apply if any remaining hunk does not match.
-          if ! patch --batch --forward --fuzz=2 --dry-run -p1 \
-              < susfs-kernel-4.19-adapted.patch > susfs-patch-dry-run.log 2>&1; then
+          if ! patch --batch --forward --fuzz=2 -p1 \
+              --dry-run < susfs-kernel-4.19-adapted.patch > susfs-patch-dry-run.log 2>&1; then
             cat susfs-patch-dry-run.log
             echo "Compatible SUSFS hunks still fail dry-run; kernel source was not patched by this step." >&2
             exit 1
@@ -251,7 +245,6 @@ jobs:
           def write(name, content):
               Path(name).write_text(content)
 
-          # Add the SUS_PATH test at the modern dentry_cmp() location in RCU lookup.
           name = "fs/dcache.c"
           s = read(name)
           if "#include <linux/susfs_def.h>" not in s:
@@ -289,7 +282,6 @@ jobs:
               s = s[:fn.start()] + body + s[fn.end():]
           write(name, s)
 
-          # The task_mmu SUS_KSTAT hunks apply, but its include hunk doesn't match this tree.
           name = "fs/proc/task_mmu.c"
           s = read(name)
           if "#include <linux/susfs_def.h>" not in s:
@@ -303,7 +295,6 @@ jobs:
                   s = s.replace(anchor, "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n" + anchor, 1)
           write(name, s)
 
-          # Add SUSFS uname spoofing after this tree's existing uname override.
           name = "kernel/sys.c"
           s = read(name)
           marker = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)"
@@ -364,7 +355,6 @@ jobs:
       - name: Align KernelSU SUS_PATH marker with SUSFS task state
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -381,35 +371,26 @@ jobs:
           header = header_path.read_text()
 
           if "TASK_STRUCT_NON_ROOT_USER_APP_PROC" not in header:
-              raise SystemExit(
-                  "SUSFS task-state marker is missing from susfs_def.h"
-              )
+              raise SystemExit("SUSFS task-state marker is missing from susfs_def.h")
 
           old = (
               r"new->user->android_kabi_reserved2\s*\|=\s*"
               r"USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE\s*;"
           )
-          replacement = (
-              "current->susfs_task_state |= "
-              "TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
-          )
+          replacement = "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
 
           if replacement not in source:
               source, count = re.subn(old, replacement, source, count=1)
               if count != 1:
                   raise SystemExit(
-                      "Could not safely replace the mismatched "
-                      "user_struct KABI marker in core_hook.c"
+                      "Could not safely replace the mismatched user_struct KABI marker in core_hook.c"
                   )
 
-          # The SUSFS task-state marker is defined in this header.
           include = "#include <linux/susfs_def.h>"
           if include not in source:
               anchor = "#include <linux/susfs.h>"
               if anchor not in source:
-                  raise SystemExit(
-                      "Could not find the CONFIG_KSU_SUSFS include anchor"
-                  )
+                  raise SystemExit("Could not find the CONFIG_KSU_SUSFS include anchor")
               source = source.replace(anchor, anchor + "\n" + include, 1)
 
           if "new->user->android_kabi_reserved2" in source:
@@ -418,11 +399,9 @@ jobs:
               raise SystemExit("SUSFS task-state marker was not installed")
 
           source_path.write_text(source)
-          print(
-              "KernelSU SUS_PATH marker now uses "
-              "current->susfs_task_state, matching the patched SUSFS hooks."
-          )
+          print("KernelSU SUS_PATH marker now uses current->susfs_task_state, matching SUSFS hooks.")
           PY
+
       - name: Configure kernel and KernelSU-Next SUSFS
         run: |
           set -euo pipefail
@@ -510,40 +489,102 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ \
             2>&1 | tee ksu-preflight.log
 
-      - name: Build kernel Image.gz and DTBs
+      - name: Build kernel Image and DTBs
         run: |
           set -euo pipefail
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" Image.gz dtbs \
+            CROSS_COMPILE="$CROSS_COMPILE" Image Image.gz dtbs \
             2>&1 | tee kernel-build.log
+          test -s arch/arm64/boot/Image
           test -s arch/arm64/boot/Image.gz
+          test -s arch/arm64/boot/dts/exynos/exynos3830.dtb
+          test -s arch/arm64/boot/dts/samsung/a13/a13_eur_open_w00_r00.dtbo
+          test -s arch/arm64/boot/dts/samsung/a13/a13_eur_open_w00_r06.dtbo
+          grep -aFq 'Linux version 4.19.325' arch/arm64/boot/Image
+          grep -aFq 'MAX-ARAF' arch/arm64/boot/Image
+          echo "Kernel Image, version, localversion, A13 DTB and DTBO outputs verified."
 
-      - name: Upload kernel artifacts
+      - name: Package TWRP flashable kernel ZIP
+        run: |
+          set -euo pipefail
+          AK3_SOURCE="$RUNNER_TEMP/AnyKernel3-source"
+          AK3_STAGE="$RUNNER_TEMP/a13-anykernel-package"
+          OUTPUT="$GITHUB_WORKSPACE/A13-KernelSU-Next-SUSFS-MAX-ARAF-${GITHUB_RUN_NUMBER}-TWRP.zip"
+
+          test -s arch/arm64/boot/Image
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_SOURCE"
+          test -s "$AK3_SOURCE/tools/ak3-core.sh"
+          test -s "$AK3_SOURCE/META-INF/com/google/android/update-binary"
+          test -s "$AK3_SOURCE/LICENSE"
+
+          rm -rf "$AK3_STAGE"
+          mkdir -p "$AK3_STAGE"
+          cp -a "$AK3_SOURCE/META-INF" "$AK3_SOURCE/tools" "$AK3_SOURCE/LICENSE" "$AK3_STAGE/"
+          cp arch/arm64/boot/Image "$AK3_STAGE/Image"
+
+          cat > "$AK3_STAGE/anykernel.sh" <<'ANYKERNEL'
+          ### AnyKernel3 install script for Samsung Galaxy A13 SM-A135F
+          properties() { '
+          kernel.string=KernelSU-Next + SUSFS - MAX ARAF
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a13
+          device.name2=a13nsxx
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+          ui_print "MAX ARAF KernelSU-Next + SUSFS";
+          ui_print "Installing kernel only; retaining current ramdisk and DTB.";
+          dump_boot;
+          write_boot;
+          ANYKERNEL
+
+          chmod 0644 "$AK3_STAGE/Image"
+          cd "$AK3_STAGE"
+          zip -r9 "$OUTPUT" META-INF tools LICENSE Image anykernel.sh 2>&1 | tee "$GITHUB_WORKSPACE/package-build.log"
+          unzip -t "$OUTPUT"
+          unzip -Z1 "$OUTPUT" | grep -Fxq 'Image'
+          unzip -Z1 "$OUTPUT" | grep -Fxq 'anykernel.sh'
+          unzip -Z1 "$OUTPUT" | grep -Fxq 'META-INF/com/google/android/update-binary'
+          unzip -p "$OUTPUT" anykernel.sh > "$RUNNER_TEMP/verify-anykernel.sh"
+          grep -Fq 'BLOCK=boot;' "$RUNNER_TEMP/verify-anykernel.sh"
+          grep -Fq 'device.name1=a13' "$RUNNER_TEMP/verify-anykernel.sh"
+          if unzip -Z1 "$OUTPUT" | grep -Eq '(^|/)(dtbo\.img|dtb\.img|boot\.img)$'; then
+            echo "Unexpected standalone DTB/DTBO/boot image included in kernel-only package." >&2
+            exit 1
+          fi
+          echo "Validated flashable ZIP: $OUTPUT"
+
+      - name: Upload TWRP flashable kernel ZIP
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}
-          path: |
-            arch/arm64/boot/Image.gz
-            arch/arm64/boot/dts/
-            .config
-            ksu-preflight.log
-            kernel-build.log
-            susfs-compatibility.log
+          name: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-TWRP
+          path: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-TWRP.zip
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload diagnostics even on failure
-        if: always()
+      - name: Upload diagnostics on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: A13-KernelSU-Next-SUSFS-diagnostics-${{ github.run_number }}
           path: |
             susfs-patch.log
+            susfs-patch-dry-run.log
             susfs-compatibility.log
             scripts-build.log
             ksu-preflight.log
             kernel-build.log
+            package-build.log
             .config
             SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
             susfs-kernel-4.19-adapted.patch
