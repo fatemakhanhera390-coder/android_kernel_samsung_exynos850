@@ -20,8 +20,9 @@ jobs:
     env:
       ARCH: arm64
       DEFCONFIG: exynos850-a13nsxx_defconfig
-      KSU_REPO: https://github.com/SuleMareVientu/KernelSU-Next.git
-      KSU_BRANCH: next-susfs-4.19
+      KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+      KSU_BRANCH: legacy
+      KSU_EXPECTED_VERSION: "33333"
       SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
       SUSFS_BRANCH: kernel-4.19
       CROSS_COMPILE: aarch64-linux-gnu-
@@ -132,9 +133,10 @@ jobs:
               path.write_text(data)
           PYKCONFIG
 
+          echo "KernelSU source: $KSU_REPO"
           echo "KernelSU branch: $KSU_BRANCH"
           echo "KernelSU commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
-          echo "KernelSU Manager signature check passed."
+          echo "KernelSU Manager signature hash is present; runtime version will be verified after preflight."
 
       - name: Apply SUSFS with conservative compatibility mode
         run: |
@@ -435,6 +437,13 @@ jobs:
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
 
+          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+          echo "Configured kernel release: $KERNELRELEASE"
+          case "$KERNELRELEASE" in
+            *MAX-ARAF*) ;;
+            *) echo "MAX-ARAF is missing from kernel release: $KERNELRELEASE" >&2; exit 1 ;;
+          esac
+
           for option in \
             CONFIG_KSU=y \
             CONFIG_KPROBES=y \
@@ -488,6 +497,12 @@ jobs:
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ \
             2>&1 | tee ksu-preflight.log
+          if ! grep -Eq -- "-- KernelSU(-Next)? version: ${KSU_EXPECTED_VERSION}([[:space:]]|$)" ksu-preflight.log; then
+            echo "Wrong KernelSU driver version. Expected ${KSU_EXPECTED_VERSION} (Manager v3.4.1 build), refusing to package." >&2
+            grep -E -- "KernelSU(-Next)? version:|Manager signature hash|Manager signature size" ksu-preflight.log || true
+            exit 1
+          fi
+          echo "KernelSU driver version ${KSU_EXPECTED_VERSION} verified for Manager v3.4.1."
 
       - name: Build kernel Image and DTBs
         run: |
@@ -502,7 +517,12 @@ jobs:
           test -s arch/arm64/boot/dts/samsung/a13/a13_eur_open_w00_r06.dtbo
           grep -aFq 'Linux version 4.19.325' arch/arm64/boot/Image
           grep -aFq 'MAX-ARAF' arch/arm64/boot/Image
-          echo "Kernel Image, version, localversion, A13 DTB and DTBO outputs verified."
+          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+          case "$KERNELRELEASE" in
+            *MAX-ARAF*) echo "Verified final kernel release: $KERNELRELEASE" ;;
+            *) echo "Final kernel release is missing MAX-ARAF: $KERNELRELEASE" >&2; exit 1 ;;
+          esac
+          echo "Kernel Image, version, MAX-ARAF localversion, A13 DTB and DTBO outputs verified."
 
       - name: Package TWRP flashable kernel ZIP
         run: |
