@@ -361,6 +361,68 @@ jobs:
           print("SUSFS compatible hunks applied and manual anchors verified.")
           PYSUSFS
 
+      - name: Align KernelSU SUS_PATH marker with SUSFS task state
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          source_path = Path("drivers/kernelsu/core_hook.c")
+          header_path = Path("include/linux/susfs_def.h")
+
+          if not source_path.is_file():
+              raise SystemExit(f"KernelSU source missing: {source_path}")
+          if not header_path.is_file():
+              raise SystemExit(f"SUSFS definitions missing: {header_path}")
+
+          source = source_path.read_text()
+          header = header_path.read_text()
+
+          if "TASK_STRUCT_NON_ROOT_USER_APP_PROC" not in header:
+              raise SystemExit(
+                  "SUSFS task-state marker is missing from susfs_def.h"
+              )
+
+          old = (
+              r"new->user->android_kabi_reserved2\s*\|=\s*"
+              r"USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE\s*;"
+          )
+          replacement = (
+              "current->susfs_task_state |= "
+              "TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
+          )
+
+          if replacement not in source:
+              source, count = re.subn(old, replacement, source, count=1)
+              if count != 1:
+                  raise SystemExit(
+                      "Could not safely replace the mismatched "
+                      "user_struct KABI marker in core_hook.c"
+                  )
+
+          # The SUSFS task-state marker is defined in this header.
+          include = "#include <linux/susfs_def.h>"
+          if include not in source:
+              anchor = "#include <linux/susfs.h>"
+              if anchor not in source:
+                  raise SystemExit(
+                      "Could not find the CONFIG_KSU_SUSFS include anchor"
+                  )
+              source = source.replace(anchor, anchor + "\n" + include, 1)
+
+          if "new->user->android_kabi_reserved2" in source:
+              raise SystemExit("Old user_struct KABI access remains")
+          if replacement not in source:
+              raise SystemExit("SUSFS task-state marker was not installed")
+
+          source_path.write_text(source)
+          print(
+              "KernelSU SUS_PATH marker now uses "
+              "current->susfs_task_state, matching the patched SUSFS hooks."
+          )
+          PY
       - name: Configure kernel and KernelSU-Next SUSFS
         run: |
           set -euo pipefail
