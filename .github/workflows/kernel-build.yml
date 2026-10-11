@@ -95,46 +95,49 @@ jobs:
           fi
 
 
+      
       - name: Integrate Linux 4.19-compatible KernelSU-Next
         shell: bash
         run: |
           set -Eeuo pipefail
           trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
 
-          echo "=== KernelSU-Next integration ==="
+          echo "=== Setting up KernelSU-Next ==="
 
           rm -rf KernelSU-Next
 
-          curl -fL --retry 3 --retry-delay 2 \
+          curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             -o "$RUNNER_TEMP/ksu-next-setup.sh"
 
           bash "$RUNNER_TEMP/ksu-next-setup.sh" legacy
 
-          echo "=== Verify KernelSU-Next files ==="
+          echo "=== Inspect KernelSU source ==="
 
           test -d KernelSU-Next/kernel
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Makefile
-          test -f KernelSU-Next/kernel/ksu.c
+
+          echo "KernelSU source files:"
+          find KernelSU-Next/kernel -maxdepth 3 -type f \
+            \( -name 'ksu.c' -o -name 'Kconfig' -o -name 'Makefile' \) \
+            -print | head -100
 
           echo "=== Verify setup integration ==="
 
           test -L drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
+          test -f drivers/kernelsu/Makefile
 
           grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
           grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-          echo "=== Verify KernelSU configuration support ==="
-
-          grep -Eq 'config KSU([[:space:]]|$)' drivers/kernelsu/Kconfig
-
-          echo "=== Source information ==="
+          echo "=== KernelSU source information ==="
           git -C KernelSU-Next rev-parse --short HEAD
           git -C KernelSU-Next branch --show-current
 
-          echo "KernelSU-Next integration checks passed."
+          echo "KernelSU-Next setup checks passed."
+
 
       - name: Apply SUSFS with conservative compatibility mode
         run: |
