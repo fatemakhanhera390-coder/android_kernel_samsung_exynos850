@@ -408,6 +408,76 @@ jobs:
 
 
 
+      - name: Adapt official KernelSU-Next mount namespace and seccomp cache for Linux 4.19
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # 1) Linux 4.19 Samsung source has no include/uapi/linux/mount.h.
+          # linux/fs.h already includes uapi/linux/fs.h, which defines MS_PRIVATE/MS_REC.
+          mount_path = Path("KernelSU-Next/kernel/infra/su_mount_ns.c")
+          mount_source = mount_path.read_text()
+          missing_header = "#include <uapi/linux/mount.h>"
+          if missing_header in mount_source:
+              mount_source = mount_source.replace(missing_header + "\n", "", 1)
+              mount_path.write_text(mount_source)
+              print("Removed unavailable uapi/linux/mount.h include from su_mount_ns.c")
+          if missing_header in mount_path.read_text():
+              raise SystemExit("su_mount_ns.c still includes the unavailable uapi/linux/mount.h")
+          if "#include <linux/fs.h>" not in mount_path.read_text():
+              raise SystemExit("su_mount_ns.c must retain linux/fs.h for Linux 4.19 mount flags")
+
+          uapi_fs = Path("include/uapi/linux/fs.h").read_text()
+          for macro in ("MS_PRIVATE", "MS_REC"):
+              if macro not in uapi_fs:
+                  raise SystemExit(f"Target kernel lacks expected legacy mount flag: {macro}")
+
+          # 2) Older kernels do not implement the SECCOMP_ARCH_NATIVE_NR cache
+          # ABI/struct layout expected by the official v3.4.1 seccomp-cache helper.
+          # Provide no-op helpers when that kernel API is absent; never overlay an
+          # incompatible modern struct seccomp_filter layout onto Linux 4.19.
+          seccomp_path = Path("KernelSU-Next/kernel/infra/seccomp_cache.c")
+          seccomp_source = seccomp_path.read_text()
+          begin_marker = "/* KSU_NEXT_419_SECCOMP_CACHE_COMPAT_BEGIN */"
+          end_marker = "/* KSU_NEXT_419_SECCOMP_CACHE_COMPAT_END */"
+          if begin_marker not in seccomp_source:
+              include_marker = '#include "infra/seccomp_cache.h"'
+              if seccomp_source.count(include_marker) != 1:
+                  raise SystemExit("Could not find unique seccomp_cache.h include in seccomp_cache.c")
+              compat = '''
+          /* KSU_NEXT_419_SECCOMP_CACHE_COMPAT_BEGIN */
+          #if !defined(SECCOMP_ARCH_NATIVE_NR)
+          /* Linux 4.19 has no seccomp decision-cache bitmap to update. */
+          void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+
+          void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+          #else
+          /* KSU_NEXT_419_SECCOMP_CACHE_COMPAT_END */
+          '''
+              seccomp_source = seccomp_source.replace(include_marker, include_marker + "\n" + compat, 1)
+              seccomp_source = seccomp_source.rstrip() + "\n#endif /* !defined(SECCOMP_ARCH_NATIVE_NR) fallback */\n"
+              seccomp_path.write_text(seccomp_source)
+
+          verify = seccomp_path.read_text()
+          if begin_marker not in verify or end_marker not in verify:
+              raise SystemExit("seccomp_cache.c compatibility guard was not written")
+          if "#if !defined(SECCOMP_ARCH_NATIVE_NR)" not in verify:
+              raise SystemExit("seccomp_cache.c legacy seccomp-cache fallback is missing")
+          if not verify.rstrip().endswith("#endif /* !defined(SECCOMP_ARCH_NATIVE_NR) fallback */"):
+              raise SystemExit("seccomp_cache.c compatibility guard is not closed at EOF")
+          print("Official KernelSU-Next Linux 4.19 mount/seccomp compatibility checks passed")
+          PY
+
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
         run: |
@@ -860,6 +930,8 @@ jobs:
             SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
             susfs-kernel-4.19-adapted.patch
             KernelSU-Next/kernel/Kbuild
+            KernelSU-Next/kernel/infra/su_mount_ns.c
+            KernelSU-Next/kernel/infra/seccomp_cache.c
             drivers/kernelsu/hook/setuid_hook.c
             fs/dcache.c
             include/linux/sched.h
