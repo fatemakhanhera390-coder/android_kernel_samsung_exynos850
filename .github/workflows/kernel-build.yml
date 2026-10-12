@@ -676,6 +676,102 @@ jobs:
           print("Verified official KernelSU-Next allowlist compatibility for target Linux 4.19 API.")
           PYALLOWLIST
 
+      - name: Adapt official KernelSU-Next app profile for Linux 4.19 seccomp API
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYAPPPROFILE'
+          from pathlib import Path
+          import re
+
+          source_path = Path("KernelSU-Next/kernel/policy/app_profile.c")
+          header_path = Path("include/linux/seccomp.h")
+          implementation_path = Path("kernel/seccomp.c")
+          for path in (source_path, header_path, implementation_path):
+              if not path.is_file():
+                  raise SystemExit(f"Required app-profile compatibility file missing: {path}")
+
+          source = source_path.read_text()
+          header = header_path.read_text()
+          implementation = implementation_path.read_text()
+          changes = []
+
+          # Determine whether this exact kernel tree's struct seccomp has filter_count.
+          struct_match = re.search(r"\bstruct\s+seccomp\s*\{(.*?)\}\s*;", header, flags=re.S)
+          if not struct_match:
+              raise SystemExit("Could not locate struct seccomp in include/linux/seccomp.h")
+          has_filter_count = re.search(r"\bfilter_count\b", struct_match.group(1)) is not None
+          filter_count_assignment = re.compile(
+              r"^[ \t]*atomic_set\(\s*&current->seccomp\.filter_count\s*,\s*0\s*\);[ \t]*$",
+              flags=re.M,
+          )
+          if not has_filter_count:
+              if "current->seccomp.filter_count" in source:
+                  source, count = filter_count_assignment.subn(
+                      "\t/* Older kernels have no seccomp.filter_count member. */",
+                      source,
+                      count=1,
+                  )
+                  if count != 1:
+                      raise SystemExit("Found filter_count access but could not isolate its atomic_set() statement")
+                  changes.append("removed filter_count reset because target struct seccomp lacks that field")
+              if "current->seccomp.filter_count" in source:
+                  raise SystemExit("Incompatible seccomp.filter_count access remains in app_profile.c")
+          else:
+              print("Target struct seccomp contains filter_count; preserved its reset.")
+
+          # Linux 4.19 uses put_seccomp_filter(); seccomp_filter_release() and its
+          # notification-orphaning behavior were added in a later seccomp API.
+          has_release_impl = re.search(
+              r"(?m)^\s*(?:static\s+)?void\s+seccomp_filter_release\s*\(\s*struct\s+task_struct\s*\*",
+              implementation,
+          ) is not None
+          if not has_release_impl:
+              has_put_decl = re.search(
+                  r"\b(?:extern\s+)?void\s+put_seccomp_filter\s*\(\s*struct\s+task_struct\s*\*",
+                  header,
+              ) is not None
+              has_put_impl = re.search(
+                  r"(?m)^\s*void\s+put_seccomp_filter\s*\(\s*struct\s+task_struct\s*\*",
+                  implementation,
+              ) is not None
+              if not (has_put_decl and has_put_impl):
+                  raise SystemExit(
+                      "Target kernel has no seccomp_filter_release() and a verified put_seccomp_filter() fallback was not found"
+                  )
+
+              prototype = re.compile(
+                  r"(?m)^\s*void\s+seccomp_filter_release\s*\(\s*struct\s+task_struct\s*\*tsk\s*\)\s*;\s*$"
+              )
+              source, proto_count = prototype.subn(
+                  "/* Legacy Linux 4.19 releases seccomp filter references with put_seccomp_filter(). */",
+                  source,
+                  count=1,
+              )
+              call = re.compile(r"\bseccomp_filter_release\s*\(\s*fake\s*\)\s*;")
+              source, call_count = call.subn("put_seccomp_filter(fake);", source, count=1)
+              if proto_count != 1 or call_count != 1:
+                  raise SystemExit(
+                      f"Could not safely adapt seccomp filter release (prototype={proto_count}, call={call_count})"
+                  )
+              changes.append("adapted seccomp filter release to the verified Linux 4.19 put_seccomp_filter() API")
+
+          source_path.write_text(source)
+          verify = source_path.read_text()
+          if not has_filter_count and "current->seccomp.filter_count" in verify:
+              raise SystemExit("Verification failed: unsupported filter_count access remains")
+          if not has_release_impl:
+              if "seccomp_filter_release(fake)" in verify:
+                  raise SystemExit("Verification failed: unsupported seccomp_filter_release() call remains")
+              if "put_seccomp_filter(fake);" not in verify:
+                  raise SystemExit("Verification failed: legacy put_seccomp_filter() call missing")
+          print("KernelSU-Next app-profile seccomp compatibility verified:")
+          for change in changes:
+              print(" - " + change)
+          if not changes:
+              print(" - no changes required for the target kernel's seccomp API")
+          PYAPPPROFILE
+
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
         run: |
@@ -1131,6 +1227,9 @@ jobs:
             KernelSU-Next/kernel/infra/su_mount_ns.c
             KernelSU-Next/kernel/infra/seccomp_cache.c
             KernelSU-Next/kernel/manager/pkg_observer.c
+            KernelSU-Next/kernel/policy/app_profile.c
+            include/linux/seccomp.h
+            kernel/seccomp.c
             include/linux/task_work.h
             kernel/task_work.c
             include/linux/fsnotify_backend.h
