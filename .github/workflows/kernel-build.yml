@@ -602,6 +602,80 @@ jobs:
               print(" - " + change)
           PYKSUPKG
 
+      - name: Adapt official KernelSU-Next allowlist for Linux 4.19 task APIs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYALLOWLIST'
+          from pathlib import Path
+          import re
+
+          source_path = Path("KernelSU-Next/kernel/policy/allowlist.c")
+          task_work_path = Path("include/linux/task_work.h")
+          task_stack_path = Path("include/linux/task_stack.h")
+
+          for path in (source_path, task_work_path, task_stack_path):
+              if not path.is_file():
+                  raise SystemExit(f"Required allowlist compatibility file missing: {path}")
+
+          source = source_path.read_text()
+          task_work_header = task_work_path.read_text()
+          task_stack_header = task_stack_path.read_text()
+
+          # Samsung Linux 4.19 declares task_work_add(task, work, bool notify),
+          # where true requests the notify-resume behavior used by TWA_RESUME.
+          declaration = re.search(
+              r"\bint\s+task_work_add\s*\(([^;]*?)\)\s*;",
+              task_work_header,
+              flags=re.S,
+          )
+          if not declaration:
+              raise SystemExit("Could not parse task_work_add() declaration from include/linux/task_work.h")
+          declaration_args = re.sub(r"\s+", " ", declaration.group(1)).strip()
+          legacy_bool_api = bool(re.search(r"\bbool\b", declaration_args))
+
+          if legacy_bool_api:
+              call_pattern = re.compile(
+                  r"\btask_work_add\s*\(\s*tsk\s*,\s*cb\s*,\s*TWA_RESUME\s*\)"
+              )
+              source, replacements = call_pattern.subn("task_work_add(tsk, cb, true)", source)
+              if replacements == 0 and "task_work_add(tsk, cb, true)" not in source:
+                  raise SystemExit("Expected task_work_add(tsk, cb, TWA_RESUME) call not found in allowlist.c")
+              if replacements > 1:
+                  raise SystemExit(f"Expected at most one allowlist task_work_add replacement, found {replacements}")
+              print("Adapted allowlist task_work_add() to legacy bool notify API (true).")
+          elif "TWA_RESUME" not in task_work_header:
+              raise SystemExit(
+                  "Unsupported task_work_add() API: neither legacy bool notify nor TWA_RESUME was detected"
+              )
+
+          # This kernel declares put_task_struct() in linux/task_stack.h, which
+          # allowlist.c did not include; add the proper declaration header.
+          declaration_pattern = re.compile(
+              r"\bput_task_struct\s*\(\s*struct\s+task_struct\s*\*"
+          )
+          if not declaration_pattern.search(task_stack_header):
+              raise SystemExit("put_task_struct() declaration not found in include/linux/task_stack.h")
+
+          include = "#include <linux/task_stack.h>"
+          if include not in source:
+              anchor = "#include <linux/task_work.h>"
+              if source.count(anchor) != 1:
+                  raise SystemExit("Could not find a unique task_work.h include in policy/allowlist.c")
+              source = source.replace(anchor, anchor + "\n" + include, 1)
+
+          source_path.write_text(source)
+          verify = source_path.read_text()
+          if legacy_bool_api and "task_work_add(tsk, cb, TWA_RESUME)" in verify:
+              raise SystemExit("TWA_RESUME remains in allowlist.c despite legacy bool notify API")
+          if include not in verify:
+              raise SystemExit("linux/task_stack.h include was not added to allowlist.c")
+          if not declaration_pattern.search(task_stack_header):
+              raise SystemExit("put_task_struct() declaration verification failed")
+
+          print("Verified official KernelSU-Next allowlist compatibility for target Linux 4.19 API.")
+          PYALLOWLIST
+
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
         run: |
