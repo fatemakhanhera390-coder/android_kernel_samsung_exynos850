@@ -114,12 +114,20 @@ jobs:
           git -C KernelSU-Next fetch --tags --force origin
           git -C KernelSU-Next checkout --detach "$KSU_TAG"
 
-          ACTUAL_COMMIT="$(git -C KernelSU-Next rev-parse --short HEAD)"
+          
+          ACTUAL_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
+          ACTUAL_COMMIT_SHORT="${ACTUAL_COMMIT:0:${#KSU_EXPECTED_COMMIT_SHORT}}"
           ACTUAL_TAG="$(git -C KernelSU-Next describe --tags --exact-match HEAD)"
           echo "Official KernelSU-Next tag: $ACTUAL_TAG"
           echo "Official KernelSU-Next commit: $ACTUAL_COMMIT"
+          echo "Verified commit prefix: $ACTUAL_COMMIT_SHORT"
           test "$ACTUAL_TAG" = "$KSU_TAG"
-          test "$ACTUAL_COMMIT" = "$KSU_EXPECTED_COMMIT_SHORT"
+          if [ "$ACTUAL_COMMIT_SHORT" != "$KSU_EXPECTED_COMMIT_SHORT" ]; then
+            echo "ERROR: Commit does not match expected v3.4.1 commit." >&2
+            echo "Expected prefix: $KSU_EXPECTED_COMMIT_SHORT" >&2
+            echo "Actual commit: $ACTUAL_COMMIT" >&2
+            exit 1
+          fi
 
           test -s KernelSU-Next/kernel/Kconfig
           test -s KernelSU-Next/kernel/Kbuild
