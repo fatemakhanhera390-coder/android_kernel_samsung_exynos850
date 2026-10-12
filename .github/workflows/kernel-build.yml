@@ -1,4 +1,4 @@
-name: A13 KernelSU-Next SUSFS Build - MAX ARAF
+name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF
 
 on:
   workflow_dispatch:
@@ -20,8 +20,10 @@ jobs:
     env:
       ARCH: arm64
       DEFCONFIG: exynos850-a13nsxx_defconfig
-      KSU_REPO: https://github.com/SuleMareVientu/KernelSU-Next.git
-      KSU_BRANCH: next-susfs-4.19
+      KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+      KSU_TAG: v3.4.1
+      KSU_EXPECTED_COMMIT_SHORT: 8f902ae
+      KSU_EXPECTED_VERSION: "33333"
       KSU_NEXT_EXPECTED_SIZE: "0x3e6"
       KSU_NEXT_EXPECTED_HASH: 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7
       KERNEL_LOCALVERSION: "-MAX-ARAF"
@@ -99,27 +101,142 @@ jobs:
             exit 1
           fi
 
-      - name: Integrate KernelSU-Next SUSFS-compatible source
+      - name: Integrate official KernelSU-Next v3.4.1 (33333)
         shell: bash
         run: |
           set -Eeuo pipefail
           trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
 
           rm -rf KernelSU-Next
-          git clone --depth=1 --single-branch --branch "$KSU_BRANCH" "$KSU_REPO" KernelSU-Next
+          # Full history is required: official KernelSU-Next derives KSU_VERSION
+          # from 30000 + git rev-list --count HEAD. A depth=1 clone gives a false version.
+          git clone "$KSU_REPO" KernelSU-Next
+          git -C KernelSU-Next fetch --tags --force origin
+          git -C KernelSU-Next checkout --detach "$KSU_TAG"
 
-          test -f KernelSU-Next/kernel/Kconfig
-          test -f KernelSU-Next/kernel/Makefile
-          test -f KernelSU-Next/kernel/ksu.c
+          ACTUAL_COMMIT="$(git -C KernelSU-Next rev-parse --short HEAD)"
+          ACTUAL_TAG="$(git -C KernelSU-Next describe --tags --exact-match HEAD)"
+          echo "Official KernelSU-Next tag: $ACTUAL_TAG"
+          echo "Official KernelSU-Next commit: $ACTUAL_COMMIT"
+          test "$ACTUAL_TAG" = "$KSU_TAG"
+          test "$ACTUAL_COMMIT" = "$KSU_EXPECTED_COMMIT_SHORT"
 
-          KSU_MAKEFILE="KernelSU-Next/kernel/Makefile"
-          grep -Fq 'KSU_NEXT_EXPECTED_SIZE' "$KSU_MAKEFILE"
-          grep -Fq 'KSU_NEXT_EXPECTED_HASH' "$KSU_MAKEFILE"
-          if ! grep -Fq '79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7' "$KSU_MAKEFILE"; then
-            echo "The selected KernelSU-Next source does not contain the expected Manager signing hash." >&2
-            echo "Selected source: $KSU_REPO ($KSU_BRANCH)" >&2
-            exit 1
-          fi
+          test -s KernelSU-Next/kernel/Kconfig
+          test -s KernelSU-Next/kernel/Kbuild
+          test -s KernelSU-Next/kernel/core/init.c
+          test -s KernelSU-Next/kernel/hook/setuid_hook.c
+
+          KSU_KBUILD="KernelSU-Next/kernel/Kbuild"
+          grep -Fq "KSU_NEXT_MANAGER_SIZE := ${KSU_NEXT_EXPECTED_SIZE}" "$KSU_KBUILD"
+          grep -Fq "KSU_NEXT_MANAGER_HASH := ${KSU_NEXT_EXPECTED_HASH}" "$KSU_KBUILD"
+
+          # The official v3.4.1 source does not carry the SUSFS Kconfig symbols
+          # from the old third-party branch. Define those kernel-side options here
+          # so the existing Linux 4.19 SUSFS patch can still be configured.
+          python3 - <<'PYKCONFIG'
+          from pathlib import Path
+
+          path = Path("KernelSU-Next/kernel/Kconfig")
+          data = path.read_text()
+          block = '''config KSU_SUSFS
+          	bool "SUSFS support"
+          	depends on KSU
+          	default y
+
+          config KSU_SUSFS_HAS_MAGIC_MOUNT
+          	bool "SUSFS magic mount support"
+          	depends on KSU_SUSFS
+          	default y
+
+          config KSU_SUSFS_SUS_PATH
+          	bool "SUSFS path hiding"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_SUS_MOUNT
+          	bool "SUSFS mount hiding"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          	bool "SUSFS automatically hide KernelSU mounts"
+          	depends on KSU_SUSFS_SUS_MOUNT
+          	default n
+
+          config KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          	bool "SUSFS automatically hide bind mounts"
+          	depends on KSU_SUSFS_SUS_MOUNT
+          	default n
+
+          config KSU_SUSFS_SUS_KSTAT
+          	bool "SUSFS stat spoofing"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_SUS_OVERLAYFS
+          	bool "SUSFS overlayfs support"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_TRY_UMOUNT
+          	bool "SUSFS try umount"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          	bool "SUSFS automatic try umount for bind mounts"
+          	depends on KSU_SUSFS_TRY_UMOUNT
+          	default n
+
+          config KSU_SUSFS_SPOOF_UNAME
+          	bool "SUSFS uname spoofing"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          	bool "SUSFS cmdline/bootconfig spoofing"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_OPEN_REDIRECT
+          	bool "SUSFS open redirect"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_SUS_SU
+          	bool "SUSFS sus su support"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_ENABLE_LOG
+          	bool "SUSFS logging"
+          	depends on KSU_SUSFS
+          	default n
+
+          config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          	bool "Hide KernelSU/SUSFS symbols"
+          	depends on KSU_SUSFS
+          	default n
+          '''
+          if "config KSU_SUSFS\n" not in data:
+              pos = data.rfind("endmenu")
+              if pos < 0:
+                  raise SystemExit("Cannot add SUSFS options: endmenu missing in official Kconfig")
+              data = data[:pos] + block + "\n" + data[pos:]
+              path.write_text(data)
+          required = [
+              "config KSU_SUSFS\n",
+              "config KSU_SUSFS_SUS_PATH\n",
+              "config KSU_SUSFS_SUS_KSTAT\n",
+              "config KSU_SUSFS_SUS_OVERLAYFS\n",
+              "config KSU_SUSFS_SPOOF_UNAME\n",
+              "config KSU_SUSFS_OPEN_REDIRECT\n",
+          ]
+          final = path.read_text()
+          for item in required:
+              if item not in final:
+                  raise SystemExit(f"Missing official-tag SUSFS Kconfig option: {item.strip()}")
+          PYKCONFIG
 
           rm -rf drivers/kernelsu
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
@@ -128,7 +245,7 @@ jobs:
             printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
 
           grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
-            python3 - <<'PY'
+            python3 - <<'PYDRIVERKCONFIG'
           from pathlib import Path
           p = Path('drivers/Kconfig')
           s = p.read_text()
@@ -138,16 +255,12 @@ jobs:
               raise SystemExit('Could not find final endmenu in drivers/Kconfig')
           s = s[:i] + 'source "drivers/kernelsu/Kconfig"\n\n' + s[i:]
           p.write_text(s)
-          PY
+          PYDRIVERKCONFIG
 
           test -L drivers/kernelsu
           grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
           grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-
-          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
-          echo "KernelSU-Next branch: $(git -C KernelSU-Next branch --show-current)"
-          echo "Manager signature compatibility: v3.4.1 target (size ${KSU_NEXT_EXPECTED_SIZE}, hash ${KSU_NEXT_EXPECTED_HASH})"
-          echo "Kernel driver source remains the 4.19 SUSFS-compatible branch: ${KSU_BRANCH}"
+          echo "Integrated official KernelSU-Next ${KSU_TAG} (${ACTUAL_COMMIT}); SUSFS kernel options added separately."
 
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
@@ -350,76 +463,70 @@ jobs:
           print("SUSFS compatible hunks applied and manual anchors verified.")
           PYSUSFS
 
-      - name: Align KernelSU SUS_PATH marker with SUSFS task state
+      - name: Align official v3.4.1 setuid hook with SUSFS task state
         shell: bash
         run: |
           set -Eeuo pipefail
           trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
-          python3 - <<'PY'
+          python3 - <<'PYSUSPATH'
           from pathlib import Path
           import re
 
-          source_path = Path("drivers/kernelsu/core_hook.c")
-          susfs_defs = Path("include/linux/susfs_def.h")
-          sched_header = Path("include/linux/sched.h")
-
-          for path in (source_path, susfs_defs, sched_header):
+          source_path = Path("drivers/kernelsu/hook/setuid_hook.c")
+          defs_path = Path("include/linux/susfs_def.h")
+          sched_path = Path("include/linux/sched.h")
+          for path in (source_path, defs_path, sched_path):
               if not path.is_file():
-                  raise SystemExit(f"Required SUS_PATH source/header missing: {path}")
+                  raise SystemExit(f"Required SUS_PATH file missing: {path}")
 
           source = source_path.read_text()
-          defs = susfs_defs.read_text()
-          sched = sched_header.read_text()
-
+          defs = defs_path.read_text()
+          sched = sched_path.read_text()
           if "TASK_STRUCT_NON_ROOT_USER_APP_PROC" not in defs:
               raise SystemExit("SUSFS task-state flag is absent from susfs_def.h")
           if "susfs_task_state" not in sched:
-              raise SystemExit("SUSFS task-state field is absent from include/linux/sched.h")
-          if "#include <linux/susfs.h>" not in source:
-              raise SystemExit("KernelSU core_hook.c no longer includes linux/susfs.h")
+              raise SystemExit("susfs_task_state field is absent from include/linux/sched.h")
 
-          # The selected KernelSU branch marks a user_struct KABI reserve, while
-          # this SUSFS 4.19 patch consumes task_struct->susfs_task_state. Align
-          # the actual setuid hook instead of weakening the CI check.
-          func_match = re.search(
-              r"\bint\s+ksu_handle_setuid\s*\(.*?\n\}", source, flags=re.S
-          )
-          if not func_match:
-              raise SystemExit("Could not locate the complete ksu_handle_setuid() function")
+          include = "#include <linux/susfs_def.h>"
+          if include not in source:
+              anchor = "#include <linux/uidgid.h>"
+              if anchor not in source:
+                  raise SystemExit("setuid_hook.c: include anchor not found")
+              source = source.replace(anchor, anchor + "\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n" + include + "\n#endif", 1)
 
-          func = func_match.group(0)
-          old_marker = re.compile(
-              r"new->user->android_kabi_reserved2\s*\|=\s*"
-              r"USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE\s*;"
-          )
-          task_marker = "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;"
-
-          if task_marker not in func:
-              if not old_marker.search(func):
-                  raise SystemExit(
-                      "Neither the expected user_struct marker nor the SUSFS task marker "
-                      "was found in ksu_handle_setuid(); refusing an unsafe automatic edit."
-                  )
-              func, count = old_marker.subn(task_marker, func, count=1)
-              if count != 1:
-                  raise SystemExit("Failed to replace the old SUS_PATH marker exactly once")
-              source = source[:func_match.start()] + func + source[func_match.end():]
-
-          if "USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE" in source:
-              raise SystemExit("Obsolete USER_STRUCT_KABI2 marker remains in core_hook.c")
+          task_code = r'''    #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+              /* Mark non-root Android application UIDs for SUSFS path filtering. */
+              if (new_uid != (uid_t)-1) {
+                  uid_t appid = new_uid % 100000;
+                  if (appid >= 10000 && appid <= 19999 &&
+                      !ksu_is_allow_uid_for_current(new_uid)) {
+                      current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;
+                  } else {
+                      current->susfs_task_state &= ~TASK_STRUCT_NON_ROOT_USER_APP_PROC;
+                  }
+              }
+          #endif
+          '''
+          if "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;" not in source:
+              anchor_re = re.compile(
+                  r'(?m)^[ \t]*pr_info\("handle_setresuid from %d to %d\\n", old_uid, new_uid\);[ \t]*$'
+              )
+              m = anchor_re.search(source)
+              if not m:
+                  raise SystemExit("Could not locate official v3.4.1 ksu_handle_setresuid() insertion anchor")
+              source = source[:m.end()] + "\n" + task_code + source[m.end():]
 
           source_path.write_text(source)
           verify = source_path.read_text()
-          m = re.search(r"\bint\s+ksu_handle_setuid\s*\(.*?\n\}", verify, flags=re.S)
-          if not m or task_marker not in m.group(0):
-              raise SystemExit("SUS_PATH task marker verification failed inside ksu_handle_setuid()")
+          if include not in verify or "current->susfs_task_state |= TASK_STRUCT_NON_ROOT_USER_APP_PROC;" not in verify:
+              raise SystemExit("Official v3.4.1 SUS_PATH setuid hook verification failed")
+          if "ksu_handle_setresuid" not in verify:
+              raise SystemExit("Official v3.4.1 setuid handler was not found")
+          print("Official v3.4.1 setuid hook aligned with SUSFS task-state marker.")
+          PYSUSPATH
 
-          print("KernelSU SUS_PATH marker aligned with SUSFS task_struct state.")
-          PY
-
-          grep -Fq 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' drivers/kernelsu/core_hook.c
-          ! grep -Fq 'USER_STRUCT_KABI2_NON_ROOT_USER_APP_PROFILE' drivers/kernelsu/core_hook.c
-          echo "SUS_PATH source alignment verified."
+          grep -Fq 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' drivers/kernelsu/hook/setuid_hook.c
+          echo "Official v3.4.1 SUS_PATH source alignment verified."
 
       - name: Configure kernel and KernelSU-Next SUSFS
         shell: bash
@@ -520,11 +627,16 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
             drivers/kernelsu/ 2>&1 | tee ksu-preflight.log
           echo "KernelSU/SUSFS preflight compile completed."
-          grep -E -- 'KernelSU(-Next)? version:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
+          grep -E -- 'KernelSU(-Next)? version:|KernelSU-Next tag:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
             ksu-preflight.log || true
+          grep -Fq -- "-- KernelSU-Next version: ${KSU_EXPECTED_VERSION}" ksu-preflight.log || {
+            echo "Wrong driver version: expected ${KSU_EXPECTED_VERSION} from official ${KSU_TAG}." >&2
+            exit 1
+          }
+          grep -Fq -- "-- KernelSU-Next tag: ${KSU_TAG}" ksu-preflight.log
           grep -Fq -- "-- KernelSU-Next Manager signature size: ${KSU_NEXT_EXPECTED_SIZE}" ksu-preflight.log
           grep -Fq -- "-- KernelSU-Next Manager signature hash: ${KSU_NEXT_EXPECTED_HASH}" ksu-preflight.log
-          echo "KernelSU-Next Manager signing compatibility verified in compiler output."
+          echo "Verified official KernelSU-Next ${KSU_TAG} driver version ${KSU_EXPECTED_VERSION} and Manager signature fingerprint."
 
       - name: Build kernel Image and DTBs
         shell: bash
@@ -601,8 +713,8 @@ jobs:
             .config
             SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
             susfs-kernel-4.19-adapted.patch
-            KernelSU-Next/kernel/Makefile
-            drivers/kernelsu/core_hook.c
+            KernelSU-Next/kernel/Kbuild
+            drivers/kernelsu/hook/setuid_hook.c
             fs/dcache.c
             include/linux/sched.h
             include/linux/susfs_def.h
