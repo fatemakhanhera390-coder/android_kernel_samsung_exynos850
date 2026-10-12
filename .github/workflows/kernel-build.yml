@@ -478,6 +478,130 @@ jobs:
           print("Official KernelSU-Next Linux 4.19 mount/seccomp compatibility checks passed")
           PY
 
+      - name: Adapt official KernelSU-Next pkg_observer for Samsung 4.19 APIs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYKSUPKG'
+          from pathlib import Path
+          import re
+
+          source_path = Path("KernelSU-Next/kernel/manager/pkg_observer.c")
+          task_header_path = Path("include/linux/task_work.h")
+          task_impl_path = Path("kernel/task_work.c")
+          fsnotify_header_path = Path("include/linux/fsnotify_backend.h")
+
+          for path in (source_path, task_header_path, task_impl_path, fsnotify_header_path):
+              if not path.is_file():
+                  raise SystemExit(f"Required compatibility source/header missing: {path}")
+
+          source = source_path.read_text()
+          task_header = task_header_path.read_text()
+          task_impl = task_impl_path.read_text()
+          fsnotify_header = fsnotify_header_path.read_text()
+          changes = []
+
+          # This Samsung 4.19 tree uses task_work_add(task, work, bool notify),
+          # not the newer TWA_RESUME enum. true preserves notify-resume behavior.
+          declaration = re.search(r"\bint\s+task_work_add\s*\(([^;]*?)\)\s*;", task_header, re.S)
+          if not declaration:
+              raise SystemExit("Could not parse task_work_add() declaration in include/linux/task_work.h")
+          decl_text = re.sub(r"\s+", " ", declaration.group(1)).strip()
+          if re.search(r"\bbool\b", decl_text):
+              if "TWA_RESUME" in source:
+                  if not re.search(r"if\s*\(\s*notify\s*\)\s*\{?\s*set_notify_resume\(task\)", task_impl):
+                      raise SystemExit("task_work_add(bool) does not show the expected notify-resume behavior; refusing unsafe replacement")
+                  source, count = re.subn(r"\bTWA_RESUME\b", "true", source)
+                  if count != 1:
+                      raise SystemExit(f"Expected one TWA_RESUME use in pkg_observer.c, found {count}")
+                  changes.append("replaced TWA_RESUME with true for this kernel's bool notify API")
+          elif "TWA_RESUME" not in task_header:
+              raise SystemExit(f"Unsupported task_work_add() API: {decl_text}")
+
+          # Detect the callback shape actually declared by this kernel instead of
+          # assuming the newer KernelSU-Next fsnotify interface exists on 4.19.
+          ops = re.search(r"struct\s+fsnotify_ops\s*\{(.*?)\n\s*\};", fsnotify_header, re.S)
+          if not ops:
+              raise SystemExit("Could not find struct fsnotify_ops in fsnotify_backend.h")
+          callback = re.search(
+              r"\bint\s*\(\s*\*\s*(handle_\w+)\s*\)\s*\((.*?)\)\s*;",
+              ops.group(1), re.S
+          )
+          if not callback:
+              raise SystemExit("Could not identify the integer fsnotify callback in struct fsnotify_ops")
+          callback_name = callback.group(1)
+          callback_args = re.sub(r"\s+", " ", callback.group(2)).strip()
+
+          handler_pattern = re.compile(
+              r"static\s+int\s+ksu_handle_inode_event\s*\(.*?\n\s*\}\s*(?=static\s+const\s+struct\s+fsnotify_ops)",
+              re.S,
+          )
+          handler_match = handler_pattern.search(source)
+          if not handler_match:
+              raise SystemExit("Could not isolate ksu_handle_inode_event() in pkg_observer.c")
+
+          if "struct fsnotify_group *" in callback_args:
+              legacy_handler = r'''static int ksu_handle_inode_event(struct fsnotify_group *group,
+                                  struct inode *inode, u32 mask,
+                                  const void *data, int data_type,
+                                  const unsigned char *file_name, u32 cookie,
+                                  struct fsnotify_iter_info *iter_info)
+          {
+              (void)group;
+              (void)inode;
+              (void)data;
+              (void)data_type;
+              (void)cookie;
+              (void)iter_info;
+              if (!file_name)
+                  return 0;
+              if (mask & FS_ISDIR)
+                  return 0;
+              if (!strcmp((const char *)file_name, "packages.list")) {
+                  pr_info("packages.list detected: %d\n", mask);
+                  ksu_defer_track_throne();
+              }
+              return 0;
+          }
+          '''
+              source = source[:handler_match.start()] + legacy_handler + source[handler_match.end():]
+              changes.append("adapted fsnotify handler to legacy group callback signature")
+          elif "struct fsnotify_mark *" in callback_args:
+              # The parameter types of the official handler match this mark-based
+              # API; only the ops member name may differ on downstream trees.
+              changes.append("retained mark-based fsnotify callback signature")
+          else:
+              raise SystemExit(f"Unsupported fsnotify_ops callback signature: {callback_args}")
+
+          if callback_name != "handle_inode_event":
+              assignment = re.compile(r"(?m)^(\s*)\.handle_inode_event\s*=\s*ksu_handle_inode_event\s*,")
+              source, count = assignment.subn(r"\1." + callback_name + " = ksu_handle_inode_event,", source, count=1)
+              if count != 1:
+                  raise SystemExit("Could not change the fsnotify ops member to the kernel's declared callback field")
+              changes.append(f"changed fsnotify ops member to .{callback_name}")
+
+          if "#include <linux/string.h>" not in source:
+              include_anchor = "#include <linux/slab.h>"
+              if include_anchor not in source:
+                  raise SystemExit("Could not find a safe include anchor for linux/string.h")
+              source = source.replace(include_anchor, include_anchor + "\n#include <linux/string.h>", 1)
+              changes.append("added linux/string.h for strcmp")
+
+          source_path.write_text(source)
+          verify = source_path.read_text()
+          if "TWA_RESUME" in verify and re.search(r"\bbool\b", decl_text):
+              raise SystemExit("TWA_RESUME remains despite bool notify API")
+          if re.search(r"(?m)^\s*\." + re.escape(callback_name) + r"\s*=\s*ksu_handle_inode_event,", verify) is None:
+              raise SystemExit(f"fsnotify callback assignment .{callback_name} failed verification")
+          if "struct fsnotify_group *" in callback_args:
+              expected = "struct fsnotify_group *group"
+              if expected not in verify or "const unsigned char *file_name" not in verify:
+                  raise SystemExit("Legacy fsnotify callback signature failed verification")
+          print("KernelSU-Next pkg_observer compatibility verified for the target kernel:")
+          for change in changes:
+              print(" - " + change)
+          PYKSUPKG
+
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
         run: |
@@ -932,6 +1056,10 @@ jobs:
             KernelSU-Next/kernel/Kbuild
             KernelSU-Next/kernel/infra/su_mount_ns.c
             KernelSU-Next/kernel/infra/seccomp_cache.c
+            KernelSU-Next/kernel/manager/pkg_observer.c
+            include/linux/task_work.h
+            kernel/task_work.c
+            include/linux/fsnotify_backend.h
             drivers/kernelsu/hook/setuid_hook.c
             fs/dcache.c
             include/linux/sched.h
