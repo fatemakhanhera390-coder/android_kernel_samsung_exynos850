@@ -271,6 +271,162 @@ jobs:
           echo "Integrated official KernelSU-Next ${KSU_TAG} (${ACTUAL_COMMIT}); SUSFS kernel options added separately."
 
 
+      - name: Backport pinned upstream SELinux compatibility for Linux 4.19 (keep v3.4.1/33333)
+        id: selinux-compat
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
+
+          # This is a source-level compatibility backport only. KernelSU-Next remains
+          # checked out at v3.4.1, so KSU_VERSION and Manager signature metadata stay
+          # those of the requested 33333 driver. Never replace the tag or UAPI header.
+          COMPAT_COMMIT="80bfcb7fd673921334a6773dcfc61bfbe4fbb07b"
+          RAW_BASE="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${COMPAT_COMMIT}/kernel/selinux"
+          TMP="$RUNNER_TEMP/ksu-selinux-compat"
+          mkdir -p "$TMP"
+
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            "$RAW_BASE/rules.c" -o "$TMP/rules.c"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            "$RAW_BASE/sepolicy.c" -o "$TMP/sepolicy.c"
+          test -s "$TMP/rules.c"
+          test -s "$TMP/sepolicy.c"
+
+          cp KernelSU-Next/kernel/selinux/rules.c "$TMP/rules.v3.4.1.c"
+          cp KernelSU-Next/kernel/selinux/sepolicy.c "$TMP/sepolicy.v3.4.1.c"
+
+          python3 - "$TMP" <<'PYSELINUXCOMPAT'
+          from pathlib import Path
+          import hashlib
+          import re
+          import sys
+
+          tmp = Path(sys.argv[1])
+          root = Path('.')
+          rules_path = root / 'KernelSU-Next/kernel/selinux/rules.c'
+          sepolicy_path = root / 'KernelSU-Next/kernel/selinux/sepolicy.c'
+          uapi_path = root / 'KernelSU-Next/kernel/selinux/uapi/selinux.h'
+          kbuild_path = root / 'KernelSU-Next/kernel/Kbuild'
+          ksu_selinux_header = root / 'KernelSU-Next/kernel/selinux/selinux.h'
+          compat_header = root / 'KernelSU-Next/kernel/kernel_compat.h'
+          target_security_header = root / 'security/selinux/include/security.h'
+          target_policydb_header = root / 'security/selinux/ss/policydb.h'
+
+          required_paths = [rules_path, sepolicy_path, uapi_path, kbuild_path,
+                            ksu_selinux_header, compat_header,
+                            target_security_header, target_policydb_header]
+          for path in required_paths:
+              if not path.is_file():
+                  raise SystemExit(f'SELinux compatibility preflight: required file missing: {path}')
+
+          rules = (tmp / 'rules.c').read_text()
+          sepolicy = (tmp / 'sepolicy.c').read_text()
+          if len(rules) < 1000 or len(sepolicy) < 1000:
+              raise SystemExit('Pinned upstream SELinux compatibility source is unexpectedly short.')
+
+          # Ensure this exact upstream compatibility implementation uses the 4.19
+          # selinux_state.ss/policydb path, not modern selinux_state.policy.
+          if 'get_policydb(void)' not in rules or 'selinux_state.ss' not in rules:
+              raise SystemExit('Pinned rules.c does not contain the expected legacy selinux_state.ss path.')
+          if 'KSU_COMPAT_USE_SELINUX_STATE' not in rules:
+              raise SystemExit('Pinned rules.c is missing the legacy state compatibility selector.')
+          if 'KSU_COMPAT_USE_SELINUX_STATE' not in rules.split('static struct policydb *get_policydb', 1)[0]:
+              # Define the source-specific compatibility mode before any branch selects
+              # avc_ss_reset/status-update signatures; this is not a global KSU flag.
+              marker = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)'
+              if rules.count(marker) != 1:
+                  raise SystemExit('Could not locate unique version guard in compatibility rules.c.')
+              rules = rules.replace(
+                  marker,
+                  '#ifndef KSU_COMPAT_USE_SELINUX_STATE\n'
+                  '#define KSU_COMPAT_USE_SELINUX_STATE 1\n'
+                  '#endif\n\n' + marker,
+                  1,
+              )
+          # Must select the old state.ss branch at Linux 4.19, not the modern policy object.
+          if '#define KSU_COMPAT_USE_SELINUX_STATE 1' not in rules:
+              raise SystemExit('Failed to enable file-local Linux 4.19 SELinux state compatibility.')
+
+          # Backported sepolicy.c has guarded implementations for pre-5.7 filename
+          # transitions / legacy flex_array policydb internals.
+          if 'filename_trans' not in sepolicy or 'KSU_SUPPORT_ADD_TYPE' not in sepolicy:
+              raise SystemExit('Pinned sepolicy.c does not contain expected legacy policydb compatibility markers.')
+          uapi = uapi_path.read_text()
+          combined_selinux_source = rules + '\n' + sepolicy
+          protocol_tokens = set(re.findall(r'\bKSU_SEPOLICY_(?:CMD|SUBCMD)_[A-Z0-9_]+\b', uapi))
+          # Catch a partial/back-level parser before any compiler work. Every named
+          # v3.4.1 command/subcommand must be implemented by the compatibility files.
+          unhandled_tokens = sorted(token for token in protocol_tokens
+                                    if token not in combined_selinux_source
+                                    and not token.endswith(('_MAX', '_COUNT')))
+          if unhandled_tokens:
+              raise SystemExit('Manager v3.4.1 SELinux UAPI protocol mismatch; unhandled tokens: '
+                               + ', '.join(unhandled_tokens))
+          for token in ('KSU_SEPOLICY_CMD_NORMAL_PERM', 'KSU_SEPOLICY_CMD_TYPE_TRANSITION',
+                        'KSU_SEPOLICY_CMD_GENFSCON'):
+              if token not in uapi or token not in combined_selinux_source:
+                  raise SystemExit(f'Manager UAPI compatibility check failed for {token}.')
+
+          # Validate the target kernel's actual legacy structure layout before writing files.
+          target_state = target_security_header.read_text()
+          if not re.search(r'struct\s+selinux_state\s*\{[\s\S]*?struct\s+selinux_ss\s*\*\s*ss\s*;', target_state):
+              raise SystemExit('Target kernel does not expose the expected struct selinux_state.ss member.')
+          if not re.search(r'struct\s+selinux_state\s*\{[^}]*\}', target_state, re.S):
+              raise SystemExit('Could not parse target struct selinux_state definition.')
+          state_body = re.search(r'struct\s+selinux_state\s*\{([^}]*)\}', target_state, re.S).group(1)
+          if re.search(r'\bpolicy_mutex\b|\bstruct\s+selinux_policy\s*\*\s*policy\b', state_body):
+              raise SystemExit('Target state unexpectedly exposes modern .policy/.policy_mutex; compatibility assumptions need review.')
+
+          policydb = target_policydb_header.read_text()
+          if 'type_val_to_struct_array' not in policydb or 'type_attr_map_array' not in policydb:
+              raise SystemExit('Target policydb does not match expected Linux 4.19 flex_array layout.')
+          datum = re.search(r'struct\s+filename_trans_datum\s*\{([^}]*)\}', policydb, re.S)
+          if not datum or 'otype' not in datum.group(1):
+              raise SystemExit('Could not verify legacy filename_trans_datum.otype layout.')
+
+          # Pin the v3.4.1 driver metadata and domain name in place.
+          kbuild = kbuild_path.read_text()
+          if 'KSU_NEXT_MANAGER_SIZE := 0x3e6' not in kbuild:
+              raise SystemExit('The requested v3.4.1 Manager size metadata changed unexpectedly.')
+          if 'KSU_NEXT_MANAGER_HASH := 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7' not in kbuild:
+              raise SystemExit('The requested v3.4.1 Manager signature hash changed unexpectedly.')
+          domain_header = ksu_selinux_header.read_text()
+          if not re.search(r'#\s*define\s+KERNEL_SU_DOMAIN\s+"ksu"', domain_header):
+              raise SystemExit('The requested v3.4.1 KERNEL_SU_DOMAIN="ksu" was not preserved.')
+
+          # Replace only the two SELinux implementation files. Do not replace Kbuild,
+          # selinux.h, UAPI, Manager metadata, or any other v3.4.1 source.
+          rules_path.write_text(rules)
+          sepolicy_path.write_text(sepolicy)
+          report = [
+              'KernelSU-Next SELinux compatibility report',
+              'Target kernel: Linux 4.19.325 (Samsung Exynos850 SM-A135F source family)',
+              'KernelSU-Next release/tag: v3.4.1 (expected Manager/driver build 33333)',
+              'Compatibility source: official KernelSU-Next upstream commit ' + '80bfcb7fd673921334a6773dcfc61bfbe4fbb07b',
+              'Files replaced: kernel/selinux/rules.c, kernel/selinux/sepolicy.c only',
+              'Preserved: official v3.4.1 Kbuild, Manager signature size/hash, UAPI, selinux.h and KERNEL_SU_DOMAIN="ksu"',
+              'Legacy APIs detected: selinux_state.ss; policydb flex_array maps; legacy filename_trans datum',
+              'Compiler behaviour: preflight uses Clang -ferror-limit=0 and make -k to collect independent errors',
+              'rules.c SHA256: ' + hashlib.sha256(rules.encode()).hexdigest(),
+              'sepolicy.c SHA256: ' + hashlib.sha256(sepolicy.encode()).hexdigest(),
+              'NOTE: this is a source/API preflight, not proof of a complete successful GitHub Actions build.',
+          ]
+          Path('selinux-compatibility-report.log').write_text('\n'.join(report) + '\n')
+          print('\n'.join(report))
+          PYSELINUXCOMPAT
+
+          # The backport's old-kernel get_policydb/reset-AVC path must be compiled
+          # with this selector. The macro is source-local in rules.c, not global.
+          grep -Fq '#define KSU_COMPAT_USE_SELINUX_STATE 1' KernelSU-Next/kernel/selinux/rules.c
+          grep -Fq 'selinux_state.ss' KernelSU-Next/kernel/selinux/rules.c
+          grep -Fq 'type_val_to_struct_array' KernelSU-Next/kernel/selinux/sepolicy.c
+          grep -Fq 'filename_trans' KernelSU-Next/kernel/selinux/sepolicy.c
+          test "$(git -C KernelSU-Next describe --tags --exact-match HEAD)" = "$KSU_TAG"
+          test "$(git -C KernelSU-Next rev-parse --short=7 HEAD)" = "$KSU_EXPECTED_COMMIT_SHORT"
+          git -C KernelSU-Next diff --exit-code -- kernel/Kbuild kernel/selinux/uapi/selinux.h kernel/selinux/selinux.h
+          echo 'Pinned Linux 4.19 SELinux compatibility overlay installed; KernelSU-Next tag remains v3.4.1 (33333).'
+
       - name: Adapt official KernelSU-Next file wrapper for Samsung 4.19 VFS API
         shell: bash
         run: |
@@ -1119,8 +1275,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+          make -k -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
+            KCFLAGS="-ferror-limit=0 -fno-color-diagnostics" \
             scripts 2>&1 | tee scripts-build.log
           test -x scripts/selinux/genheaders/genheaders
           scripts/selinux/genheaders/genheaders \
@@ -1129,14 +1286,73 @@ jobs:
           test -s security/selinux/av_permissions.h
           echo "SELinux headers generated successfully."
 
-      - name: Preflight compile KernelSU-Next and SUSFS
+      - name: Preflight compile KSU/SUSFS and collect ALL Clang errors
         shell: bash
         run: |
-          set -euo pipefail
-          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+          set -uo pipefail
+          echo '=== Preflight: keep-going mode, unrestricted Clang error count ==='
+          echo 'This step intentionally compiles independent objects after failures.'
+          set +e
+          make -k -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
+            KCFLAGS="-ferror-limit=0 -fno-color-diagnostics" \
             drivers/kernelsu/ 2>&1 | tee ksu-preflight.log
-          echo "KernelSU/SUSFS preflight compile completed."
+          MAKE_RC=${PIPESTATUS[0]}
+          set -e
+
+          python3 - <<'PYERRREPORT'
+          from pathlib import Path
+          import re
+
+          log_path = Path('ksu-preflight.log')
+          text = log_path.read_text(errors='replace') if log_path.exists() else ''
+          lines = text.splitlines()
+          error_re = re.compile(r'\b(?:fatal\s+)?error\s*:|\btoo many errors emitted\b', re.I)
+          warning_re = re.compile(r'\bwarning\s*:', re.I)
+          errors = [(i, line) for i, line in enumerate(lines) if error_re.search(line)]
+          warnings = [(i, line) for i, line in enumerate(lines) if warning_re.search(line)]
+          # Keep every emitted error line and nearby compiler context. The complete
+          # unfiltered output remains in ksu-preflight.log as the authoritative log.
+          out = [
+              'KernelSU/SUSFS preflight compiler diagnostic summary',
+              f'Compiler error/fatal-error lines: {len(errors)}',
+              f'Warning lines: {len(warnings)}',
+              'Unique source locations (when the compiler printed a file:line:col):',
+          ]
+          locations = []
+          loc_re = re.compile(r'([^\s:]+\.(?:c|h|S|s|cpp)):(\d+):(\d+):\s*(?:fatal\s+)?error\s*:')
+          for _, line in errors:
+              m = loc_re.search(line)
+              if m:
+                  loc = f'{m.group(1)}:{m.group(2)}:{m.group(3)}'
+                  if loc not in locations:
+                      locations.append(loc)
+          out.extend('  ' + loc for loc in locations)
+          if not locations:
+              out.append('  (none parsed; see full log)')
+          out.append('')
+          out.append('All compiler error lines with nearby context:')
+          emitted = set()
+          for i, line in errors:
+              lo, hi = max(0, i - 1), min(len(lines), i + 3)
+              block = '\n'.join(f'{j+1}: {lines[j]}' for j in range(lo, hi))
+              if block not in emitted:
+                  out.append(block)
+                  out.append('---')
+                  emitted.add(block)
+          if not errors:
+              out.append('No compiler error lines were found in the preflight log.')
+          Path('compiler-error-summary.txt').write_text('\n'.join(out) + '\n')
+          print('\n'.join(out))
+          PYERRREPORT
+
+          echo "make preflight exit code: $MAKE_RC"
+          if [ "$MAKE_RC" -ne 0 ]; then
+            echo 'KernelSU/SUSFS preflight failed. Full diagnostics are in ksu-preflight.log and compiler-error-summary.txt.' >&2
+            exit "$MAKE_RC"
+          fi
+
+          echo 'KernelSU/SUSFS preflight compile completed.'
           grep -E -- 'KernelSU(-Next)? version:|KernelSU-Next tag:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
             ksu-preflight.log || true
           grep -Fq -- "-- KernelSU-Next version: ${KSU_EXPECTED_VERSION}" ksu-preflight.log || {
@@ -1152,8 +1368,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+          make -k -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
+            KCFLAGS="-ferror-limit=0 -fno-color-diagnostics" \
             Image Image.gz dtbs 2>&1 | tee kernel-build.log
 
           test -s arch/arm64/boot/Image
@@ -1208,6 +1425,46 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Summarize compiler diagnostics for every job outcome
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python3 - <<'PYALLDIAG'
+          from pathlib import Path
+          import re
+
+          candidates = ['scripts-build.log', 'ksu-preflight.log', 'kernel-build.log']
+          error_re = re.compile(r'\b(?:fatal\s+)?error\s*:|\btoo many errors emitted\b', re.I)
+          warning_re = re.compile(r'\bwarning\s*:', re.I)
+          report = ['Aggregate compiler diagnostics (full logs are also uploaded)', '']
+          total_errors = total_warnings = 0
+          any_log = False
+          for name in candidates:
+              path = Path(name)
+              if not path.is_file():
+                  continue
+              any_log = True
+              lines = path.read_text(errors='replace').splitlines()
+              errors = [(i, line) for i, line in enumerate(lines) if error_re.search(line)]
+              warnings = [line for line in lines if warning_re.search(line)]
+              total_errors += len(errors)
+              total_warnings += len(warnings)
+              report.append(f'{name}: {len(errors)} error/fatal-error lines, {len(warnings)} warning lines')
+              for i, line in errors:
+                  report.append(f'  line {i+1}: {line}')
+              if not errors:
+                  report.append('  No compiler error lines found in this log.')
+              report.append('')
+          report.extend([f'TOTAL error/fatal-error lines: {total_errors}',
+                         f'TOTAL warning lines: {total_warnings}'])
+          if not any_log:
+              report.append('No compiler logs existed (failure may have occurred before compilation).')
+          Path('compiler-error-summary.txt').write_text('\n'.join(report) + '\n')
+          print('\n'.join(report))
+          PYALLDIAG
+          exit 0
+
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1219,11 +1476,20 @@ jobs:
             susfs-compatibility.log
             scripts-build.log
             ksu-preflight.log
+            compiler-error-summary.txt
+            selinux-compatibility-report.log
             kernel-build.log
             .config
             SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
             susfs-kernel-4.19-adapted.patch
             KernelSU-Next/kernel/Kbuild
+            KernelSU-Next/kernel/selinux/rules.c
+            KernelSU-Next/kernel/selinux/sepolicy.c
+            KernelSU-Next/kernel/selinux/selinux.h
+            KernelSU-Next/kernel/selinux/uapi/selinux.h
+            security/selinux/include/security.h
+            security/selinux/ss/policydb.h
+            security/selinux/ss/services.h
             KernelSU-Next/kernel/infra/su_mount_ns.c
             KernelSU-Next/kernel/infra/seccomp_cache.c
             KernelSU-Next/kernel/manager/pkg_observer.c
