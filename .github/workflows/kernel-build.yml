@@ -270,6 +270,144 @@ jobs:
           grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           echo "Integrated official KernelSU-Next ${KSU_TAG} (${ACTUAL_COMMIT}); SUSFS kernel options added separately."
 
+
+      - name: Adapt official KernelSU-Next file wrapper for Samsung 4.19 VFS API
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          source_path = Path("KernelSU-Next/kernel/infra/file_wrapper.c")
+          header_path = Path("include/linux/fs.h")
+          if not source_path.is_file() or not header_path.is_file():
+              raise SystemExit("KernelSU-Next file_wrapper.c or kernel fs.h is missing")
+
+          source = source_path.read_text()
+          header = header_path.read_text()
+          match = re.search(
+              r"struct file_operations\s*\{(.*?)\}\s*(?:__randomize_layout)?\s*;",
+              header,
+              flags=re.S,
+          )
+          if not match:
+              raise SystemExit("Could not inspect struct file_operations in include/linux/fs.h")
+          fops = match.group(1)
+
+          def has_member(name):
+              return re.search(r"\(\s*\*\s*" + re.escape(name) + r"\s*\)", fops) is not None
+
+          changed = []
+
+          # Some Samsung 4.19 trees omit iopoll despite the nominal kernel version.
+          if not has_member("iopoll"):
+              pattern = re.compile(
+                  r"#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 1, 0\)\s*\n"
+                  r"static int ksu_wrapper_iopoll\(.*?\n#endif\s*\n",
+                  flags=re.S,
+              )
+              source, count = pattern.subn("", source, count=1)
+              if count != 1:
+                  raise SystemExit("Could not isolate the official iopoll wrapper block")
+              source, count = re.subn(
+                  r"^[ \t]*p->ops\.iopoll\s*=\s*fp->f_op->iopoll\s*\?\s*"
+                  r"ksu_wrapper_iopoll\s*:\s*NULL;[ \t]*\n",
+                  "",
+                  source,
+                  count=1,
+                  flags=re.M,
+              )
+              if count != 1:
+                  raise SystemExit("Could not remove the unavailable iopoll assignment")
+              changed.append("omitted iopoll (not present in target file_operations)")
+
+          # The target 4.19 tree exposes clone/dedupe callbacks instead of remap_file_range.
+          if not has_member("remap_file_range"):
+              if not has_member("clone_file_range") or not has_member("dedupe_file_range"):
+                  raise SystemExit(
+                      "Target fs.h has no remap_file_range and does not expose both "
+                      "clone_file_range/dedupe_file_range; refusing an unsafe compatibility edit"
+                  )
+
+              start_marker = "// no REMAP_FILE_DEDUP: use file_in"
+              end_marker = "static int ksu_wrapper_fadvise("
+              start = source.find(start_marker)
+              end = source.find(end_marker, start + 1) if start >= 0 else -1
+              if start < 0 or end < 0:
+                  if "ksu_wrapper_clone_file_range" not in source or "ksu_wrapper_dedupe_file_range" not in source:
+                      raise SystemExit("Could not locate official remap wrapper block for 4.19 adaptation")
+              else:
+                  legacy_wrappers = r'''static int ksu_wrapper_clone_file_range(struct file *file_in, loff_t pos_in,
+                                               struct file *file_out, loff_t pos_out,
+                                               u64 len)
+          {
+              struct ksu_file_wrapper *data = file_in->private_data;
+              struct file *orig = data->orig;
+              if (!orig->f_op->clone_file_range) {
+                  return -EOPNOTSUPP;
+              }
+              return orig->f_op->clone_file_range(orig, pos_in, file_out, pos_out, len);
+          }
+
+          static int ksu_wrapper_dedupe_file_range(struct file *file_in, loff_t pos_in,
+                                                  struct file *file_out, loff_t pos_out,
+                                                  u64 len)
+          {
+              struct ksu_file_wrapper *data = file_out->private_data;
+              struct file *orig = data->orig;
+              if (!orig->f_op->dedupe_file_range) {
+                  return -EOPNOTSUPP;
+              }
+              return orig->f_op->dedupe_file_range(file_in, pos_in, orig, pos_out, len);
+          }
+
+                  '''
+                  source = source[:start] + legacy_wrappers + source[end:]
+
+              assignment = re.compile(
+                  r"^[ \t]*p->ops\.remap_file_range\s*=\s*\n"
+                  r"[ \t]*fp->f_op->remap_file_range\s*\?\s*"
+                  r"ksu_wrapper_remap_file_range\s*:\s*NULL;[ \t]*\n",
+                  flags=re.M,
+              )
+              source, count = assignment.subn(
+                  "    p->ops.clone_file_range =\n"
+                  "        fp->f_op->clone_file_range ? ksu_wrapper_clone_file_range : NULL;\n"
+                  "    p->ops.dedupe_file_range =\n"
+                  "        fp->f_op->dedupe_file_range ? ksu_wrapper_dedupe_file_range : NULL;\n",
+                  source,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit("Could not replace remap_file_range assignment with 4.19 callbacks")
+              changed.append("mapped remap callback to 4.19 clone/dedupe callbacks")
+
+          if "p->ops.iopoll" in source or "fp->f_op->iopoll" in source:
+              if not has_member("iopoll"):
+                  raise SystemExit("Unavailable iopoll member remains in KernelSU-Next file_wrapper.c")
+          if "REMAP_FILE_DEDUP" in source or "fp->f_op->remap_file_range" in source:
+              if not has_member("remap_file_range"):
+                  raise SystemExit("Unavailable remap_file_range API remains after adaptation")
+          for required in (
+              "static int ksu_wrapper_clone_file_range",
+              "static int ksu_wrapper_dedupe_file_range",
+              "p->ops.clone_file_range",
+              "p->ops.dedupe_file_range",
+          ):
+              if not has_member("remap_file_range") and required not in source:
+                  raise SystemExit(f"4.19 file-wrapper verification failed: {required}")
+
+          source_path.write_text(source)
+          print("KernelSU-Next file-wrapper API adaptation verified:")
+          for item in changed:
+              print(f" - {item}")
+          if not changed:
+              print(" - no changes needed; target fs.h already exposes required callbacks")
+          PY
+
+
+
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
         run: |
