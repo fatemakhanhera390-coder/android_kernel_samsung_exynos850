@@ -24,6 +24,7 @@ jobs:
       KSU_BRANCH: next-susfs-4.19
       KSU_NEXT_EXPECTED_SIZE: "0x3e6"
       KSU_NEXT_EXPECTED_HASH: 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7
+      KERNEL_LOCALVERSION: "-MAX-ARAF"
       SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
       SUSFS_BRANCH: kernel-4.19
       CROSS_COMPILE: aarch64-linux-gnu-
@@ -425,7 +426,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
+            CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" "$DEFCONFIG"
 
           scripts/config --file .config --enable KSU
           scripts/config --file .config --enable OVERLAY_FS
@@ -452,10 +453,11 @@ jobs:
           scripts/config --file .config --disable LOCALVERSION_AUTO
 
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+            CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
 
-          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" kernelrelease)"
           echo "Configured kernel release: $KERNELRELEASE"
+          echo "Requested localversion: $KERNEL_LOCALVERSION"
           case "$KERNELRELEASE" in
             *MAX-ARAF*) ;;
             *) echo "MAX-ARAF is missing from kernel release: $KERNELRELEASE" >&2; exit 1 ;;
@@ -501,7 +503,8 @@ jobs:
         run: |
           set -euo pipefail
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" scripts 2>&1 | tee scripts-build.log
+            CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
+            scripts 2>&1 | tee scripts-build.log
           test -x scripts/selinux/genheaders/genheaders
           scripts/selinux/genheaders/genheaders \
             security/selinux/flask.h security/selinux/av_permissions.h
@@ -514,8 +517,8 @@ jobs:
         run: |
           set -euo pipefail
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ \
-            2>&1 | tee ksu-preflight.log
+            CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
+            drivers/kernelsu/ 2>&1 | tee ksu-preflight.log
           echo "KernelSU/SUSFS preflight compile completed."
           grep -E -- 'KernelSU(-Next)? version:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
             ksu-preflight.log || true
@@ -528,8 +531,8 @@ jobs:
         run: |
           set -euo pipefail
           make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" Image Image.gz dtbs \
-            2>&1 | tee kernel-build.log
+            CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
+            Image Image.gz dtbs 2>&1 | tee kernel-build.log
 
           test -s arch/arm64/boot/Image
           test -s arch/arm64/boot/Image.gz
@@ -538,7 +541,7 @@ jobs:
 
           grep -aFq 'Linux version 4.19.325' arch/arm64/boot/Image
           grep -aFq 'MAX-ARAF' arch/arm64/boot/Image
-          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+          KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" kernelrelease)"
           case "$KERNELRELEASE" in
             *MAX-ARAF*) echo "Verified final kernel release: $KERNELRELEASE" ;;
             *) echo "Final kernel release is missing MAX-ARAF: $KERNELRELEASE" >&2; exit 1 ;;
@@ -561,7 +564,8 @@ jobs:
             -exec cp --parents '{}' "$STAGE/dts/" \;
 
           make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" kernelrelease > "$STAGE/kernel-release.txt"
+            CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
+            kernelrelease > "$STAGE/kernel-release.txt"
           printf '%s\n' \
             'Build artifacts only. This ZIP is NOT a TWRP-flashable package.' \
             'Do not flash Image or Image.gz directly.' \
