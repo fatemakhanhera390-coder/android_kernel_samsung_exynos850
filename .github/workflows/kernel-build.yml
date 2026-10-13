@@ -1412,7 +1412,7 @@ jobs:
           scripts/config --file .config --enable KSU_SUSFS_SPOOF_UNAME
           scripts/config --file .config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
           scripts/config --file .config --enable KSU_SUSFS_OPEN_REDIRECT
-          scripts/config --file .config --enable KSU_SUSFS_SUS_SU
+          scripts/config --file .config --disable KSU_SUSFS_SUS_SU
           scripts/config --file .config --enable KSU_SUSFS_ENABLE_LOG
           scripts/config --file .config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
           scripts/config --file .config --set-str LOCALVERSION '-MAX-ARAF'
@@ -1420,6 +1420,11 @@ jobs:
 
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" olddefconfig
+
+          if grep -q '^CONFIG_KSU_SUSFS_SUS_SU=y' .config; then
+            echo "KSU_SUSFS_SUS_SU must remain disabled with official KernelSU-Next v3.4.1 on this 4.19 tree." >&2
+            exit 1
+          fi
 
           KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" kernelrelease)"
           echo "Configured kernel release: $KERNELRELEASE"
@@ -1543,23 +1548,24 @@ jobs:
               raise SystemExit(f"Missing source: {umount}")
           text = umount.read_text()
           if "KSU_NEXT_419_PATH_UMOUNT_FALLBACK" not in text:
-              # Add the fallback after the file's include block so errno is available.
-              matches = list(re.finditer(r'(?m)^(?:#include[^\n]*\n|[ \t]*\n)+', text))
-              if not matches:
-                  raise SystemExit("Could not locate include block in kernel_umount.c")
-              pos = matches[0].end()
-              fallback = (
+              # Replace the declaration itself, not the include block: a
+              # function-like macro before the declaration rewrites the
+              # declaration and causes a C syntax error.
+              text, count = re.subn(
+                  r'extern\s+int\s+path_umount\s*\([^;]+;\s*',
                   '/* KSU_NEXT_419_PATH_UMOUNT_FALLBACK: path_umount is not exported on this 4.19 tree. */\n'
-                  '#define path_umount(...) (-EOPNOTSUPP)\n\n'
+                  '#define path_umount(...) (-EOPNOTSUPP)\n',
+                  text, count=1, flags=re.S
               )
-              text = text[:pos] + fallback + text[pos:]
+              if count != 1:
+                  raise SystemExit("Could not replace path_umount declaration in kernel_umount.c")
               umount.write_text(text)
           if "KSU_NEXT_419_PATH_UMOUNT_FALLBACK" not in umount.read_text():
               raise SystemExit("Could not install path_umount 4.19 fallback")
 
           # SUSFS's optional SUS_SU toggles call symbols not provided by the
-          # official v3.4.1 driver. The SUS_SU option is not enabled in this
-          # conservative configuration, so compile those call sites out.
+          # official v3.4.1 driver. The Configure step disables this optional
+          # feature, so compile those call sites out.
           susfs = Path("fs/susfs.c")
           if not susfs.is_file():
               raise SystemExit("fs/susfs.c missing after SUSFS patch")
