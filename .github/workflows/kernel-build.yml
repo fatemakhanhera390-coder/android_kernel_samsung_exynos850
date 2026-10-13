@@ -1387,6 +1387,194 @@ jobs:
           grep -Fq 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' drivers/kernelsu/hook/setuid_hook.c
           echo "Official v3.4.1 SUS_PATH source alignment verified."
 
+      - name: Integrate KernelSU-Next manual hooks for non-GKI Linux 4.19
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
+          python3 - <<'PYKSULEGACY'
+          from pathlib import Path
+
+          edits = []
+
+          def patch_once(rel, marker, anchor, replacement, description):
+              path = Path(rel)
+              if not path.is_file():
+                  raise SystemExit(f"Missing source for {description}: {rel}")
+              source = path.read_text()
+              if marker in source:
+                  edits.append(f"{rel}: already present: {description}")
+                  return
+              count = source.count(anchor)
+              if count != 1:
+                  raise SystemExit(
+                      f"{rel}: expected exactly one anchor for {description}, found {count}; refusing unsafe edit"
+                  )
+              path.write_text(source.replace(anchor, replacement, 1))
+              if marker not in path.read_text():
+                  raise SystemExit(f"{rel}: verification failed for {description}")
+              edits.append(f"{rel}: added: {description}")
+
+          # The pinned v3.4.1 Kconfig has no CONFIG_KSU_KPROBE_HOOKS switch.
+          # Wire the documented non-GKI legacy interception points explicitly.
+          exec_decl_anchor = "int do_execve(struct filename *filename,\n"
+          exec_decl = '''/* KSU_NEXT_V341_LEGACY_EXEC_HOOK_DECL */
+          #ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+                                          void *argv, void *envp, int *flags);
+          #endif
+
+          ''' + exec_decl_anchor
+          patch_once("fs/exec.c", "KSU_NEXT_V341_LEGACY_EXEC_HOOK_DECL",
+                     exec_decl_anchor, exec_decl, "execve hook declaration")
+
+          native_anchor = "\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
+          native_replacement = '''\tstruct user_arg_ptr envp = { .ptr.native = __envp };
+          #ifdef CONFIG_KSU
+          	/* KSU_NEXT_V341_LEGACY_EXEC_HOOK */
+          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+          #endif
+          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
+          patch_once("fs/exec.c", "KSU_NEXT_V341_LEGACY_EXEC_HOOK */",
+                     native_anchor, native_replacement, "native execve hook call")
+
+          compat_anchor = "\tstruct user_arg_ptr envp = {\n\t\t.is_compat = true,\n\t\t.ptr.compat = __envp,\n\t};\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
+          compat_replacement = '''\tstruct user_arg_ptr envp = {
+          		.is_compat = true,
+          		.ptr.compat = __envp,
+          	};
+          #ifdef CONFIG_KSU
+          	/* KSU_NEXT_V341_LEGACY_COMPAT_EXEC_HOOK */
+          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+          #endif
+          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
+          patch_once("fs/exec.c", "KSU_NEXT_V341_LEGACY_COMPAT_EXEC_HOOK */",
+                     compat_anchor, compat_replacement, "32-bit compat execve hook call")
+
+          open_anchor = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          {
+          	return do_faccessat(dfd, filename, mode);
+          }'''
+          open_replacement = '''/* KSU_NEXT_V341_LEGACY_FACCESSAT_HOOK_DECL */
+          #ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+                                          int *mode, int *flags);
+          #endif
+          SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          {
+          #ifdef CONFIG_KSU
+          	/* KSU_NEXT_V341_LEGACY_FACCESSAT_HOOK */
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          	return do_faccessat(dfd, filename, mode);
+          }'''
+          patch_once("fs/open.c", "KSU_NEXT_V341_LEGACY_FACCESSAT_HOOK_DECL",
+                     open_anchor, open_replacement, "faccessat hook")
+
+          read_anchor = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {
+          	return ksys_read(fd, buf, count);
+          }'''
+          read_replacement = '''/* KSU_NEXT_V341_LEGACY_READ_HOOK_DECL */
+          #ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,
+                                                               char __user **buf_ptr,
+                                                               size_t *count_ptr);
+          #endif
+          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {
+          #ifdef CONFIG_KSU
+          	/* KSU_NEXT_V341_LEGACY_READ_HOOK */
+          	if (unlikely(ksu_vfs_read_hook))
+          		ksu_handle_sys_read(fd, &buf, &count);
+          #endif
+          	return ksys_read(fd, buf, count);
+          }'''
+          patch_once("fs/read_write.c", "KSU_NEXT_V341_LEGACY_READ_HOOK_DECL",
+                     read_anchor, read_replacement, "read hook")
+
+          stat_anchor = '''SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+          		struct stat __user *, statbuf, int, flag)
+          {
+          	struct kstat stat;
+          	int error;
+
+          	error = vfs_fstatat(dfd, filename, &stat, flag);'''
+          stat_replacement = '''/* KSU_NEXT_V341_LEGACY_STAT_HOOK_DECL */
+          #ifdef CONFIG_KSU
+          __attribute__((hot))
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+                                     int *flags);
+          #endif
+          SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+          		struct stat __user *, statbuf, int, flag)
+          {
+          	struct kstat stat;
+          	int error;
+          #ifdef CONFIG_KSU
+          	/* KSU_NEXT_V341_LEGACY_STAT_HOOK */
+          	ksu_handle_stat(&dfd, &filename, &flag);
+          #endif
+
+          	error = vfs_fstatat(dfd, filename, &stat, flag);'''
+          patch_once("fs/stat.c", "KSU_NEXT_V341_LEGACY_STAT_HOOK_DECL",
+                     stat_anchor, stat_replacement, "newfstatat hook")
+
+          reboot_decl_anchor = "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,"
+          reboot_decl = '''/* KSU_NEXT_V341_LEGACY_REBOOT_HOOK_DECL */
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+                                           void __user **arg);
+          #endif
+          ''' + reboot_decl_anchor
+          patch_once("kernel/reboot.c", "KSU_NEXT_V341_LEGACY_REBOOT_HOOK_DECL",
+                     reboot_decl_anchor, reboot_decl, "reboot hook declaration")
+
+          reboot_call_anchor = "\tint ret = 0;\n\t/* We only trust the superuser with the system. */"
+          reboot_call_replacement = '''\tint ret = 0;
+          #ifdef CONFIG_KSU
+          	/* KSU_NEXT_V341_LEGACY_REBOOT_HOOK */
+          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          #endif
+          	/* We only trust the superuser with the system. */'''
+          patch_once("kernel/reboot.c", "KSU_NEXT_V341_LEGACY_REBOOT_HOOK */",
+                     reboot_call_anchor, reboot_call_replacement, "reboot driver-install hook call")
+
+          checks = {
+              "fs/exec.c": ["ksu_handle_execveat((int *)AT_FDCWD", "KSU_NEXT_V341_LEGACY_COMPAT_EXEC_HOOK"],
+              "fs/open.c": ["ksu_handle_faccessat(&dfd, &filename, &mode, NULL)"],
+              "fs/read_write.c": ["ksu_handle_sys_read(fd, &buf, &count)"],
+              "fs/stat.c": ["ksu_handle_stat(&dfd, &filename, &flag)"],
+              "kernel/reboot.c": ["ksu_handle_sys_reboot(magic1, magic2, cmd, &arg)"],
+          }
+          for rel, needles in checks.items():
+              source = Path(rel).read_text()
+              for needle in needles:
+                  if needle not in source:
+                      raise SystemExit(f"Manual hook verification failed: {rel}: {needle}")
+
+          kbuild = Path("KernelSU-Next/kernel/Kbuild").read_text()
+          if "KSU_NEXT_MANAGER_SIZE := 0x3e6" not in kbuild or \
+             "KSU_NEXT_MANAGER_HASH := 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7" not in kbuild:
+              raise SystemExit("KernelSU-Next v3.4.1 Manager signature metadata changed unexpectedly")
+
+          report = [
+              "KernelSU-Next manual integration report",
+              "Target: Samsung SM-A135F / Exynos850 / Linux 4.19.325",
+              "Pinned KernelSU-Next: v3.4.1; Manager build: 33333",
+              "Mode: manual legacy hooks; v3.4.1 Kconfig has no KSU_KPROBE_HOOKS option.",
+              *edits,
+              "Verified hooks: execve (native+compat), faccessat, read, newfstatat, reboot driver handshake.",
+              "Manager signature metadata preserved.",
+              "Source-level hook checks pass; runtime root functionality still must be tested on-device.",
+          ]
+          Path("ksu-legacy-hook-integration.log").write_text("\n".join(report) + "\n")
+          print("\n".join(report))
+          PYKSULEGACY
+
       - name: Configure kernel and KernelSU-Next SUSFS
         shell: bash
         run: |
@@ -1483,7 +1671,7 @@ jobs:
           test -s security/selinux/av_permissions.h
           echo "SELinux headers generated successfully."
 
-      - name: Preflight compile KernelSU-Next and SUSFS; collect all Clang errors
+      - name: Preflight compile KernelSU-Next, legacy hook call-sites and SUSFS; collect all Clang errors
         shell: bash
         run: |
           set -uo pipefail
@@ -1492,7 +1680,9 @@ jobs:
           set +e
           make -k -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
-            KCFLAGS="-ferror-limit=0" drivers/kernelsu/ 2>&1 | tee ksu-preflight.log
+            KCFLAGS="-ferror-limit=0" \
+            drivers/kernelsu/ fs/exec.o fs/open.o fs/read_write.o fs/stat.o kernel/reboot.o \
+            2>&1 | tee ksu-preflight.log
           build_rc=${PIPESTATUS[0]}
           set -e
 
@@ -1500,11 +1690,11 @@ jobs:
             ksu-preflight.log | tee ksu-preflight-error-summary.log || true
           echo "Preflight make exit code: $build_rc"
           if [ "$build_rc" -ne 0 ]; then
-            echo "KernelSU/SUSFS preflight failed; all available diagnostics are in ksu-preflight.log and ksu-preflight-error-summary.log." >&2
+            echo "KernelSU/SUSFS/manual-hook preflight failed; all available diagnostics are in ksu-preflight.log and ksu-preflight-error-summary.log." >&2
             exit "$build_rc"
           fi
 
-          echo "KernelSU/SUSFS preflight compile completed."
+          echo "KernelSU-Next objects and all five legacy hook call-site objects compiled successfully in preflight."
           grep -E -- 'KernelSU(-Next)? version:|KernelSU-Next tag:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
             ksu-preflight.log || true
           grep -Fq -- "-- KernelSU-Next version: ${KSU_EXPECTED_VERSION}" ksu-preflight.log || {
@@ -1528,40 +1718,51 @@ jobs:
           # this Samsung 4.19 tree. Keep the feature entry points but make
           # these optional operations fail safely instead of creating
           # unresolved references at final link time.
-          mount_ns = Path("KernelSU-Next/kernel/infra/su_mount_ns.c")
-          if not mount_ns.is_file():
-              raise SystemExit(f"Missing source: {mount_ns}")
-          text = mount_ns.read_text()
-          if "KSU_NEXT_419_PATH_MOUNT_FALLBACK" not in text:
+          def replace_extern_with_fallback(path, symbol, marker):
+              if not path.is_file():
+                  raise SystemExit(f"Missing source: {path}")
+              text = path.read_text()
+              # Remove a fallback injected by an older workflow at the wrong
+              # location (e.g. immediately after the includes). This prevents
+              # a function-like macro from rewriting its own extern prototype.
               text = re.sub(
-                  r'extern int path_mount\([^;]+;\s*',
-                  '/* KSU_NEXT_419_PATH_MOUNT_FALLBACK: path_mount is not exported on this 4.19 tree. */\n'
-                  '#define path_mount(...) (-EOPNOTSUPP)\n',
-                  text, count=1, flags=re.S
+                  rf"^[ \t]*/\* {re.escape(marker)}:[^\n]*\*/[ \t]*\n"
+                  rf"^[ \t]*#define {symbol}\(\.\.\.\) \(-EOPNOTSUPP\)[ \t]*\n?",
+                  "",
+                  text,
+                  flags=re.M,
               )
-              mount_ns.write_text(text)
-          if "KSU_NEXT_419_PATH_MOUNT_FALLBACK" not in mount_ns.read_text():
-              raise SystemExit("Could not install path_mount 4.19 fallback")
+              if marker not in text:
+                  pattern = rf"extern\s+int\s+{re.escape(symbol)}\s*\([^;]+;[ \t]*"
+                  replacement = (
+                      f"/* {marker}: {symbol} is not exported on this 4.19 tree. */\n"
+                      f"#define {symbol}(...) (-EOPNOTSUPP)\n"
+                  )
+                  text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+                  if count != 1:
+                      raise SystemExit(f"Could not replace extern {symbol} declaration in {path}")
+              # Strictly verify that no original extern declaration remains.
+              if marker not in text or re.search(rf"extern\s+int\s+{re.escape(symbol)}\s*\(", text):
+                  raise SystemExit(f"Invalid {symbol} fallback placement in {path}")
+              path.write_text(text)
+              lines = text.splitlines()
+              marker_line = next(i for i, line in enumerate(lines) if marker in line)
+              if marker_line + 1 >= len(lines) or not re.fullmatch(
+                  rf"#define {re.escape(symbol)}\(\.\.\.\) \(-EOPNOTSUPP\)",
+                  lines[marker_line + 1].strip(),
+              ):
+                  raise SystemExit(f"{symbol} fallback macro is not directly after its marker in {path}")
 
-          umount = Path("KernelSU-Next/kernel/feature/kernel_umount.c")
-          if not umount.is_file():
-              raise SystemExit(f"Missing source: {umount}")
-          text = umount.read_text()
-          if "KSU_NEXT_419_PATH_UMOUNT_FALLBACK" not in text:
-              # Replace the declaration itself, not the include block: a
-              # function-like macro before the declaration rewrites the
-              # declaration and causes a C syntax error.
-              text, count = re.subn(
-                  r'extern\s+int\s+path_umount\s*\([^;]+;\s*',
-                  '/* KSU_NEXT_419_PATH_UMOUNT_FALLBACK: path_umount is not exported on this 4.19 tree. */\n'
-                  '#define path_umount(...) (-EOPNOTSUPP)\n',
-                  text, count=1, flags=re.S
-              )
-              if count != 1:
-                  raise SystemExit("Could not replace path_umount declaration in kernel_umount.c")
-              umount.write_text(text)
-          if "KSU_NEXT_419_PATH_UMOUNT_FALLBACK" not in umount.read_text():
-              raise SystemExit("Could not install path_umount 4.19 fallback")
+          replace_extern_with_fallback(
+              Path("KernelSU-Next/kernel/infra/su_mount_ns.c"),
+              "path_mount",
+              "KSU_NEXT_419_PATH_MOUNT_FALLBACK",
+          )
+          replace_extern_with_fallback(
+              Path("KernelSU-Next/kernel/feature/kernel_umount.c"),
+              "path_umount",
+              "KSU_NEXT_419_PATH_UMOUNT_FALLBACK",
+          )
 
           # SUSFS's optional SUS_SU toggles call symbols not provided by the
           # official v3.4.1 driver. The Configure step disables this optional
@@ -1681,6 +1882,7 @@ jobs:
             susfs-compatibility.log
             selinux-compatibility-report.log
             ksu-linux-419-api-compatibility.log
+            ksu-legacy-hook-integration.log
             linux-419-link-compatibility.log
             KernelSU-Next/kernel/supercall/dispatch.c
             KernelSU-Next/kernel/supercall/supercall.c
