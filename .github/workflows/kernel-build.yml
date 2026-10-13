@@ -1,4 +1,4 @@
-name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF
+name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF (seccomp fix)
 
 on:
   workflow_dispatch:
@@ -1387,193 +1387,87 @@ jobs:
           grep -Fq 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' drivers/kernelsu/hook/setuid_hook.c
           echo "Official v3.4.1 SUS_PATH source alignment verified."
 
-      - name: Integrate KernelSU-Next manual hooks for non-GKI Linux 4.19
+      - name: Fix KernelSU-Next driver-install syscall blocked by Android seccomp
         shell: bash
         run: |
           set -Eeuo pipefail
           trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
-          python3 - <<'PYKSULEGACY'
+          python3 - <<'PYKSUSECCOMP'
           from pathlib import Path
+          import re
 
-          edits = []
+          seccomp_path = Path("kernel/seccomp.c")
+          supercall_path = Path("KernelSU-Next/kernel/supercall/supercall.c")
+          uapi_path = Path("KernelSU-Next/kernel/uapi/supercall.h")
+          for p in (seccomp_path, supercall_path, uapi_path):
+              if not p.is_file():
+                  raise SystemExit(f"Required source missing: {p}")
 
-          def patch_once(rel, marker, anchor, replacement, description):
-              path = Path(rel)
-              if not path.is_file():
-                  raise SystemExit(f"Missing source for {description}: {rel}")
-              source = path.read_text()
-              if marker in source:
-                  edits.append(f"{rel}: already present: {description}")
-                  return
-              count = source.count(anchor)
-              if count != 1:
-                  raise SystemExit(
-                      f"{rel}: expected exactly one anchor for {description}, found {count}; refusing unsafe edit"
-                  )
-              path.write_text(source.replace(anchor, replacement, 1))
-              if marker not in path.read_text():
-                  raise SystemExit(f"{rel}: verification failed for {description}")
-              edits.append(f"{rel}: added: {description}")
+          supercall = supercall_path.read_text()
+          uapi = uapi_path.read_text()
+          if "KSU_INSTALL_MAGIC1 = 0xDEADBEEF" not in uapi or \
+             "KSU_INSTALL_MAGIC2 = 0xCAFEBABE" not in uapi:
+              raise SystemExit("Pinned KernelSU-Next v3.4.1 install magic values differ; refusing to patch seccomp")
+          if "magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_INSTALL_MAGIC2" not in supercall or \
+             "register_kprobe(&reboot_kp)" not in supercall:
+              raise SystemExit("Pinned KernelSU-Next reboot-kprobe driver handshake differs; refusing to patch seccomp")
 
-          # The pinned v3.4.1 Kconfig has no CONFIG_KSU_KPROBE_HOOKS switch.
-          # Wire the documented non-GKI legacy interception points explicitly.
-          exec_decl_anchor = "int do_execve(struct filename *filename,\n"
-          exec_decl = '''/* KSU_NEXT_V341_LEGACY_EXEC_HOOK_DECL */
-          #ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-                                          void *argv, void *envp, int *flags);
-          #endif
+          source = seccomp_path.read_text()
+          marker = "KSU_NEXT_DRIVER_INSTALL_SECCOMP_ALLOW"
+          if marker not in source:
+              # Match only the real CONFIG_SECCOMP_FILTER implementation. The
+              # fallback stub is distinguished by the following local vars.
+              pattern = re.compile(
+                  r'(static int __seccomp_filter\(int this_syscall, const struct seccomp_data \*sd,\s*'
+                  r'const bool recheck_after_trace\)\s*\{\s*)(?=u32 filter_ret,\s*action;)'
+              )
+              matches = list(pattern.finditer(source))
+              if len(matches) != 1:
+                  raise SystemExit(f"Expected one real __seccomp_filter() body, found {len(matches)}; refusing unsafe edit")
+              insertion = (
+                  "\n#ifdef CONFIG_KSU\n"
+                  "\t/* " + marker + "\n"
+                  "\t * KernelSU-Next v3.4.1 installs its driver fd through reboot(2)\n"
+                  "\t * with this exact magic tuple. Android app seccomp profiles can\n"
+                  "\t * otherwise block the request before the KSU reboot kprobe sees it.\n"
+                  "\t * Pass only this driver-install request; all other syscalls continue\n"
+                  "\t * through their installed seccomp BPF filters.\n"
+                  "\t */\n"
+                  "\tif (sd && this_syscall == __NR_reboot &&\n"
+                  "\t    (u32)sd->args[0] == 0xDEADBEEF &&\n"
+                  "\t    (u32)sd->args[1] == 0xCAFEBABE &&\n"
+                  "\t    (u32)sd->args[2] == 0 && sd->args[3] != 0)\n"
+                  "\t\treturn 0;\n"
+                  "#endif\n\n"
+              )
+              m = matches[0]
+              source = source[:m.end()] + insertion + source[m.end():]
+              seccomp_path.write_text(source)
 
-          ''' + exec_decl_anchor
-          patch_once("fs/exec.c", "KSU_NEXT_V341_LEGACY_EXEC_HOOK_DECL",
-                     exec_decl_anchor, exec_decl, "execve hook declaration")
-
-          native_anchor = "\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
-          native_replacement = '''\tstruct user_arg_ptr envp = { .ptr.native = __envp };
-          #ifdef CONFIG_KSU
-          	/* KSU_NEXT_V341_LEGACY_EXEC_HOOK */
-          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-          #endif
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
-          patch_once("fs/exec.c", "KSU_NEXT_V341_LEGACY_EXEC_HOOK */",
-                     native_anchor, native_replacement, "native execve hook call")
-
-          compat_anchor = "\tstruct user_arg_ptr envp = {\n\t\t.is_compat = true,\n\t\t.ptr.compat = __envp,\n\t};\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
-          compat_replacement = '''\tstruct user_arg_ptr envp = {
-          		.is_compat = true,
-          		.ptr.compat = __envp,
-          	};
-          #ifdef CONFIG_KSU
-          	/* KSU_NEXT_V341_LEGACY_COMPAT_EXEC_HOOK */
-          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-          #endif
-          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);'''
-          patch_once("fs/exec.c", "KSU_NEXT_V341_LEGACY_COMPAT_EXEC_HOOK */",
-                     compat_anchor, compat_replacement, "32-bit compat execve hook call")
-
-          open_anchor = '''SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-          {
-          	return do_faccessat(dfd, filename, mode);
-          }'''
-          open_replacement = '''/* KSU_NEXT_V341_LEGACY_FACCESSAT_HOOK_DECL */
-          #ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-                                          int *mode, int *flags);
-          #endif
-          SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-          {
-          #ifdef CONFIG_KSU
-          	/* KSU_NEXT_V341_LEGACY_FACCESSAT_HOOK */
-          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif
-          	return do_faccessat(dfd, filename, mode);
-          }'''
-          patch_once("fs/open.c", "KSU_NEXT_V341_LEGACY_FACCESSAT_HOOK_DECL",
-                     open_anchor, open_replacement, "faccessat hook")
-
-          read_anchor = '''SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {
-          	return ksys_read(fd, buf, count);
-          }'''
-          read_replacement = '''/* KSU_NEXT_V341_LEGACY_READ_HOOK_DECL */
-          #ifdef CONFIG_KSU
-          extern bool ksu_vfs_read_hook __read_mostly;
-          extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,
-                                                               char __user **buf_ptr,
-                                                               size_t *count_ptr);
-          #endif
-          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
-          {
-          #ifdef CONFIG_KSU
-          	/* KSU_NEXT_V341_LEGACY_READ_HOOK */
-          	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(fd, &buf, &count);
-          #endif
-          	return ksys_read(fd, buf, count);
-          }'''
-          patch_once("fs/read_write.c", "KSU_NEXT_V341_LEGACY_READ_HOOK_DECL",
-                     read_anchor, read_replacement, "read hook")
-
-          stat_anchor = '''SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
-          		struct stat __user *, statbuf, int, flag)
-          {
-          	struct kstat stat;
-          	int error;
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);'''
-          stat_replacement = '''/* KSU_NEXT_V341_LEGACY_STAT_HOOK_DECL */
-          #ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
-                                     int *flags);
-          #endif
-          SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
-          		struct stat __user *, statbuf, int, flag)
-          {
-          	struct kstat stat;
-          	int error;
-          #ifdef CONFIG_KSU
-          	/* KSU_NEXT_V341_LEGACY_STAT_HOOK */
-          	ksu_handle_stat(&dfd, &filename, &flag);
-          #endif
-
-          	error = vfs_fstatat(dfd, filename, &stat, flag);'''
-          patch_once("fs/stat.c", "KSU_NEXT_V341_LEGACY_STAT_HOOK_DECL",
-                     stat_anchor, stat_replacement, "newfstatat hook")
-
-          reboot_decl_anchor = "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,"
-          reboot_decl = '''/* KSU_NEXT_V341_LEGACY_REBOOT_HOOK_DECL */
-          #ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
-                                           void __user **arg);
-          #endif
-          ''' + reboot_decl_anchor
-          patch_once("kernel/reboot.c", "KSU_NEXT_V341_LEGACY_REBOOT_HOOK_DECL",
-                     reboot_decl_anchor, reboot_decl, "reboot hook declaration")
-
-          reboot_call_anchor = "\tint ret = 0;\n\t/* We only trust the superuser with the system. */"
-          reboot_call_replacement = '''\tint ret = 0;
-          #ifdef CONFIG_KSU
-          	/* KSU_NEXT_V341_LEGACY_REBOOT_HOOK */
-          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-          #endif
-          	/* We only trust the superuser with the system. */'''
-          patch_once("kernel/reboot.c", "KSU_NEXT_V341_LEGACY_REBOOT_HOOK */",
-                     reboot_call_anchor, reboot_call_replacement, "reboot driver-install hook call")
-
-          checks = {
-              "fs/exec.c": ["ksu_handle_execveat((int *)AT_FDCWD", "KSU_NEXT_V341_LEGACY_COMPAT_EXEC_HOOK"],
-              "fs/open.c": ["ksu_handle_faccessat(&dfd, &filename, &mode, NULL)"],
-              "fs/read_write.c": ["ksu_handle_sys_read(fd, &buf, &count)"],
-              "fs/stat.c": ["ksu_handle_stat(&dfd, &filename, &flag)"],
-              "kernel/reboot.c": ["ksu_handle_sys_reboot(magic1, magic2, cmd, &arg)"],
-          }
-          for rel, needles in checks.items():
-              source = Path(rel).read_text()
-              for needle in needles:
-                  if needle not in source:
-                      raise SystemExit(f"Manual hook verification failed: {rel}: {needle}")
-
-          kbuild = Path("KernelSU-Next/kernel/Kbuild").read_text()
-          if "KSU_NEXT_MANAGER_SIZE := 0x3e6" not in kbuild or \
-             "KSU_NEXT_MANAGER_HASH := 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7" not in kbuild:
-              raise SystemExit("KernelSU-Next v3.4.1 Manager signature metadata changed unexpectedly")
+          verify = seccomp_path.read_text()
+          if verify.count(marker) != 1:
+              raise SystemExit("Seccomp handshake exception marker must appear exactly once")
+          for needle in [
+              "this_syscall == __NR_reboot",
+              "(u32)sd->args[0] == 0xDEADBEEF",
+              "(u32)sd->args[1] == 0xCAFEBABE",
+              "(u32)sd->args[2] == 0 && sd->args[3] != 0",
+              "\t\treturn 0;",
+          ]:
+              if needle not in verify:
+                  raise SystemExit(f"Seccomp exception verification failed: {needle}")
 
           report = [
-              "KernelSU-Next manual integration report",
-              "Target: Samsung SM-A135F / Exynos850 / Linux 4.19.325",
-              "Pinned KernelSU-Next: v3.4.1; Manager build: 33333",
-              "Mode: manual legacy hooks; v3.4.1 Kconfig has no KSU_KPROBE_HOOKS option.",
-              *edits,
-              "Verified hooks: execve (native+compat), faccessat, read, newfstatat, reboot driver handshake.",
-              "Manager signature metadata preserved.",
-              "Source-level hook checks pass; runtime root functionality still must be tested on-device.",
+              "KernelSU-Next v3.4.1 driver-install seccomp compatibility fix",
+              "Evidence: device bug report logged 'KernelSU driver install syscall was blocked by seccomp'.",
+              "Pinned handshake verified against KernelSU-Next kernel/uapi/supercall.h and kernel/supercall/supercall.c.",
+              "Only native reboot(2) with args0=0xDEADBEEF, args1=0xCAFEBABE, args2=0, and non-NULL args3 bypasses the BPF filter.",
+              "All other syscall tuples continue through normal seccomp filtering.",
+              "This does not prove reboot-kprobe registration or runtime root; verify kernel log after boot.",
           ]
-          Path("ksu-legacy-hook-integration.log").write_text("\n".join(report) + "\n")
+          Path("ksu-driver-seccomp-fix.log").write_text("\n".join(report) + "\n")
           print("\n".join(report))
-          PYKSULEGACY
+          PYKSUSECCOMP
 
       - name: Configure kernel and KernelSU-Next SUSFS
         shell: bash
@@ -1583,6 +1477,13 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" "$DEFCONFIG"
 
           scripts/config --file .config --enable KSU
+          # KernelSU-Next v3.4.1 uses syscall-table resolution and syscall tracepoints.
+          scripts/config --file .config --enable DEBUG_KERNEL
+          scripts/config --file .config --enable KALLSYMS
+          scripts/config --file .config --enable KALLSYMS_ALL
+          scripts/config --file .config --enable TRACEPOINTS
+          scripts/config --file .config --enable SECCOMP
+          scripts/config --file .config --enable SECCOMP_FILTER
           scripts/config --file .config --enable OVERLAY_FS
           scripts/config --file .config --enable KPROBES
           scripts/config --file .config --enable KPROBE_EVENTS
@@ -1603,7 +1504,7 @@ jobs:
           scripts/config --file .config --disable KSU_SUSFS_SUS_SU
           scripts/config --file .config --enable KSU_SUSFS_ENABLE_LOG
           scripts/config --file .config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-          scripts/config --file .config --set-str LOCALVERSION '-MAX-ARAF'
+          scripts/config --file .config --set-str LOCALVERSION ''
           scripts/config --file .config --disable LOCALVERSION_AUTO
 
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
@@ -1625,6 +1526,12 @@ jobs:
           for option in \
             CONFIG_KSU=y \
             CONFIG_KPROBES=y \
+            CONFIG_KALLSYMS=y \
+            CONFIG_DEBUG_KERNEL=y \
+            CONFIG_KALLSYMS_ALL=y \
+            CONFIG_SECCOMP=y \
+            CONFIG_SECCOMP_FILTER=y \
+            CONFIG_HAVE_SYSCALL_TRACEPOINTS=y \
             CONFIG_KPROBE_EVENTS=y \
             CONFIG_EXT4_FS=y \
             CONFIG_OVERLAY_FS=y \
@@ -1654,7 +1561,7 @@ jobs:
             fi
           done
 
-          grep -q '^CONFIG_LOCALVERSION="-MAX-ARAF"$' .config
+          grep -q '^CONFIG_LOCALVERSION=""$' .config
           echo "KernelSU and conservative SUSFS feature configs verified."
 
       - name: Generate SELinux headers
@@ -1671,7 +1578,7 @@ jobs:
           test -s security/selinux/av_permissions.h
           echo "SELinux headers generated successfully."
 
-      - name: Preflight compile KernelSU-Next, legacy hook call-sites and SUSFS; collect all Clang errors
+      - name: Preflight compile KernelSU-Next, SUSFS and seccomp compatibility; collect all Clang errors
         shell: bash
         run: |
           set -uo pipefail
@@ -1681,7 +1588,7 @@ jobs:
           make -k -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
             KCFLAGS="-ferror-limit=0" \
-            drivers/kernelsu/ fs/exec.o fs/open.o fs/read_write.o fs/stat.o kernel/reboot.o \
+            drivers/kernelsu/ fs/exec.o fs/open.o fs/read_write.o fs/stat.o kernel/reboot.o kernel/seccomp.o \
             2>&1 | tee ksu-preflight.log
           build_rc=${PIPESTATUS[0]}
           set -e
@@ -1690,11 +1597,11 @@ jobs:
             ksu-preflight.log | tee ksu-preflight-error-summary.log || true
           echo "Preflight make exit code: $build_rc"
           if [ "$build_rc" -ne 0 ]; then
-            echo "KernelSU/SUSFS/manual-hook preflight failed; all available diagnostics are in ksu-preflight.log and ksu-preflight-error-summary.log." >&2
+            echo "KernelSU/SUSFS/seccomp preflight failed; all available diagnostics are in ksu-preflight.log and ksu-preflight-error-summary.log." >&2
             exit "$build_rc"
           fi
 
-          echo "KernelSU-Next objects and all five legacy hook call-site objects compiled successfully in preflight."
+          echo "KernelSU-Next objects, seccomp compatibility, and SUSFS preflight targets compiled successfully."
           grep -E -- 'KernelSU(-Next)? version:|KernelSU-Next tag:|Manager signature hash|Manager signature size|SUSFS_VERSION' \
             ksu-preflight.log || true
           grep -Fq -- "-- KernelSU-Next version: ${KSU_EXPECTED_VERSION}" ksu-preflight.log || {
@@ -1882,6 +1789,7 @@ jobs:
             susfs-compatibility.log
             selinux-compatibility-report.log
             ksu-linux-419-api-compatibility.log
+            ksu-driver-seccomp-fix.log
             ksu-legacy-hook-integration.log
             linux-419-link-compatibility.log
             KernelSU-Next/kernel/supercall/dispatch.c
