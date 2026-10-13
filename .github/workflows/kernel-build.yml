@@ -927,6 +927,200 @@ jobs:
               print(" - no changes required for the target kernel's seccomp API")
           PYAPPPROFILE
 
+      - name: Repair remaining KernelSU-Next APIs for Samsung Linux 4.19
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
+          python3 - <<'PYKSU419'
+          from pathlib import Path
+          import re
+
+          # 1) The pinned SELinux compatibility backport references a private
+          # compat/kernel_compat.h that is not part of the selected source tree.
+          # On this verified 4.19 target, its KSU_COMPAT_USE_SELINUX_STATE path
+          # is selected explicitly and ksu_compat_kvrealloc is compiled out.
+          for rel in (
+              'KernelSU-Next/kernel/selinux/rules.c',
+              'KernelSU-Next/kernel/selinux/sepolicy.c',
+          ):
+              p = Path(rel)
+              if not p.is_file():
+                  raise SystemExit(f'Required SELinux source missing: {rel}')
+              s = p.read_text()
+              s, count = re.subn(
+                  r'(?m)^\s*#include\s+"compat/kernel_compat\.h"[^\n]*\n',
+                  '', s,
+              )
+              if count != 1:
+                  raise SystemExit(f'{rel}: expected exactly one pinned compat/kernel_compat.h include, found {count}')
+              if '"compat/kernel_compat.h"' in s:
+                  raise SystemExit(f'{rel}: unresolved compat/kernel_compat.h include remains')
+              p.write_text(s)
+              print(f'{rel}: removed unavailable private compat header ({count} occurrence(s))')
+
+          # 2) Linux 4.19 places min()/min_t() in linux/kernel.h; it has no
+          # linux/minmax.h header. Keep overflow helpers and the SULog logic.
+          p = Path('KernelSU-Next/kernel/sulog/event.c')
+          if not p.is_file():
+              raise SystemExit('Required source missing: KernelSU-Next/kernel/sulog/event.c')
+          s = p.read_text()
+          s = s.replace('#include <linux/minmax.h>', '#include <linux/kernel.h>')
+          if '#include <linux/kernel.h>' not in s:
+              anchor = '#include <linux/gfp.h>'
+              if s.count(anchor) != 1:
+                  raise SystemExit('sulog/event.c: cannot locate safe linux/kernel.h include anchor')
+              s = s.replace(anchor, anchor + '\n#include <linux/kernel.h>', 1)
+          if '#include <linux/minmax.h>' in s or '#include <linux/kernel.h>' not in s:
+              raise SystemExit('sulog/event.c: min/max header adaptation failed')
+          p.write_text(s)
+          print('sulog/event.c: switched min/max include to Linux 4.19 kernel.h')
+
+          # 3) Kernel 4.19 task-work takes bool notify rather than TWA_RESUME.
+          task_work = Path('include/linux/task_work.h')
+          p = Path('KernelSU-Next/kernel/supercall/supercall.c')
+          if not task_work.is_file() or not p.is_file():
+              raise SystemExit('Missing task_work.h or KernelSU-Next supercall.c')
+          declaration = re.search(r'\bint\s+task_work_add\s*\(([^;]*?)\)\s*;', task_work.read_text(), re.S)
+          if not declaration:
+              raise SystemExit('Cannot identify task_work_add() declaration in target kernel')
+          args = re.sub(r'\s+', ' ', declaration.group(1)).strip()
+          s = p.read_text()
+          if re.search(r'\bbool\b', args):
+              s, count = re.subn(
+                  r'(task_work_add\s*\([^;]*?)\bTWA_RESUME\b([^;]*?\))',
+                  r'\1true\2', s, count=1, flags=re.S,
+              )
+              if count == 0 and re.search(r'task_work_add\s*\([^;]*\bTWA_RESUME\b', s, re.S):
+                  raise SystemExit('supercall.c: could not safely adapt TWA_RESUME')
+              if 'TWA_RESUME' in s:
+                  raise SystemExit('supercall.c: unsupported TWA_RESUME token remains on bool notify API')
+              print('supercall.c: adapted task_work_add() to bool notify API')
+          elif 'TWA_RESUME' not in task_work.read_text():
+              raise SystemExit(f'Unsupported task_work_add() target API: {args}')
+          p.write_text(s)
+
+          # 4) dispatch.c needs task/pid declarations on downstream 4.19 trees.
+          p = Path('KernelSU-Next/kernel/supercall/dispatch.c')
+          if not p.is_file():
+              raise SystemExit('Required source missing: KernelSU-Next/kernel/supercall/dispatch.c')
+          s = p.read_text()
+          for include in (
+              '#include <linux/sched.h>',
+              '#include <linux/sched/signal.h>',
+              '#include <linux/pid.h>',
+              '#include <linux/spinlock.h>',
+          ):
+              if include not in s:
+                  anchor = '#include <linux/version.h>'
+                  if s.count(anchor) != 1:
+                      raise SystemExit(f'dispatch.c: cannot add {include}; version.h anchor is not unique')
+                  s = s.replace(anchor, anchor + '\n' + include, 1)
+
+          header_text = ''
+          for rel in ('include/linux/sched.h', 'include/linux/sched/signal.h', 'include/linux/pid.h'):
+              hp = Path(rel)
+              if not hp.is_file():
+                  raise SystemExit(f'Target kernel header missing: {rel}')
+              header_text += '\n' + hp.read_text()
+
+          # If this vendor kernel has no task_pgrp/task_session helper declaration,
+          # use its legacy signal->pids layout (after verifying that layout exists).
+          signal_header = Path('include/linux/sched/signal.h').read_text()
+          sched_headers = header_text
+          if not re.search(r'\btask_pgrp\s*\(', sched_headers):
+              if not re.search(r'\bstruct\s+pid\s*\*\s*pids\s*\[\s*PIDTYPE_MAX\s*\]', sched_headers):
+                  raise SystemExit('No task_pgrp API and no verified legacy signal->pids layout in target headers')
+              helper = (
+                  '/* KSU_NEXT_419_TASK_PGRP_COMPAT */\n'
+                  'static inline struct pid *ksu_legacy_task_pgrp(struct task_struct *task)\n'
+                  '{ return task->signal->pids[PIDTYPE_PGID]; }\n'
+              )
+              if 'ksu_legacy_task_pgrp' not in s:
+                  s = s.replace('static int do_set_init_pgrp(', helper + '\nstatic int do_set_init_pgrp(', 1)
+              s = re.sub(r'\btask_pgrp\s*\(', 'ksu_legacy_task_pgrp(', s)
+              print('dispatch.c: added verified legacy task_pgrp helper')
+
+          if not re.search(r'\btask_session\s*\(', sched_headers):
+              if not re.search(r'\bstruct\s+pid\s*\*\s*pids\s*\[\s*PIDTYPE_MAX\s*\]', sched_headers):
+                  raise SystemExit('No task_session API and no verified legacy signal->pids layout in target headers')
+              helper = (
+                  '/* KSU_NEXT_419_TASK_SESSION_COMPAT */\n'
+                  'static inline struct pid *ksu_legacy_task_session(struct task_struct *task)\n'
+                  '{ return task->signal->pids[PIDTYPE_SID]; }\n'
+              )
+              if 'ksu_legacy_task_session' not in s:
+                  s = s.replace('static int do_set_init_pgrp(', helper + '\nstatic int do_set_init_pgrp(', 1)
+              s = re.sub(r'\btask_session\s*\(', 'ksu_legacy_task_session(', s)
+              print('dispatch.c: added verified legacy task_session helper')
+
+          # Declarations may be hidden by a downstream header variant even though
+          # the actual kernel symbols exist. Add externs only if all headers omit them.
+          if not re.search(r'\btasklist_lock\b', sched_headers):
+              s = s.replace('#include <linux/spinlock.h>', '#include <linux/spinlock.h>\nextern rwlock_t tasklist_lock;', 1)
+          if not re.search(r'\binit_task\b', sched_headers):
+              s = s.replace('#include <linux/spinlock.h>', '#include <linux/spinlock.h>\nextern struct task_struct init_task;', 1)
+          p.write_text(s)
+          print('dispatch.c: added legacy task/pid includes and API checks')
+
+          # 5) v3.4.1's SELinux-hide optional feature relies on fields absent from
+          # SELinux's Linux 4.19 selinux_state (status_lock/status_page/policy).
+          # Keep all five public entry points, but make this OPTIONAL hiding feature
+          # a no-op on <5.0. Core SELinux rule application and Manager ABI are separate.
+          p = Path('KernelSU-Next/kernel/feature/selinux_hide.c')
+          if not p.is_file():
+              raise SystemExit('Required source missing: KernelSU-Next/kernel/feature/selinux_hide.c')
+          s = p.read_text()
+          marker = '/* KSU_NEXT_419_SELINUX_HIDE_STUB */'
+          if marker not in s:
+              stub = '''#include <linux/version.h>
+          #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+          /* KSU_NEXT_419_SELINUX_HIDE_STUB */
+          #include "selinux_hide.h"
+          void ksu_selinux_hide_init(void) {}
+          void ksu_selinux_hide_exit(void) {}
+          void ksu_selinux_hide_drop_backup_if_unused(void) {}
+          void ksu_selinux_hide_handle_second_stage(void) {}
+          void ksu_selinux_hide_handle_post_fs_data(void) {}
+          #else
+          '''
+              s = stub + s + '\n#endif /* Linux 4.19: SELinux-hide implementation is not API-compatible */\n'
+          required_stubs = (
+              'void ksu_selinux_hide_init(void)',
+              'void ksu_selinux_hide_exit(void)',
+              'void ksu_selinux_hide_drop_backup_if_unused(void)',
+              'void ksu_selinux_hide_handle_second_stage(void)',
+              'void ksu_selinux_hide_handle_post_fs_data(void)',
+          )
+          if marker not in s or not s.rstrip().endswith('#endif /* Linux 4.19: SELinux-hide implementation is not API-compatible */'):
+              raise SystemExit('selinux_hide.c: compatibility guard failed verification')
+          for item in required_stubs:
+              if item not in s:
+                  raise SystemExit(f'selinux_hide.c: missing compatibility stub {item}')
+          p.write_text(s)
+          print('selinux_hide.c: added Linux 4.19 no-op stubs for optional SELinux-hide feature')
+
+          # Ensure core identity has not been edited during compatibility work.
+          kbuild = Path('KernelSU-Next/kernel/Kbuild').read_text()
+          if 'KSU_NEXT_MANAGER_SIZE := 0x3e6' not in kbuild:
+              raise SystemExit('Manager size changed during 4.19 compatibility patch')
+          if 'KSU_NEXT_MANAGER_HASH := 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7' not in kbuild:
+              raise SystemExit('Manager signature hash changed during 4.19 compatibility patch')
+          print('Verified: official v3.4.1 Manager signature metadata is unchanged.')
+          Path('ksu-linux-419-api-compatibility.log').write_text(
+              'Target: Samsung Galaxy A13 SM-A135F / Linux 4.19.325\n'
+              'Manager/driver: official KernelSU-Next v3.4.1, build 33333\n'
+              'Removed unavailable compat/kernel_compat.h includes from the pinned SELinux backport; '
+              'the 4.19 path is explicitly selected by the preceding step.\n'
+              'SULog min/max header mapped to linux/kernel.h.\n'
+              'task_work_add() checked against target task_work.h; TWA_RESUME replaced only for bool-notify API.\n'
+              'dispatch.c includes legacy task/pid declarations and checks target helper availability.\n'
+              'Optional SELinux-hide implementation disabled on Linux <5.0 because its required selinux_state fields '
+              'are absent; public entry points retained as no-op stubs.\n'
+              'KSU_NEXT_MANAGER_SIZE and KSU_NEXT_MANAGER_HASH verified unchanged.\n'
+          )
+          PYKSU419
+
       - name: Apply SUSFS with conservative compatibility mode
         shell: bash
         run: |
@@ -1387,6 +1581,11 @@ jobs:
             susfs-patch-dry-run.log
             susfs-compatibility.log
             selinux-compatibility-report.log
+            ksu-linux-419-api-compatibility.log
+            KernelSU-Next/kernel/supercall/dispatch.c
+            KernelSU-Next/kernel/supercall/supercall.c
+            KernelSU-Next/kernel/sulog/event.c
+            KernelSU-Next/kernel/feature/selinux_hide.c
             selinux-rules-compat.diff
             selinux-sepolicy-compat.diff
             scripts-build.log
