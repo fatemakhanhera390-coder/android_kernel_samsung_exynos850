@@ -50,6 +50,11 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Initialize diagnostics directory
+        if: always()
+        shell: bash
+        run: mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+
       - name: Install build dependencies
         shell: bash
         run: |
@@ -101,6 +106,38 @@ jobs:
           test -f drivers/kernelsu/Makefile
           echo "KernelSU source ref requested: $KSU_REF"
           git -C KernelSU rev-parse HEAD
+
+      - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          FILE="drivers/input/touchscreen/ovt/td4150_spi/ovt_tcm_sec_fn_test.c"
+          test -f "$FILE" || { echo "Expected touchscreen source not found: $FILE" >&2; exit 1; }
+          python3 - "$FILE" <<'PYFIX'
+          from pathlib import Path
+          import re, sys
+
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          pattern = re.compile(
+              r'snprintf\(\s*tcm_hcd->print_buf\s*,\s*'
+              r'sizeof\(\s*tcm_hcd->print_buf\s*\)\s*,\s*"NG"\s*\)\s*;'
+          )
+          fixed, count = pattern.subn(
+              'memcpy(tcm_hcd->print_buf, "NG", sizeof("NG"));', source
+          )
+          if count < 1:
+              raise SystemExit(
+                  'No expected sizeof(pointer) NG call found; source may have changed. '
+                  'Inspect this file and the attached diagnostics before editing the patch.'
+              )
+          path.write_text(fixed)
+          print(f'Fixed {count} snprintf(sizeof(pointer)) call(s) in {path}.')
+          PYFIX
+          git diff --check
+          git diff -- "$FILE" > "$GITHUB_WORKSPACE/diagnostics/source-fixes.patch"
+          cp "$FILE" "$GITHUB_WORKSPACE/diagnostics/ovt_tcm_sec_fn_test.c.patched"
 
       - name: Configure kernel
         shell: bash
@@ -159,8 +196,13 @@ jobs:
         working-directory: kernel
         run: |
           set -Eeuo pipefail
-          make -j"$(nproc --all)" ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" Image dtbs
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+          {
+            echo "Build started (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Command: make V=1 -j$(nproc --all) ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image dtbs"
+          } | tee "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
+          make V=1 -j"$(nproc --all)" ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" Image dtbs 2>&1 | tee -a "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
           test -s arch/arm64/boot/Image
           file arch/arm64/boot/Image
           strings arch/arm64/boot/Image | grep -m1 'Linux version' || true
@@ -238,3 +280,84 @@ jobs:
             sha256sum.txt
           if-no-files-found: error
           retention-days: 14
+
+      - name: Collect diagnostics (runs even after a failed build)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          DIAG="$GITHUB_WORKSPACE/diagnostics"
+          mkdir -p "$DIAG"
+          {
+            echo "A13X Suzume Kernel build diagnostics"
+            echo "UTC time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "GitHub repository: $GITHUB_REPOSITORY"
+            echo "Workflow run ID: $GITHUB_RUN_ID"
+            echo "Workflow run attempt: $GITHUB_RUN_ATTEMPT"
+            echo "Runner OS: ${RUNNER_OS:-unknown}"
+            echo "Runner arch: ${RUNNER_ARCH:-unknown}"
+            echo "Kernel repo: $KERNEL_REPO"
+            echo "Kernel branch: $KERNEL_BRANCH"
+            echo "Defconfig: $DEFCONFIG"
+            echo "Neutron release tag: $NEUTRON_TAG"
+            echo "KernelSU requested ref: $KSU_REF"
+            echo
+            echo '--- Toolchain ---'
+            command -v clang
+            clang --version
+            command -v ld.lld
+            ld.lld --version
+            echo
+            echo '--- Kernel source ---'
+            if [[ -d "$GITHUB_WORKSPACE/kernel/.git" ]]; then
+              git -C "$GITHUB_WORKSPACE/kernel" rev-parse HEAD
+              git -C "$GITHUB_WORKSPACE/kernel" log -1 --format='%H%n%ad%n%s' --date=iso-strict
+              git -C "$GITHUB_WORKSPACE/kernel" status --short
+              git -C "$GITHUB_WORKSPACE/kernel" diff --check
+              git -C "$GITHUB_WORKSPACE/kernel" diff -- drivers/input/touchscreen/ovt/td4150_spi/ovt_tcm_sec_fn_test.c
+              if [[ -d "$GITHUB_WORKSPACE/kernel/KernelSU/.git" ]]; then
+                echo '--- KernelSU commit ---'
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU" rev-parse HEAD
+              fi
+              if [[ -f "$GITHUB_WORKSPACE/kernel/Makefile" ]]; then
+                echo "Kernel version: $(make -s -C "$GITHUB_WORKSPACE/kernel" kernelversion 2>&1)"
+                echo "Kernel release (if configured): $(make -s -C "$GITHUB_WORKSPACE/kernel" ARCH=arm64 kernelrelease 2>&1)"
+              fi
+            else
+              echo 'Kernel source checkout is unavailable.'
+            fi
+          } > "$DIAG/build-environment.txt" 2>&1
+
+          if [[ -f "$GITHUB_WORKSPACE/kernel/.config" ]]; then
+            cp "$GITHUB_WORKSPACE/kernel/.config" "$DIAG/kernel.config"
+            grep -E '^(CONFIG_(KSU|KPROBES|KALLSYMS|KALLSYMS_ALL|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' \
+              "$GITHUB_WORKSPACE/kernel/.config" > "$DIAG/config-summary.txt" || true
+          else
+            echo 'Kernel .config was not generated.' > "$DIAG/config-summary.txt"
+          fi
+
+          if [[ -f "$DIAG/kernel-build.log" ]]; then
+            grep -nE -i '(^|[[:space:]])(fatal )?error:|error generated|errors? generated|make\[[0-9]+\]: \*\*\*|Error [0-9]+|Broken pipe|warning:' \
+              "$DIAG/kernel-build.log" > "$DIAG/errors-summary.txt" || true
+            tail -n 250 "$DIAG/kernel-build.log" > "$DIAG/kernel-build-last-250-lines.txt" || true
+          else
+            echo 'Compilation log was not created; the failure may have happened before the compile step.' > "$DIAG/errors-summary.txt"
+          fi
+
+          {
+            echo 'Diagnostics artifact contents:'
+            find "$DIAG" -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
+            echo
+            echo 'The full compiler log, error summary, final 250 lines, kernel config, source diff, and toolchain/source versions are included when available.'
+          } > "$DIAG/README.txt"
+          echo 'Diagnostics collected. The A13X-Suzume-Build-Diagnostics artifact is uploaded even if earlier steps failed.'
+
+      - name: Upload build diagnostics (always, including failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A13X-Suzume-Build-Diagnostics-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
