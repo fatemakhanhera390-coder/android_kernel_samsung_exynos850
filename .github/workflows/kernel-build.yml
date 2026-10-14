@@ -1322,7 +1322,7 @@ jobs:
           print("SUSFS compatible hunks applied and manual anchors verified.")
           PYSUSFS
 
-      - name: Fix SUSFS Linux 4.19 kstat forward declaration
+      - name: Fix SUSFS Linux 4.19 kstat forward declaration (newline-safe)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -1332,27 +1332,38 @@ jobs:
           header = Path("include/linux/susfs.h")
           if not header.is_file():
               raise SystemExit("SUSFS header missing before kstat compatibility fix")
-          source = header.read_text()
-          marker = "/* sus_kstat */"
-          if "struct kstat;" not in source:
-              if source.count(marker) < 2:
-                  raise SystemExit("Could not find SUSFS kstat declaration section")
-              # The first marker defines SUSFS data structures; the second starts
-              # the public function prototypes. Put the forward declaration before
-              # those prototypes so struct kstat has file scope in Linux 4.19.
-              positions = [i for i in range(len(source)) if source.startswith(marker, i)]
-              pos = positions[1]
-              source = source[:pos] + "struct kstat;\\n\\n" + source[pos:]
-              header.write_text(source)
 
+          source = header.read_text()
+          # v16 accidentally wrote the two characters \\n instead of actual newlines.
+          # Normalize that exact bad insertion first, making this step safe on either
+          # a clean checkout or a workspace that already contains the v16 result.
+          source = source.replace("struct kstat;\\n\\n", "struct kstat;\n\n")
+
+          marker = "/* sus_kstat */"
+          if not any(line.strip() == "struct kstat;" for line in source.splitlines()):
+              positions = [i for i in range(len(source)) if source.startswith(marker, i)]
+              if len(positions) < 2:
+                  raise SystemExit("Could not find SUSFS kstat API declaration section")
+              # The second marker precedes the public API prototypes; place the
+              # forward declaration at file scope immediately before that section.
+              pos = positions[1]
+              source = source[:pos] + "struct kstat;\n\n" + source[pos:]
+
+          header.write_text(source)
           verify = header.read_text()
           prototype = "void susfs_sus_ino_for_generic_fillattr(unsigned long ino, struct kstat *stat);"
-          if verify.count("struct kstat;") != 1 or prototype not in verify:
-              raise SystemExit("SUSFS kstat forward-declaration verification failed")
+          declaration_lines = [line.strip() for line in verify.splitlines() if line.strip() == "struct kstat;"]
+          declaration_pos = verify.find("struct kstat;")
+          prototype_pos = verify.find(prototype)
+          if (len(declaration_lines) != 1 or prototype_pos < 0 or
+                  declaration_pos < 0 or declaration_pos >= prototype_pos or
+                  "struct kstat;\\n\\n" in verify):
+              raise SystemExit("SUSFS kstat forward declaration verification failed (newline/placement/count)")
+
           Path("susfs-kstat-compatibility.log").write_text(
-              "Added file-scope struct kstat forward declaration for Linux 4.19; SUSFS API unchanged.\\n"
+              "Added one real file-scope struct kstat forward declaration before SUSFS API prototypes.\n"
           )
-          print("SUSFS kstat forward declaration verified.")
+          print("SUSFS kstat forward declaration verified: one declaration, real newlines, correct placement.")
           PYKSTAT
 
       - name: Fix SUSFS v4.19 if-chain prctl port for official KernelSU-Next v3.4.1
