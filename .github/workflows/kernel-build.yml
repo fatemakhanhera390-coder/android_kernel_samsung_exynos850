@@ -1322,6 +1322,39 @@ jobs:
           print("SUSFS compatible hunks applied and manual anchors verified.")
           PYSUSFS
 
+      - name: Fix SUSFS Linux 4.19 kstat forward declaration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYKSTAT'
+          from pathlib import Path
+
+          header = Path("include/linux/susfs.h")
+          if not header.is_file():
+              raise SystemExit("SUSFS header missing before kstat compatibility fix")
+          source = header.read_text()
+          marker = "/* sus_kstat */"
+          if "struct kstat;" not in source:
+              if source.count(marker) < 2:
+                  raise SystemExit("Could not find SUSFS kstat declaration section")
+              # The first marker defines SUSFS data structures; the second starts
+              # the public function prototypes. Put the forward declaration before
+              # those prototypes so struct kstat has file scope in Linux 4.19.
+              positions = [i for i in range(len(source)) if source.startswith(marker, i)]
+              pos = positions[1]
+              source = source[:pos] + "struct kstat;\\n\\n" + source[pos:]
+              header.write_text(source)
+
+          verify = header.read_text()
+          prototype = "void susfs_sus_ino_for_generic_fillattr(unsigned long ino, struct kstat *stat);"
+          if verify.count("struct kstat;") != 1 or prototype not in verify:
+              raise SystemExit("SUSFS kstat forward-declaration verification failed")
+          Path("susfs-kstat-compatibility.log").write_text(
+              "Added file-scope struct kstat forward declaration for Linux 4.19; SUSFS API unchanged.\\n"
+          )
+          print("SUSFS kstat forward declaration verified.")
+          PYKSTAT
+
       - name: Fix SUSFS v4.19 if-chain prctl port for official KernelSU-Next v3.4.1
         shell: bash
         run: |
