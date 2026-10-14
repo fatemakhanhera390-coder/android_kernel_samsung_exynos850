@@ -1322,7 +1322,7 @@ jobs:
           print("SUSFS compatible hunks applied and manual anchors verified.")
           PYSUSFS
 
-      - name: Port SUSFS v4.19 prctl command interface into official KernelSU-Next v3.4.1
+      - name: Fix SUSFS v4.19 if-chain prctl port for official KernelSU-Next v3.4.1
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -1374,65 +1374,24 @@ jobs:
                   raise SystemExit(f"SUSFS command/header mismatch; missing {command}")
           fragment = fragment.replace("ksu_access_ok(", "ksu_susfs_access_ok(")
 
-          # Preserve the command block's legacy switch semantics in a standalone function:
-          # recognized cases that break out of the switch return success; unknown commands fail closed.
-          def matching_brace(text, open_pos):
-              depth = 0
-              state = "code"
-              i = open_pos
-              while i < len(text):
-                  ch = text[i]
-                  nxt = text[i + 1] if i + 1 < len(text) else ""
-                  if state == "line_comment":
-                      if ch == "\n": state = "code"
-                  elif state == "block_comment":
-                      if ch == "*" and nxt == "/": state = "code"; i += 1
-                  elif state in ("string", "char"):
-                      if ch == "\\": i += 1
-                      elif (state == "string" and ch == '"') or (state == "char" and ch == "'"):
-                          state = "code"
-                  else:
-                      if ch == "/" and nxt == "/": state = "line_comment"; i += 1
-                      elif ch == "/" and nxt == "*": state = "block_comment"; i += 1
-                      elif ch == '"': state = "string"
-                      elif ch == "'": state = "char"
-                      elif ch == "{": depth += 1
-                      elif ch == "}":
-                          depth -= 1
-                          if depth == 0: return i
-                  i += 1
-              raise SystemExit("Unbalanced braces in extracted SUSFS command block")
-
-          sw = re.search(r"\bswitch\s*\(\s*arg2\s*\)\s*\{", fragment)
-          if not sw:
-              raise SystemExit("Extracted SUSFS block lacks switch(arg2); refusing incomplete port")
-          sw_open = fragment.find("{", sw.start(), sw.end())
-          sw_close = matching_brace(fragment, sw_open)
-          switch_body = fragment[sw_open + 1:sw_close]
-          default = re.search(r"(?m)^\s*default\s*:", switch_body)
-          if default:
-              rest = switch_body[default.end():]
-              next_label = re.search(r"(?m)^\s*(?:case\b|default\s*:)", rest)
-              default_end = default.end() + (next_label.start() if next_label else len(rest))
-              default_segment = switch_body[default.end():default_end]
-              if "return -ENOTTY;" not in default_segment:
-                  terminal = re.search(r"\b(?:break\s*;|return\s+[^;]+;)", default_segment)
-                  if not terminal:
-                      raise SystemExit("Cannot make the existing SUSFS default case fail closed safely")
-                  abs_start = default.end() + terminal.start()
-                  abs_end = default.end() + terminal.end()
-                  switch_body = switch_body[:abs_start] + "return -ENOTTY;" + switch_body[abs_end:]
-          else:
-              switch_body += "\n                default: return -ENOTTY;\n            "
-          fragment = fragment[:sw_open + 1] + switch_body + fragment[sw_close:]
-          sw = re.search(r"\bswitch\s*\(\s*arg2\s*\)\s*\{", fragment)
-          sw_open = fragment.find("{", sw.start(), sw.end())
-          sw_close = matching_brace(fragment, sw_open)
-          # Ensure switch is the last statement inside the root-UID guard before inserting success.
-          tail = fragment[sw_close + 1:]
-          if not re.match(r"\s*\}\s*#endif\b", tail):
-              raise SystemExit("SUSFS command block layout differs after switch(arg2); refusing to guess success semantics")
-          fragment = fragment[:sw_close + 1] + "\n                return 0;" + fragment[sw_close + 1:]
+          # The pinned SUSFS 4.19 patch uses a chain of independent if(arg2 == CMD_...)
+          # checks, not switch(arg2). Preserve that exact protocol; do not invent a switch.
+          # Each recognized command returns 0 from the extracted handler, while unknown
+          # commands fall through to the postlude's -ENOTTY. This is verified against the
+          # actual patch fragment before any source file is written.
+          command_checks = re.findall(r"\bif\s*\(\s*arg2\s*==\s*(CMD_SUSFS_[A-Z0-9_]+)\s*\)", fragment)
+          if len(command_checks) < 6:
+              raise SystemExit(f"Extracted SUSFS command block is incomplete: only {len(command_checks)} arg2 command checks found")
+          if len(command_checks) != len(set(command_checks)):
+              # A few command names may appear in log strings, but the parsed if-checks
+              # themselves must be unique to avoid accidental duplicate dispatch.
+              raise SystemExit("Extracted SUSFS command block has duplicate arg2 dispatch checks")
+          if "if (current_uid_val == 0)" not in fragment:
+              raise SystemExit("Extracted SUSFS command block lacks its root-UID guard")
+          if "return 0;" not in fragment:
+              raise SystemExit("Extracted SUSFS command block has no successful command return")
+          if "return -ENOTTY;" in fragment:
+              raise SystemExit("Legacy SUSFS block unexpectedly contains a fallback; wrapper owns unknown-command handling")
 
           handler_path = Path("KernelSU-Next/kernel/feature/susfs_compat.c")
           handler_marker = "KSU_NEXT_SUSFS_PRCTL_COMPAT"
@@ -1538,7 +1497,7 @@ jobs:
               "Port source: KernelSU-Next-compatible extraction of SUSFS kernel-4.19 10_enable_susfs_for_ksu.patch command block.",
               "Dispatcher: kernel/sys.c SYSCALL_DEFINE5(prctl), KERNEL_SU_OPTION 0xDEADBEEF only.",
               "Authorization: SUSFS command block only acts for current_uid().val == 0.",
-              "Unknown SUSFS command returns -ENOTTY; command errors are returned through arg5 per SUSFS protocol.",
+              "Legacy independent arg2 command checks preserved; unknown SUSFS commands return -ENOTTY; command errors use arg5 per protocol.",
               "Features compiled only under existing CONFIG_KSU_SUSFS_* flags; disabled mount/try_umount/sus_su features stay disabled.",
               "Source patch and Kbuild integration verified; compile and device-runtime validation still required.",
           ]
@@ -1571,6 +1530,7 @@ jobs:
               "Linux prctl syscall calls the bridge": "KSU_NEXT_SUSFS_PRCTL_DISPATCH" in kernel_sys and "return ksu_susfs_handle_prctl(arg2, arg3, arg4, arg5);" in kernel_sys,
               "KernelSU-Next Kbuild links the bridge": "feature/susfs_compat.o" in kbuild,
               "Unknown commands fail closed": "return -ENOTTY;" in handler,
+              "Legacy arg2 if-chain retained": len(re.findall(r"\bif\s*\(\s*arg2\s*==\s*CMD_SUSFS_", handler)) >= 6,
               "Root UID guard is present": "current_uid_val == 0" in handler,
           }
           failed = [name for name, ok in checks.items() if not ok]
