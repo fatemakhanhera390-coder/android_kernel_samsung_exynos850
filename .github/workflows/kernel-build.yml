@@ -1,4 +1,4 @@
-name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF (seccomp fix)
+name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF (seccomp fix v2)
 
 on:
   workflow_dispatch:
@@ -1398,7 +1398,7 @@ jobs:
 
           seccomp_path = Path("kernel/seccomp.c")
           supercall_path = Path("KernelSU-Next/kernel/supercall/supercall.c")
-          uapi_path = Path("KernelSU-Next/kernel/uapi/supercall.h")
+          uapi_path = Path("KernelSU-Next/uapi/supercall.h")
           for p in (seccomp_path, supercall_path, uapi_path):
               if not p.is_file():
                   raise SystemExit(f"Required source missing: {p}")
@@ -1460,7 +1460,7 @@ jobs:
           report = [
               "KernelSU-Next v3.4.1 driver-install seccomp compatibility fix",
               "Evidence: device bug report logged 'KernelSU driver install syscall was blocked by seccomp'.",
-              "Pinned handshake verified against KernelSU-Next kernel/uapi/supercall.h and kernel/supercall/supercall.c.",
+              "Pinned handshake verified against KernelSU-Next uapi/supercall.h and kernel/supercall/supercall.c.",
               "Only native reboot(2) with args0=0xDEADBEEF, args1=0xCAFEBABE, args2=0, and non-NULL args3 bypasses the BPF filter.",
               "All other syscall tuples continue through normal seccomp filtering.",
               "This does not prove reboot-kprobe registration or runtime root; verify kernel log after boot.",
