@@ -1,4 +1,4 @@
-name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF (seccomp fix v2)
+name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF (seccomp fix v3 + full diagnostics)
 
 on:
   workflow_dispatch:
@@ -1391,83 +1391,105 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          trap 'rc=$?; echo "ERROR at line $LINENO: $BASH_COMMAND (exit=$rc)" >&2; exit "$rc"' ERR
+          trap 'rc=$?; printf "ERROR at line %s (exit=%s)\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
           python3 - <<'PYKSUSECCOMP'
           from pathlib import Path
           import re
 
           seccomp_path = Path("kernel/seccomp.c")
           supercall_path = Path("KernelSU-Next/kernel/supercall/supercall.c")
-          uapi_path = Path("KernelSU-Next/uapi/supercall.h")
-          for p in (seccomp_path, supercall_path, uapi_path):
+          uapi_candidates = (
+              Path("KernelSU-Next/uapi/supercall.h"),
+              Path("KernelSU-Next/kernel/uapi/supercall.h"),
+          )
+          for p in (seccomp_path, supercall_path):
               if not p.is_file():
                   raise SystemExit(f"Required source missing: {p}")
+          uapi_path = next((p for p in uapi_candidates if p.is_file()), None)
+          if uapi_path is None:
+              searched = ", ".join(str(p) for p in uapi_candidates)
+              raise SystemExit(f"KernelSU-Next UAPI header missing; searched: {searched}")
 
           supercall = supercall_path.read_text()
           uapi = uapi_path.read_text()
-          if "KSU_INSTALL_MAGIC1 = 0xDEADBEEF" not in uapi or \
-             "KSU_INSTALL_MAGIC2 = 0xCAFEBABE" not in uapi:
-              raise SystemExit("Pinned KernelSU-Next v3.4.1 install magic values differ; refusing to patch seccomp")
-          if "magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_INSTALL_MAGIC2" not in supercall or \
-             "register_kprobe(&reboot_kp)" not in supercall:
+
+          def has_magic(header, name, value):
+              for line in header.splitlines():
+                  if re.search(r"\b" + re.escape(name) + r"\b", line) and re.search(r"\b" + re.escape(value) + r"\b", line, re.I):
+                      return True
+              return False
+
+          if not has_magic(uapi, "KSU_INSTALL_MAGIC1", "0xDEADBEEF") or not has_magic(uapi, "KSU_INSTALL_MAGIC2", "0xCAFEBABE"):
+              raise SystemExit(f"Pinned install magic values differ in {uapi_path}; refusing to patch seccomp")
+
+          normalized_supercall = re.sub(r"\s+", " ", supercall)
+          if not re.search(r"magic1\s*==\s*KSU_INSTALL_MAGIC1\s*&&\s*magic2\s*==\s*KSU_INSTALL_MAGIC2", normalized_supercall) or not re.search(r"register_kprobe\s*\(\s*&reboot_kp\s*\)", normalized_supercall):
               raise SystemExit("Pinned KernelSU-Next reboot-kprobe driver handshake differs; refusing to patch seccomp")
 
           source = seccomp_path.read_text()
           marker = "KSU_NEXT_DRIVER_INSTALL_SECCOMP_ALLOW"
           if marker not in source:
-              # Keep every C declaration at the start of the function body.
-              # Linux 4.19 builds with -Werror=declaration-after-statement.
+              # Match the declaration block in the real CONFIG_SECCOMP_FILTER
+              # implementation so no C statement precedes a local declaration.
               pattern = re.compile(
-                  r'(static int __seccomp_filter\\(int this_syscall, const struct seccomp_data \\*sd,\\s*'
-                  r'const bool recheck_after_trace\\)\\s*\\{\\s*)'
-                  r'(u32 filter_ret,\\s*action;\\s*'
-                  r'struct seccomp_filter \\*match = NULL;\\s*'
-                  r'int data;\\s*)'
+                  r'(static int __seccomp_filter\(int this_syscall, const struct seccomp_data \*sd,\s*'
+                  r'const bool recheck_after_trace\)\s*\{\s*)'
+                  r'(u32 filter_ret,\s*action;\s*'
+                  r'struct seccomp_filter \*match = NULL;\s*'
+                  r'int data;\s*)'
               )
               matches = list(pattern.finditer(source))
               if len(matches) != 1:
                   raise SystemExit(f"Expected one real __seccomp_filter() declaration block, found {len(matches)}; refusing unsafe edit")
               insertion = (
-                  "\\n#ifdef CONFIG_KSU\\n"
-                  "\\t/* " + marker + "\\n"
-                  "\\t * KernelSU-Next v3.4.1 installs its driver fd through reboot(2)\\n"
-                  "\\t * with this exact magic tuple. Android app seccomp profiles can\\n"
-                  "\\t * otherwise block the request before the KSU reboot kprobe sees it.\\n"
-                  "\\t * Pass only this driver-install request; all other syscalls continue\\n"
-                  "\\t * through their installed seccomp BPF filters.\\n"
-                  "\\t */\\n"
-                  "\\tif (sd && this_syscall == __NR_reboot &&\\n"
-                  "\\t    (u32)sd->args[0] == 0xDEADBEEF &&\\n"
-                  "\\t    (u32)sd->args[1] == 0xCAFEBABE &&\\n"
-                  "\\t    (u32)sd->args[2] == 0 && sd->args[3] != 0)\\n"
-                  "\\t\\treturn 0;\\n"
-                  "#endif\\n\\n"
+                  "\n#ifdef CONFIG_KSU\n"
+                  "\t/* " + marker + "\n"
+                  "\t * KernelSU-Next v3.4.1 obtains its driver fd through reboot(2)\n"
+                  "\t * using the exact UAPI magic tuple. Android seccomp profiles may\n"
+                  "\t * otherwise block the request before the reboot kprobe sees it.\n"
+                  "\t * Allow only this exact driver-install request; all other tuples\n"
+                  "\t * continue through the installed seccomp BPF filters.\n"
+                  "\t */\n"
+                  "\tif (sd && this_syscall == __NR_reboot &&\n"
+                  "\t    (u32)sd->args[0] == 0xDEADBEEF &&\n"
+                  "\t    (u32)sd->args[1] == 0xCAFEBABE &&\n"
+                  "\t    (u32)sd->args[2] == 0 && sd->args[3] != 0)\n"
+                  "\t\treturn 0;\n"
+                  "#endif\n\n"
               )
-              m = matches[0]
-              insert_at = m.end(2)
-              source = source[:insert_at] + insertion + source[insert_at:]
+              match = matches[0]
+              insertion_point = match.end(2)
+              source = source[:insertion_point] + insertion + source[insertion_point:]
               seccomp_path.write_text(source)
 
           verify = seccomp_path.read_text()
           if verify.count(marker) != 1:
               raise SystemExit("Seccomp handshake exception marker must appear exactly once")
-          for needle in [
+          start_match = re.search(r"static int __seccomp_filter\(int this_syscall, const struct seccomp_data \*sd,\s*const bool recheck_after_trace\)\s*\{", verify)
+          if not start_match:
+              raise SystemExit("Could not re-find __seccomp_filter() after seccomp patch")
+          decl_end = verify.find("int data;", start_match.end())
+          marker_pos = verify.find(marker, start_match.end())
+          function_end = verify.find("\n}", start_match.end())
+          if decl_end < 0 or marker_pos < decl_end or function_end < 0 or marker_pos > function_end:
+              raise SystemExit("Seccomp exception is not in the real function after all C declarations")
+          for needle in (
               "this_syscall == __NR_reboot",
               "(u32)sd->args[0] == 0xDEADBEEF",
               "(u32)sd->args[1] == 0xCAFEBABE",
               "(u32)sd->args[2] == 0 && sd->args[3] != 0",
-              "\t\treturn 0;",
-          ]:
+              "return 0;",
+          ):
               if needle not in verify:
                   raise SystemExit(f"Seccomp exception verification failed: {needle}")
 
           report = [
               "KernelSU-Next v3.4.1 driver-install seccomp compatibility fix",
+              f"UAPI header: {uapi_path}",
               "Evidence: device bug report logged 'KernelSU driver install syscall was blocked by seccomp'.",
-              "Pinned handshake verified against KernelSU-Next uapi/supercall.h and kernel/supercall/supercall.c.",
-              "Only native reboot(2) with args0=0xDEADBEEF, args1=0xCAFEBABE, args2=0, and non-NULL args3 bypasses the BPF filter.",
-              "All other syscall tuples continue through normal seccomp filtering.",
-              "This does not prove reboot-kprobe registration or runtime root; verify kernel log after boot.",
+              "Pinned magic values and reboot-kprobe handler verified in the checked-out v3.4.1 source.",
+              "Only reboot(2) with args0=0xDEADBEEF, args1=0xCAFEBABE, args2=0, and non-NULL args3 bypasses the BPF filter.",
+              "This source check does not prove runtime kprobe registration or root access; verify after boot.",
           ]
           Path("ksu-driver-seccomp-fix.log").write_text("\n".join(report) + "\n")
           print("\n".join(report))
@@ -1582,38 +1604,56 @@ jobs:
           test -s security/selinux/av_permissions.h
           echo "SELinux headers generated successfully."
 
-      - name: Preflight compile KernelSU-Next, SUSFS and seccomp compatibility; collect all Clang errors
+      - name: Preflight compile all KernelSU-Next and SUSFS touched C units; collect all Clang errors
         shell: bash
         run: |
-          set -uo pipefail
-          # Verify the generated seccomp exception is C89-safe before compiling.
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "ERROR at line %s (exit=%s)\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+
+          # Fail fast only on source-layout/patch integrity. The compiler phase below
+          # uses make -k so independent object errors are collected in one run.
           python3 - <<'PREFLIGHTSEC'
           from pathlib import Path
           import re
-          p = Path("kernel/seccomp.c")
-          text = p.read_text()
-          start = text.find("static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,")
-          if start < 0:
+
+          path = Path("kernel/seccomp.c")
+          source = path.read_text()
+          signature = re.compile(
+              r"static int __seccomp_filter\(int this_syscall, const struct seccomp_data \*sd,\s*"
+              r"const bool recheck_after_trace\)\s*\{"
+          )
+          match = signature.search(source)
+          if not match:
               raise SystemExit("Could not find real __seccomp_filter() for preflight validation")
-          body = text[start:text.find("\\n}", start) + 2]
-          marker = body.find("KSU_NEXT_DRIVER_INSTALL_SECCOMP_ALLOW")
-          decls = body.find("u32 filter_ret, action;")
-          if marker < 0 or decls < 0 or marker < decls:
-              raise SystemExit("Seccomp driver-install exception is missing or placed before declarations")
-          if body.count("KSU_NEXT_DRIVER_INSTALL_SECCOMP_ALLOW") != 1:
-              raise SystemExit("Seccomp driver-install exception marker count is not exactly one")
-          if re.search(r"return 0;[\\s\\S]{0,80}u32 filter_ret", body):
+          end = source.find("\n}", match.end())
+          if end < 0:
+              raise SystemExit("Could not find end of real __seccomp_filter() for preflight validation")
+          body = source[match.start():end + 2]
+          marker = "KSU_NEXT_DRIVER_INSTALL_SECCOMP_ALLOW"
+          if body.count(marker) != 1:
+              raise SystemExit("Seccomp exception marker must appear exactly once inside __seccomp_filter()")
+          declarations_end = body.find("int data;")
+          marker_pos = body.find(marker)
+          if declarations_end < 0 or marker_pos < declarations_end:
+              raise SystemExit("Seccomp exception missing or inserted before the C declaration block")
+          if re.search(r"return 0;[\s\S]{0,80}u32 filter_ret", body):
               raise SystemExit("Found declaration-after-statement regression in seccomp exception")
-          print("Seccomp preflight source checks passed: marker unique and declarations precede statements.")
+          print("Seccomp preflight source validation passed: correct function, unique marker, declarations first.")
           PREFLIGHTSEC
-          # -k continues independent build targets; -ferror-limit=0 asks Clang
-          # to report all diagnostics in each translation unit instead of stopping at 20.
+
+          # Compile each C translation unit touched by KSU/SUSFS compatibility edits.
+          # -k continues with independent targets after errors; -ferror-limit=0 asks Clang
+          # to report all diagnostics within each translation unit.
           set +e
           make -k -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
             KCFLAGS="-ferror-limit=0" \
-            drivers/kernelsu/ fs/exec.o fs/open.o fs/read_write.o fs/stat.o fs/dcache.o \
-            kernel/reboot.o kernel/seccomp.o kernel/task_work.o \
+            drivers/kernelsu/ \
+            fs/exec.o fs/open.o fs/read_write.o fs/stat.o fs/statfs.o fs/dcache.o \
+            fs/namei.o fs/notify/fdinfo.o fs/overlayfs/inode.o fs/overlayfs/readdir.o \
+            fs/overlayfs/super.o fs/proc/cmdline.o fs/proc/fd.o fs/proc/task_mmu.o \
+            fs/proc_namespace.o fs/readdir.o fs/susfs.o \
+            kernel/kallsyms.o kernel/sys.o kernel/reboot.o kernel/seccomp.o kernel/task_work.o \
             2>&1 | tee ksu-preflight.log
           build_rc=${PIPESTATUS[0]}
           set -e
@@ -1621,29 +1661,32 @@ jobs:
           python3 - <<'PYERRORSUMMARY'
           from pathlib import Path
           import re
+
           log = Path("ksu-preflight.log").read_text(errors="replace").splitlines()
-          pattern = re.compile(r'(^|\\s)(fatal )?error:|undefined reference|No rule to make target|Error [0-9]+')
-          matches = [f"{i + 1}:{line}" for i, line in enumerate(log) if pattern.search(line)]
-          Path("ksu-preflight-error-summary.log").write_text(
-              "\\n".join(matches) + ("\\n" if matches else "No compiler or make errors detected in preflight log.\\n")
-          )
-          print(f"Collected {len(matches)} compiler/linker/make diagnostic lines.")
+          pattern = re.compile(r"(^|\s)(fatal )?error:|undefined reference|No rule to make target|Error [0-9]+")
+          hits = [i for i, line in enumerate(log) if pattern.search(line)]
+          keep = set()
+          for i in hits:
+              keep.update(range(max(0, i - 2), min(len(log), i + 3)))
+          summary = [f"Matched {len(hits)} compiler/linker/make diagnostic lines."]
+          if not hits:
+              summary.append("No compiler or make error markers were found in the preflight log.")
+          previous = -2
+          for i in sorted(keep):
+              if i > previous + 1:
+                  summary.append("...")
+              summary.append(f"{i + 1}: {log[i]}")
+              previous = i
+          Path("ksu-preflight-error-summary.log").write_text("\n".join(summary) + "\n")
+          print(summary[0])
           PYERRORSUMMARY
+
           echo "Preflight make exit code: $build_rc"
           if [ "$build_rc" -ne 0 ]; then
-            echo "KernelSU/SUSFS/seccomp preflight failed; all available diagnostics are in ksu-preflight.log and ksu-preflight-error-summary.log." >&2
+            echo "Preflight failed; complete build output and contextual diagnostic summary will be uploaded." >&2
             exit "$build_rc"
           fi
 
-          echo "KernelSU-Next objects and all explicitly patched compatibility translation units compiled successfully."
-          python3 - <<'PYVERSIONREPORT'
-          from pathlib import Path
-          needles = ("KernelSU-Next version:", "KernelSU-Next tag:", "Manager signature hash:",
-                     "Manager signature size:", "SUSFS_VERSION")
-          for line in Path("ksu-preflight.log").read_text(errors="replace").splitlines():
-              if any(needle in line for needle in needles):
-                  print(line)
-          PYVERSIONREPORT
           grep -Fq -- "-- KernelSU-Next version: ${KSU_EXPECTED_VERSION}" ksu-preflight.log || {
             echo "Wrong driver version: expected ${KSU_EXPECTED_VERSION} from official ${KSU_TAG}." >&2
             exit 1
@@ -1651,7 +1694,7 @@ jobs:
           grep -Fq -- "-- KernelSU-Next tag: ${KSU_TAG}" ksu-preflight.log
           grep -Fq -- "-- KernelSU-Next Manager signature size: ${KSU_NEXT_EXPECTED_SIZE}" ksu-preflight.log
           grep -Fq -- "-- KernelSU-Next Manager signature hash: ${KSU_NEXT_EXPECTED_HASH}" ksu-preflight.log
-          echo "Verified official KernelSU-Next ${KSU_TAG} driver version ${KSU_EXPECTED_VERSION} and Manager signature fingerprint."
+          echo "All touched KernelSU-Next/SUSFS compatibility objects compiled; v3.4.1 driver 33333 and Manager metadata verified."
 
       - name: Resolve Linux 4.19 final-link compatibility symbols
         shell: bash
@@ -1758,13 +1801,48 @@ jobs:
           print("Linux 4.19 final-link compatibility checks passed.")
           PY419LINK
 
-      - name: Build kernel Image and DTBs
+      - name: Build kernel Image and DTBs; collect complete diagnostics
         shell: bash
         run: |
-          set -euo pipefail
-          make -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "ERROR at line %s (exit=%s)\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+
+          # -k keeps building independent prerequisites after one target fails.
+          set +e
+          make -k -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
             Image Image.gz dtbs 2>&1 | tee kernel-build.log
+          build_rc=${PIPESTATUS[0]}
+          set -e
+
+          python3 - <<'PYBUILDSUMMARY'
+          from pathlib import Path
+          import re
+
+          log = Path("kernel-build.log").read_text(errors="replace").splitlines()
+          pattern = re.compile(r"(^|\s)(fatal )?error:|undefined reference|No rule to make target|Error [0-9]+")
+          hits = [i for i, line in enumerate(log) if pattern.search(line)]
+          keep = set()
+          for i in hits:
+              keep.update(range(max(0, i - 2), min(len(log), i + 3)))
+          summary = [f"Matched {len(hits)} compiler/linker/make diagnostic lines."]
+          if not hits:
+              summary.append("No compiler, linker, or make error markers were found in the kernel build log.")
+          previous = -2
+          for i in sorted(keep):
+              if i > previous + 1:
+                  summary.append("...")
+              summary.append(f"{i + 1}: {log[i]}")
+              previous = i
+          Path("kernel-build-error-summary.log").write_text("\n".join(summary) + "\n")
+          print(summary[0])
+          PYBUILDSUMMARY
+
+          echo "Full kernel make exit code: $build_rc"
+          if [ "$build_rc" -ne 0 ]; then
+            echo "Kernel build failed; all collected diagnostics will be uploaded." >&2
+            exit "$build_rc"
+          fi
 
           test -s arch/arm64/boot/Image
           test -s arch/arm64/boot/Image.gz
@@ -1841,6 +1919,10 @@ jobs:
             scripts-build.log
             ksu-preflight.log
             ksu-preflight-error-summary.log
+            kernel-build-error-summary.log
+            fs/susfs.c
+            include/linux/susfs.h
+            include/linux/susfs_def.h
             selinux-compat-original-v3.4.1-rules.c
             selinux-compat-original-v3.4.1-sepolicy.c
             KernelSU-Next/kernel/selinux/rules.c
