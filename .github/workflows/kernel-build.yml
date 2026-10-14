@@ -1667,15 +1667,36 @@ jobs:
               r"static int __seccomp_filter\(int this_syscall, const struct seccomp_data \*sd,\s*"
               r"const bool recheck_after_trace\)\s*\{"
           )
-          matches = list(signature.finditer(source))
-          if len(matches) != 1:
-              raise SystemExit(f"Expected exactly one __seccomp_filter() function, found {len(matches)}")
-          fn_start = matches[0].start()
-          fn_body_start = matches[0].end()
-          fn_end = source.find("\n}", fn_body_start)
-          if fn_end < 0:
-              raise SystemExit("Could not locate __seccomp_filter() end")
-          body = source[fn_start:fn_end + 2]
+          def find_real_filter(text):
+              # Linux 4.19 has a real implementation under CONFIG_SECCOMP_FILTER
+              # and a same-signature BUG() stub in the #else branch. Select by
+              # the implementation's declarations and filter-run call, not by
+              # raw signature count or preprocessor text order.
+              candidates = []
+              decl_block = re.compile(
+                  r"u32 filter_ret,\s*action;\s*"
+                  r"struct seccomp_filter \*match = NULL;\s*"
+                  r"int data;"
+              )
+              for item in signature.finditer(text):
+                  body_start = item.end()
+                  body_end = text.find("\n}", body_start)
+                  if body_end < 0:
+                      continue
+                  candidate_body = text[item.start():body_end + 2]
+                  if decl_block.search(candidate_body) and "seccomp_run_filters(sd, &match)" in candidate_body:
+                      candidates.append((item, body_end, candidate_body))
+              if len(candidates) != 1:
+                  raise SystemExit(
+                      "Expected exactly one real __seccomp_filter() implementation "
+                      "(declaration block + seccomp_run_filters call), found "
+                      + str(len(candidates))
+                  )
+              return candidates[0]
+
+          fn_match, fn_end, body = find_real_filter(source)
+          fn_start = fn_match.start()
+          fn_body_start = fn_match.end()
           if marker not in body:
               decls = re.compile(
                   r"(u32 filter_ret,\s*action;\s*"
@@ -1691,11 +1712,9 @@ jobs:
               insert_decl_at = fn_start + decl_matches[0].end()
               # Keep all local declarations before the first executable statement (Linux 4.19 C89 mode).
               source = source[:insert_decl_at] + add_decl + source[insert_decl_at:]
-              matches = list(signature.finditer(source))
-              fn_start = matches[0].start()
-              fn_body_start = matches[0].end()
-              fn_end = source.find("\n}", fn_body_start)
-              body = source[fn_start:fn_end + 2]
+              fn_match, fn_end, body = find_real_filter(source)
+              fn_start = fn_match.start()
+              fn_body_start = fn_match.end()
               decl_matches = list(decls.finditer(body))
               if len(decl_matches) != 1:
                   raise SystemExit("Could not re-locate declaration block after adding NULL-data local")
@@ -1736,13 +1755,9 @@ jobs:
               seccomp_path.write_text(source)
 
           verify = seccomp_path.read_text()
-          matches = list(signature.finditer(verify))
-          if len(matches) != 1:
-              raise SystemExit("Could not verify unique __seccomp_filter() after patch")
-          fn_start = matches[0].start()
-          fn_body_start = matches[0].end()
-          fn_end = verify.find("\n}", fn_body_start)
-          body = verify[fn_start:fn_end + 2]
+          fn_match, fn_end, body = find_real_filter(verify)
+          fn_start = fn_match.start()
+          fn_body_start = fn_match.end()
           if body.count(marker) != 1:
               raise SystemExit("The driver-install seccomp marker must appear exactly once inside __seccomp_filter()")
           if "struct seccomp_data ksu_seccomp_data;" not in body:
@@ -2015,15 +2030,29 @@ jobs:
               r"static int __seccomp_filter\(int this_syscall, const struct seccomp_data \*sd,\s*"
               r"const bool recheck_after_trace\)\s*\{"
           )
-          matches = list(signature.finditer(source))
-          if len(matches) != 1:
-              raise SystemExit(f"Expected unique __seccomp_filter(), got {len(matches)}")
-          start = matches[0].start()
-          body_start = matches[0].end()
-          end = source.find("\n}", body_start)
-          if end < 0:
-              raise SystemExit("Could not locate __seccomp_filter() end")
-          body = source[start:end + 2]
+          def find_real_filter(text):
+              # Ignore the same-signature BUG() stub in the CONFIG_SECCOMP_FILTER
+              # #else branch; validate the actual implementation that runs BPF.
+              candidates = []
+              decl_block = re.compile(
+                  r"u32 filter_ret,\s*action;\s*"
+                  r"struct seccomp_filter \*match = NULL;\s*"
+                  r"int data;"
+              )
+              for item in signature.finditer(text):
+                  body_start = item.end()
+                  body_end = text.find("\n}", body_start)
+                  if body_end < 0:
+                      continue
+                  candidate_body = text[item.start():body_end + 2]
+                  if decl_block.search(candidate_body) and "seccomp_run_filters(sd, &match)" in candidate_body:
+                      candidates.append((item, body_end, candidate_body))
+              if len(candidates) != 1:
+                  raise SystemExit("Expected exactly one real __seccomp_filter() implementation; found " + str(len(candidates)))
+              return candidates[0]
+
+          fn_match, end, body = find_real_filter(source)
+          start = fn_match.start()
           marker = "KSU_NEXT_DRIVER_INSTALL_SECCOMP_ALLOW"
           if body.count(marker) != 1:
               raise SystemExit("Seccomp marker must appear exactly once inside __seccomp_filter()")
