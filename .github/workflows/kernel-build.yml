@@ -1633,11 +1633,27 @@ jobs:
 
           uapi = uapi_path.read_text()
           supercall = supercall_path.read_text()
-          def has_define(source, name, value):
-              return re.search(r"(?m)^\s*#\s*define\s+" + re.escape(name) + r"\s+" + re.escape(value) + r"(?:\s|$)", source, re.I) is not None
-          if not has_define(uapi, "KSU_INSTALL_MAGIC1", "0xDEADBEEF"):
+          def has_magic_constant(source, name, value):
+              # KernelSU-Next v3.4.1 UAPI declares these as `static const __u32`,
+              # not necessarily as preprocessor #define macros. Accept either form,
+              # but require the exact pinned name and numeric value.
+              name_re = re.escape(name)
+              value_re = re.escape(value)
+              macro = re.search(
+                  r"(?m)^\s*#\s*define\s+" + name_re + r"\s+" + value_re + r"(?:\s|$)",
+                  source,
+                  re.I,
+              )
+              constant = re.search(
+                  r"\bstatic\s+const\s+__u32\s+" + name_re
+                  + r"\s*=\s*" + value_re + r"\s*;",
+                  source,
+                  re.I,
+              )
+              return macro is not None or constant is not None
+          if not has_magic_constant(uapi, "KSU_INSTALL_MAGIC1", "0xDEADBEEF"):
               raise SystemExit(f"Unexpected/missing KSU_INSTALL_MAGIC1 in {uapi_path}; refusing patch")
-          if not has_define(uapi, "KSU_INSTALL_MAGIC2", "0xCAFEBABE"):
+          if not has_magic_constant(uapi, "KSU_INSTALL_MAGIC2", "0xCAFEBABE"):
               raise SystemExit(f"Unexpected/missing KSU_INSTALL_MAGIC2 in {uapi_path}; refusing patch")
           flat = re.sub(r"\s+", " ", supercall)
           if not re.search(r"magic1\s*==\s*KSU_INSTALL_MAGIC1\s*&&\s*magic2\s*==\s*KSU_INSTALL_MAGIC2", flat):
