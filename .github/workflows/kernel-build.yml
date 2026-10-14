@@ -1,4 +1,4 @@
-name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF (seccomp + SUSFS prctl port + diagnostics)
+name: A13 KernelSU-Next v3.4.1 (33333) SUSFS Build - MAX ARAF (seccomp entry guard + runtime diagnostics)
 
 on:
   workflow_dispatch:
@@ -1841,6 +1841,174 @@ jobs:
           print("\n".join(report))
           PYKSUSECCOMP
 
+      - name: Add exact KernelSU driver-install guard at __secure_computing entry
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "ERROR at line %s (exit=%s)\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+          python3 - <<'PYKSUENTRY'
+          from pathlib import Path
+          import re
+
+          path = Path("kernel/seccomp.c")
+          source = path.read_text()
+          marker = "KSU_NEXT_DRIVER_INSTALL_ENTRY_ALLOW"
+          signature = re.compile(r"int\s+__secure_computing\s*\(\s*const struct seccomp_data \*sd\s*\)\s*\{")
+          matches = list(signature.finditer(source))
+          if len(matches) != 1:
+              raise SystemExit(f"Expected one __secure_computing() entry, found {len(matches)}")
+
+          def isolate_function(text, match):
+              start = match.start()
+              brace = text.find("{", match.start())
+              depth = 0
+              end = -1
+              for i in range(brace, len(text)):
+                  if text[i] == "{":
+                      depth += 1
+                  elif text[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          break
+              if end < 0:
+                  raise SystemExit("Could not isolate __secure_computing() body")
+              return start, end, text[start:end]
+
+          start, end, fn = isolate_function(source, matches[0])
+          if marker not in fn:
+              decl_anchor = "\tint this_syscall;"
+              if fn.count(decl_anchor) != 1:
+                  raise SystemExit("Could not find unique C89 declaration anchor in __secure_computing()")
+              decl_add = (
+                  decl_anchor + "\n#ifdef CONFIG_KSU\n"
+                  "\tstruct seccomp_data ksu_entry_seccomp_data;\n"
+                  "\tconst struct seccomp_data *ksu_entry_sd;\n"
+                  "#endif"
+              )
+              fn = fn.replace(decl_anchor, decl_add, 1)
+              syscall_anchor = re.compile(
+                  r"this_syscall\s*=\s*sd\s*\?\s*sd->nr\s*:\s*\n\s*"
+                  r"syscall_get_nr\(current, task_pt_regs\(current\)\);"
+              )
+              if len(list(syscall_anchor.finditer(fn))) != 1:
+                  raise SystemExit("Could not find unique syscall number assignment in __secure_computing()")
+              guard = (
+                  "\n#ifdef CONFIG_KSU\n"
+                  "\t/* KSU_NEXT_DRIVER_INSTALL_ENTRY_ALLOW\n"
+                  "\t * Narrow exception for the official v3.4.1 driver-FD handshake only.\n"
+                  "\t * No normal reboot request or other syscall bypasses seccomp.\n"
+                  "\t */\n"
+                  "\tif (mode == SECCOMP_MODE_FILTER && this_syscall == __NR_reboot) {\n"
+                  "\t\tksu_entry_sd = sd;\n"
+                  "\t\tif (!ksu_entry_sd) {\n"
+                  "\t\t\tpopulate_seccomp_data(&ksu_entry_seccomp_data);\n"
+                  "\t\t\tksu_entry_sd = &ksu_entry_seccomp_data;\n"
+                  "\t\t}\n"
+                  "\t\tif ((u32)ksu_entry_sd->args[0] == 0xDEADBEEF) {\n"
+                  "\t\t\tif ((u32)ksu_entry_sd->args[1] == 0xCAFEBABE &&\n"
+                  "\t\t\t    (u32)ksu_entry_sd->args[2] == 0 &&\n"
+                  "\t\t\t    ksu_entry_sd->args[3] != 0) {\n"
+                  "\t\t\t\tpr_info_ratelimited(\"KernelSU-Next: seccomp allowed exact driver-install handshake before BPF\\n\");\n"
+                  "\t\t\t\treturn 0;\n"
+                  "\t\t\t}\n"
+                  "\t\t\tpr_info_ratelimited(\"KernelSU-Next: seccomp KSU reboot candidate mismatch magic2=%08x cmd=%08x out_nonnull=%d\\n\",\n"
+                  "\t\t\t\t(u32)ksu_entry_sd->args[1], (u32)ksu_entry_sd->args[2],\n"
+                  "\t\t\t\tksu_entry_sd->args[3] != 0);\n"
+                  "\t\t}\n"
+                  "\t}\n"
+                  "#endif\n"
+              )
+              fn, count = syscall_anchor.subn(lambda m: m.group(0) + guard, fn, count=1)
+              if count != 1:
+                  raise SystemExit("Could not insert exact driver-install guard after syscall number resolution")
+              source = source[:start] + fn + source[end:]
+              path.write_text(source)
+
+          source = path.read_text()
+          matches = list(signature.finditer(source))
+          if len(matches) != 1:
+              raise SystemExit("Post-patch __secure_computing() lookup is not unique")
+          _, _, fn = isolate_function(source, matches[0])
+          required = (
+              marker,
+              "mode == SECCOMP_MODE_FILTER && this_syscall == __NR_reboot",
+              "populate_seccomp_data(&ksu_entry_seccomp_data);",
+              "(u32)ksu_entry_sd->args[0] == 0xDEADBEEF",
+              "(u32)ksu_entry_sd->args[1] == 0xCAFEBABE",
+              "(u32)ksu_entry_sd->args[2] == 0",
+              "ksu_entry_sd->args[3] != 0",
+              "KernelSU-Next: seccomp allowed exact driver-install handshake before BPF",
+              "KernelSU-Next: seccomp KSU reboot candidate mismatch",
+              "return 0;",
+          )
+          for item in required:
+              if item not in fn:
+                  raise SystemExit("KSU entry guard verification failed: " + item)
+          for item in ("struct seccomp_data ksu_entry_seccomp_data;", "const struct seccomp_data *ksu_entry_sd;"):
+              if fn.find(item) < 0 or fn.find(item) > fn.find("if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE)"):
+                  raise SystemExit("C89 declaration order failed for " + item)
+          Path("ksu-seccomp-entry-guard.log").write_text(
+              "KernelSU-Next v3.4.1 driver-install seccomp entry guard\n"
+              "Exact tuple only: reboot, arg0=0xDEADBEEF, arg1=0xCAFEBABE, arg2=0, arg3!=NULL.\n"
+              "The guard runs at __secure_computing() before BPF evaluation; mismatch logs include magic2/cmd and output-pointer presence, not pointer values.\n"
+              "The previous in-filter guard remains as an exact-tuple fallback.\n"
+              "Static/source check only; device runtime logs must confirm the allow marker and ksu fd installation.\n"
+          )
+          print(Path("ksu-seccomp-entry-guard.log").read_text())
+
+          PYKSUENTRY
+
+      - name: Audit pinned v3.4.1 syscall and driver-install hook path
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYKSUHOOKAUDIT'
+          from pathlib import Path
+
+          files = {
+              "core init": Path("KernelSU-Next/kernel/core/init.c"),
+              "syscall hook manager": Path("KernelSU-Next/kernel/hook/syscall_hook_manager.c"),
+              "arm64 syscall dispatcher": Path("KernelSU-Next/kernel/hook/arm64/syscall_hook.c"),
+              "supercall/reboot kprobe": Path("KernelSU-Next/kernel/supercall/supercall.c"),
+              "KernelSU Kbuild": Path("KernelSU-Next/kernel/Kbuild"),
+          }
+          for label, path in files.items():
+              if not path.is_file():
+                  raise SystemExit(f"Pinned v3.4.1 hook audit: missing {label} source {path}")
+          text = {label: path.read_text(errors="replace") for label, path in files.items()}
+          checks = {
+              "core init invokes syscall hook init": "ksu_syscall_hook_init();" in text["core init"],
+              "core init invokes reboot supercalls": "ksu_supercalls_init();" in text["core init"],
+              "tracepoint hook manager registers sys_enter": "register_trace_prio_sys_enter" in text["syscall hook manager"],
+              "tracepoint hook manager entrypoint exists": "ksu_syscall_hook_manager_init" in text["syscall hook manager"],
+              "arm64 hook resolves syscall table": "sys_call_table" in text["arm64 syscall dispatcher"],
+              "arm64 hook locates ni_syscall slot": "__arm64_sys_ni_syscall" in text["arm64 syscall dispatcher"],
+              "arm64 hook has dispatcher installation diagnostic": "dispatcher installed at slot" in text["arm64 syscall dispatcher"],
+              "reboot hook symbol is pinned via REBOOT_SYMBOL": "REBOOT_SYMBOL" in text["supercall/reboot kprobe"],
+              "reboot kprobe is registered": "register_kprobe(&reboot_kp)" in text["supercall/reboot kprobe"],
+              "reboot hook reports registration success": "reboot kprobe registered successfully" in text["supercall/reboot kprobe"],
+              "Kbuild links syscall hook manager": "hook/syscall_hook_manager.o" in text["KernelSU Kbuild"],
+              "Kbuild links arm64 syscall dispatcher": "hook/arm64/syscall_hook.o" in text["KernelSU Kbuild"],
+              "Kbuild links supercall driver installer": "supercall/supercall.o" in text["KernelSU Kbuild"],
+          }
+          report = [
+              "Pinned KernelSU-Next v3.4.1 / driver 33333 hook-path source audit",
+              "This tag uses syscall-table dispatch + sys_enter tracepoint hooks and a reboot kprobe for driver-FD install.",
+          ]
+          report += [("PASS" if passed else "FAIL") + ": " + label for label, passed in checks.items()]
+          report += [
+              "No manual legacy ks u_handle_* calls are injected: those APIs belong to a different legacy setup path and do not exist in this pinned tagged source.",
+              "Static source audit only. Runtime kernel logs must still confirm table resolution, tracepoint registration, reboot kprobe registration and ksu fd installation.",
+          ]
+          Path("ksu-legacy-hook-integration.log").write_text("\n".join(report) + "\n")
+          print("\n".join(report))
+          failed = [label for label, passed in checks.items() if not passed]
+          if failed:
+              raise SystemExit("Pinned KSU hook path audit failed: " + "; ".join(failed))
+
+          PYKSUHOOKAUDIT
+
       - name: Configure kernel and KernelSU-Next SUSFS
         shell: bash
         run: |
@@ -1856,6 +2024,8 @@ jobs:
           scripts/config --file .config --enable TRACEPOINTS
           scripts/config --file .config --enable SECCOMP
           scripts/config --file .config --enable SECCOMP_FILTER
+          # Keep SELinux enforcing-capable; do not ship an ALWAYS_PERMISSIVE kernel.
+          scripts/config --file .config --disable SECURITY_SELINUX_ALWAYS_PERMISSIVE
           scripts/config --file .config --enable OVERLAY_FS
           scripts/config --file .config --enable KPROBES
           scripts/config --file .config --enable KPROBE_EVENTS
@@ -1892,10 +2062,10 @@ jobs:
           KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" kernelrelease)"
           echo "Configured kernel release: $KERNELRELEASE"
           echo "Requested localversion: $KERNEL_LOCALVERSION"
-          case "$KERNELRELEASE" in
-            *MAX-ARAF*) ;;
-            *) echo "MAX-ARAF is missing from kernel release: $KERNELRELEASE" >&2; exit 1 ;;
-          esac
+          if [ "$KERNELRELEASE" != "4.19.325-MAX-ARAF" ]; then
+            echo "Unexpected kernel release (must avoid duplicate localversion): $KERNELRELEASE" >&2
+            exit 1
+          fi
 
           for option in \
             CONFIG_KSU=y \
@@ -1936,6 +2106,9 @@ jobs:
           done
 
           grep -q '^CONFIG_LOCALVERSION=""$' .config
+          if grep -qx 'CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE=y' .config; then
+            echo "Unsafe CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE=y survived olddefconfig." >&2; exit 1;
+          fi
           echo "KernelSU and conservative SUSFS kernel-side configs verified; see ksu-susfs-command-audit.log for userspace protocol status."
 
       - name: Generate SELinux headers
@@ -2241,14 +2414,21 @@ jobs:
             echo 'KernelSU-Next reboot-kprobe failure diagnostic missing from Image.' >&2; exit 1;
           }
           echo 'Kernel image contains seccomp handshake and KernelSU reboot-kprobe runtime diagnostic strings.'
+          grep -Fq 'KernelSU-Next: seccomp allowed exact driver-install handshake before BPF' kernel-image-strings.txt || {
+            echo 'The early __secure_computing() handshake marker is absent from final Image.' >&2; exit 1;
+          }
+          grep -Fq 'KernelSU-Next: seccomp KSU reboot candidate mismatch' kernel-image-strings.txt || {
+            echo 'The seccomp candidate diagnostic marker is absent from final Image.' >&2; exit 1;
+          }
           grep -Fq 'KernelSU-Next: SUSFS prctl dispatcher reached' kernel-image-strings.txt || {
             echo 'SUSFS prctl dispatcher marker is absent from the final Image.' >&2; exit 1;
           }
           KERNELRELEASE="$(make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" kernelrelease)"
-          case "$KERNELRELEASE" in
-            *MAX-ARAF*) echo "Verified final kernel release: $KERNELRELEASE" ;;
-            *) echo "Final kernel release is missing MAX-ARAF: $KERNELRELEASE" >&2; exit 1 ;;
-          esac
+          if [ "$KERNELRELEASE" != "4.19.325-MAX-ARAF" ]; then
+            echo "Final kernel release must be exactly 4.19.325-MAX-ARAF, got: $KERNELRELEASE" >&2
+            exit 1
+          fi
+          echo "Verified exact final kernel release: $KERNELRELEASE"
 
           echo "Kernel Image, Image.gz, device-tree outputs, KSU seccomp marker, and reboot-kprobe diagnostics verified."
 
@@ -2267,114 +2447,4 @@ jobs:
             -exec cp --parents '{}' "$STAGE/dts/" \;
 
           make -s ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" LOCALVERSION="$KERNEL_LOCALVERSION" \
-            kernelrelease > "$STAGE/kernel-release.txt"
-          cp .config "$STAGE/kernel.config"
-          for f in ksu-driver-seccomp-fix.log ksu-susfs-command-audit.log ksu-susfs-prctl-port.log kernel-image-strings.txt \
-                   ksu-preflight.log ksu-preflight-error-summary.log \
-                   kernel-build.log kernel-build-error-summary.log \
-                   susfs-patch.log susfs-compatibility.log \
-                   linux-419-link-compatibility.log selinux-compatibility-report.log; do
-            [ ! -s "$f" ] || cp "$f" "$STAGE/"
-          done
-          KSU_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
-          SUSFS_COMMIT="$(git -C SUSFS rev-parse HEAD)"
-          KERNEL_SHA="$(sha256sum arch/arm64/boot/Image | awk '{print $1}')"
-          IMAGE_GZ_SHA="$(sha256sum arch/arm64/boot/Image.gz | awk '{print $1}')"
-          CLANG_VERSION="$(clang --version | head -n 1)"
-          {
-            echo "Kernel repository commit: $(git rev-parse HEAD)"
-            echo "Kernel source version: $(make -s kernelversion)"
-            echo "Kernel release: $(cat "$STAGE/kernel-release.txt")"
-            echo "KernelSU-Next tag: $KSU_TAG"
-            echo "KernelSU-Next commit: $KSU_COMMIT"
-            echo "KernelSU-Next driver version expected: $KSU_EXPECTED_VERSION"
-            echo "Manager metadata expected size: $KSU_NEXT_EXPECTED_SIZE"
-            echo "Manager metadata expected hash: $KSU_NEXT_EXPECTED_HASH"
-            echo "SUSFS branch: $SUSFS_BRANCH"
-            echo "SUSFS commit: $SUSFS_COMMIT"
-            echo "Clang: $CLANG_VERSION"
-            echo "Image SHA256: $KERNEL_SHA"
-            echo "Image.gz SHA256: $IMAGE_GZ_SHA"
-            echo "Boot image: not included; this bundle is not flashable"
-            echo "SUSFS command interface: see ksu-susfs-command-audit.log; source presence is not runtime support"
-            echo "Runtime root validation: not possible in GitHub build; test su -c id only after a verified boot image is assembled"
-          } > "$STAGE/build-manifest.txt"
-          printf '%s\n' \
-            'Build artifacts only. This ZIP is NOT a TWRP-flashable package.' \
-            'Do not flash Image or Image.gz directly.' \
-            'A device-verified boot-image packaging method is required before flashing.' \
-            > "$STAGE/FLASHING-WARNING.txt"
-
-          cd "$STAGE"
-          zip -qr "$OUTPUT" .
-          unzip -t "$OUTPUT"
-          echo "Created non-flashable artifact bundle: $OUTPUT"
-
-      - name: Upload kernel build artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-BUILD-ARTIFACTS
-          path: A13-KernelSU-Next-SUSFS-MAX-ARAF-${{ github.run_number }}-BUILD-ARTIFACTS.zip
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: A13-KernelSU-Next-SUSFS-diagnostics-${{ github.run_number }}
-          path: |
-            susfs-patch.log
-            susfs-patch-dry-run.log
-            susfs-compatibility.log
-            selinux-compatibility-report.log
-            ksu-linux-419-api-compatibility.log
-            ksu-driver-seccomp-fix.log
-            ksu-susfs-command-audit.log
-            ksu-legacy-hook-integration.log
-            linux-419-link-compatibility.log
-            KernelSU-Next/kernel/supercall/dispatch.c
-            KernelSU-Next/kernel/supercall/supercall.c
-            KernelSU-Next/kernel/sulog/event.c
-            KernelSU-Next/kernel/feature/selinux_hide.c
-            KernelSU-Next/kernel/feature/susfs_compat.c
-            ksu-susfs-prctl-port.log
-            SUSFS/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
-            selinux-rules-compat.diff
-            selinux-sepolicy-compat.diff
-            scripts-build.log
-            ksu-preflight.log
-            ksu-preflight-error-summary.log
-            kernel-build-error-summary.log
-            fs/susfs.c
-            include/linux/susfs.h
-            include/linux/susfs_def.h
-            selinux-compat-original-v3.4.1-rules.c
-            selinux-compat-original-v3.4.1-sepolicy.c
-            KernelSU-Next/kernel/selinux/rules.c
-            KernelSU-Next/kernel/selinux/sepolicy.c
-            kernel-build.log
-            .config
-            SUSFS/kernel_patches/50_add_susfs_in_kernel-4.19.patch
-            susfs-kernel-4.19-adapted.patch
-            KernelSU-Next/kernel/Kbuild
-            KernelSU-Next/kernel/infra/su_mount_ns.c
-            KernelSU-Next/kernel/infra/seccomp_cache.c
-            KernelSU-Next/kernel/manager/pkg_observer.c
-            KernelSU-Next/kernel/policy/app_profile.c
-            include/linux/seccomp.h
-            kernel/seccomp.c
-            ksu-susfs-command-audit.log
-            kernel-image-strings.txt
-            build-manifest.txt
-            include/linux/task_work.h
-            kernel/task_work.c
-            include/linux/fsnotify_backend.h
-            drivers/kernelsu/hook/setuid_hook.c
-            fs/dcache.c
-            include/linux/sched.h
-            include/linux/susfs_def.h
-          if-no-files-found: warn
-          retention-days: 7
+        
