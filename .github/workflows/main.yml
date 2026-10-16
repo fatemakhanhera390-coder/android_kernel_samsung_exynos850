@@ -1,18 +1,18 @@
-name: A13X Suzume KernelSU Kernel
+name: A13X Suzume KernelSU-Next Kernel
 
 on:
   workflow_dispatch:
     inputs:
       neutron_tag:
-        description: 'Neutron Clang release tag (30062026 = Clang 23; 30072026 = Clang 24)'
+        description: 'Neutron Clang release tag (06092026 = Clang 24.0.0git)'
         required: true
         type: string
-        default: '30062026'
+        default: '06092026'
       ksu_ref:
-        description: 'backslashxx/KernelSU branch, tag, or commit'
+        description: 'KernelSU-Next commit/ref (default is the requested 33333 driver baseline)'
         required: true
         type: string
-        default: 'master'
+        default: '8f902ae'
   push:
     branches:
       - main
@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build A13X Kernel + AnyKernel3 ZIP
+    name: Build A13X Suzume + KernelSU-Next + AnyKernel3
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -37,15 +37,16 @@ jobs:
       CROSS_COMPILE: aarch64-linux-gnu-
       LLVM: '1'
       LLVM_IAS: '1'
-      NEUTRON_TAG: ${{ inputs.neutron_tag || '30062026' }}
-      KSU_REF: ${{ inputs.ksu_ref || 'master' }}
+      NEUTRON_TAG: ${{ inputs.neutron_tag || '06092026' }}
+      KSU_REF: ${{ inputs.ksu_ref || '8f902ae' }}
+      KSU_REPO: KernelSU-Next/KernelSU-Next
 
     steps:
       - name: Checkout A13 kernel source
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.KERNEL_REPO }}
-          ref: ${{ env.KERNEL_BRANCH }}
+          repository: Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850
+          ref: lineage-24.0
           path: kernel
           fetch-depth: 1
           persist-credentials: false
@@ -66,7 +67,7 @@ jobs:
             libelf-dev libncurses-dev libssl-dev python3 python-is-python3 \
             rsync dwarves zstd lz4 zip unzip file
 
-      - name: Download Neutron Clang release
+      - name: Download Neutron Clang 24 release
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -87,25 +88,67 @@ jobs:
           mkdir -p "$RUNNER_TEMP/neutron-clang"
           curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/neutron-clang.tar.zst"
           tar --zstd -xf "$RUNNER_TEMP/neutron-clang.tar.zst" -C "$RUNNER_TEMP/neutron-clang"
-          test -x "$RUNNER_TEMP/neutron-clang/bin/clang"
-          echo "$RUNNER_TEMP/neutron-clang/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/neutron-clang/bin/clang" --version
-          "$RUNNER_TEMP/neutron-clang/bin/ld.lld" --version
+          CLANG_BIN="$(find "$RUNNER_TEMP/neutron-clang" -type f -path '*/bin/clang' -print -quit)"
+          [[ -n "$CLANG_BIN" && -x "$CLANG_BIN" ]] || {
+            echo "Could not locate executable bin/clang inside release asset" >&2
+            find "$RUNNER_TEMP/neutron-clang" -maxdepth 4 -type f | head -100 || true
+            exit 1
+          }
+          TOOLCHAIN_BIN="$(dirname "$CLANG_BIN")"
+          [[ -x "$TOOLCHAIN_BIN/ld.lld" ]] || {
+            echo "Could not locate ld.lld next to $CLANG_BIN" >&2
+            exit 1
+          }
+          echo "$TOOLCHAIN_BIN" >> "$GITHUB_PATH"
+          echo "NEUTRON_CLANG_BIN=$TOOLCHAIN_BIN" >> "$GITHUB_ENV"
+          clang --version
+          ld.lld --version
+          clang --version | grep -q '24\.0\.0git' || {
+            echo "Expected Clang 24.0.0git from tag 06092026; actual compiler version differs." >&2
+            exit 1
+          }
 
-      - name: Integrate backslashxx KernelSU (no SUSFS)
+      - name: Integrate pinned KernelSU-Next (no SUSFS)
         shell: bash
         run: |
           set -Eeuo pipefail
           curl -fsSL --retry 3 \
-            https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh \
+            "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_REF}/kernel/setup.sh" \
             -o "$RUNNER_TEMP/ksu-setup.sh"
           cd "$GITHUB_WORKSPACE/kernel"
-          bash "$RUNNER_TEMP/ksu-setup.sh" "$KSU_REF"
+          bash "$RUNNER_TEMP/ksu-setup.sh" "$KSU_REF" 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/ksu-setup.log"
           test -L drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/Makefile
-          echo "KernelSU source ref requested: $KSU_REF"
-          git -C KernelSU rev-parse HEAD
+          test -d KernelSU-Next/.git
+          KSU_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
+          echo "KernelSU-Next commit: $KSU_COMMIT" | tee "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
+          echo "Requested KernelSU-Next ref: $KSU_REF" >> "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
+          git -C KernelSU-Next status --short >> "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
+          # KernelSU-Next at this pinned revision uses its own syscall dispatcher / tracepoint
+          # hook manager. Do NOT apply the older backslashxx legacy manual-call-site script:
+          # it expects APIs such as ksu_handle_execveat that this revision does not export.
+          KSU_REV_COUNT="$(git -C KernelSU-Next rev-list --count HEAD)"
+          KSU_DRIVER_VERSION="$((30000 + KSU_REV_COUNT))"
+          {
+            echo "KernelSU-Next commit: $KSU_COMMIT"
+            echo "KernelSU-Next git revision count: $KSU_REV_COUNT"
+            echo "Calculated KernelSU driver version: $KSU_DRIVER_VERSION"
+            echo "Expected manager/driver baseline: 33333"
+            echo 'Integration model: KernelSU-Next syscall dispatcher + syscall tracepoint hook manager'
+            echo 'Legacy syscall_hook_patches.sh: intentionally NOT applied (API mismatch with this KSU-Next revision)'
+          } | tee "$GITHUB_WORKSPACE/diagnostics/ksu-version-info.txt"
+          if [[ "$KSU_DRIVER_VERSION" != "33333" ]]; then
+            echo "KernelSU driver version mismatch: calculated $KSU_DRIVER_VERSION, expected 33333. Refuse to build an incompatible image." >&2
+            exit 1
+          fi
+          for source in kernel/hook/syscall_hook_manager.c kernel/hook/syscall_event_bridge.c kernel/hook/arm64/syscall_hook.c kernel/feature/sucompat.c; do
+            test -s "KernelSU-Next/$source" || { echo "Required KernelSU-Next source missing: $source" >&2; exit 1; }
+          done
+          grep -q 'ksu_syscall_hook_manager_init' KernelSU-Next/kernel/hook/syscall_hook_manager.c
+          grep -q 'register_trace_prio_sys_enter' KernelSU-Next/kernel/hook/syscall_hook_manager.c
+          grep -q 'ksu_register_syscall_hook(__NR_execveat' KernelSU-Next/kernel/hook/syscall_hook_manager.c
+          echo 'Pinned KernelSU-Next dispatcher integration sources verified.'
 
       - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
         shell: bash
@@ -129,17 +172,16 @@ jobs:
           )
           if count < 1:
               raise SystemExit(
-                  'No expected sizeof(pointer) NG call found; source may have changed. '
-                  'Inspect this file and the attached diagnostics before editing the patch.'
+                  'No expected sizeof(pointer) NG call found; inspect source and diagnostics.'
               )
           path.write_text(fixed)
           print(f'Fixed {count} snprintf(sizeof(pointer)) call(s) in {path}.')
           PYFIX
           git diff --check
-          git diff -- "$FILE" > "$GITHUB_WORKSPACE/diagnostics/source-fixes.patch"
+          git diff --binary -- "$FILE" > "$GITHUB_WORKSPACE/diagnostics/touchscreen-source-fix.patch"
           cp "$FILE" "$GITHUB_WORKSPACE/diagnostics/ovt_tcm_sec_fn_test.c.patched"
 
-      - name: Configure kernel
+      - name: Configure kernel and verify KSU config
         shell: bash
         working-directory: kernel
         run: |
@@ -155,15 +197,17 @@ jobs:
 
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
-
           scripts/config --file .config --enable KSU
+          scripts/config --file .config --enable KPROBES
           scripts/config --file .config --enable KALLSYMS
           scripts/config --file .config --enable KALLSYMS_ALL
-          scripts/config --file .config --enable KPROBES
-          scripts/config --file .config --set-str LOCALVERSION '-Suzume'
+          scripts/config --file .config --enable KSU_DEBUG
+          scripts/config --file .config --enable FTRACE
+          scripts/config --file .config --enable FTRACE_SYSCALLS
+          scripts/config --file .config --enable KRETPROBES
+          scripts/config --file .config --set-str LOCALVERSION '-Darknight'
           scripts/config --file .config --disable LOCALVERSION_AUTO
 
-          # Explicitly disable every SUSFS option present in this source/config.
           python3 - <<'PY'
           from pathlib import Path
           import re, subprocess
@@ -171,41 +215,42 @@ jobs:
           symbols = sorted(set(re.findall(r'^(?:# )?(CONFIG_[A-Z0-9_]*SUSFS[A-Z0-9_]*)', config, re.M)))
           for symbol in symbols:
               subprocess.run(['scripts/config', '--file', '.config', '--disable', symbol.removeprefix('CONFIG_')], check=True)
-          print(f'Disabled {len(symbols)} SUSFS config option(s). No SUSFS repository or patches are added by this workflow.')
+          print(f'Disabled {len(symbols)} SUSFS config option(s). No SUSFS repository or patches are added.')
           PY
 
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
-
-          grep -Fxq 'CONFIG_KSU=y' .config || {
-            echo 'KernelSU did not survive olddefconfig; aborting.' >&2
-            exit 1
-          }
-          grep -Fxq 'CONFIG_KALLSYMS=y' .config
-          grep -Fxq 'CONFIG_KALLSYMS_ALL=y' .config
+          for item in CONFIG_KSU=y CONFIG_KPROBES=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y CONFIG_EXT4_FS=y CONFIG_KSU_DEBUG=y CONFIG_FTRACE=y CONFIG_FTRACE_SYSCALLS=y; do
+            grep -Fxq "$item" .config || { echo "Required config missing after olddefconfig: $item" >&2; exit 1; }
+          done
           if grep -Eq '^CONFIG_[A-Z0-9_]*SUSFS[A-Z0-9_]*=y' .config; then
             echo 'A SUSFS option remains enabled; aborting.' >&2
             exit 1
           fi
-          echo 'Final kernel release:'
-          make -s ARCH="$ARCH" kernelrelease
-          echo 'KernelSU and Suzume config verified; SUSFS config is disabled.'
+          make -s ARCH="$ARCH" kernelrelease | tee "$GITHUB_WORKSPACE/diagnostics/kernelrelease.txt"
+          cp .config "$GITHUB_WORKSPACE/diagnostics/kernel.config"
+          grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' .config \
+            > "$GITHUB_WORKSPACE/diagnostics/config-summary.txt" || true
 
-      - name: Compile kernel Image and DTBs
+      - name: Compile kernel Image
         shell: bash
         working-directory: kernel
         run: |
           set -Eeuo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
           {
             echo "Build started (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "Command: make V=1 -j$(nproc --all) ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image dtbs"
+            echo "Neutron tag: $NEUTRON_TAG"
+            clang --version
+            ld.lld --version
+            echo "Command: make V=1 -j$(nproc --all) ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image"
           } | tee "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
           make V=1 -j"$(nproc --all)" ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" Image dtbs 2>&1 | tee -a "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
+            CROSS_COMPILE="$CROSS_COMPILE" Image 2>&1 | tee -a "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
           test -s arch/arm64/boot/Image
-          file arch/arm64/boot/Image
-          strings arch/arm64/boot/Image | grep -m1 'Linux version' || true
+          file arch/arm64/boot/Image | tee "$GITHUB_WORKSPACE/diagnostics/kernel-image-file.txt"
+          strings arch/arm64/boot/Image | grep -m1 'Linux version' | tee "$GITHUB_WORKSPACE/diagnostics/kernel-image-version.txt" || true
+          strings arch/arm64/boot/Image | grep -iE -m15 'KernelSU|ksu|grant root|Darknight' \
+            > "$GITHUB_WORKSPACE/diagnostics/kernel-image-ksu-strings.txt" || true
 
       - name: Package TWRP-flashable AnyKernel3 ZIP
         shell: bash
@@ -216,9 +261,9 @@ jobs:
           cp "$GITHUB_WORKSPACE/kernel/arch/arm64/boot/Image" "$AK3/Image"
           cat > "$AK3/anykernel.sh" <<'AK3SCRIPT'
           ### AnyKernel3 Ramdisk Mod Script
-          ## Suzume KernelSU for Samsung Galaxy A13X (SM-A135F / SM-A135M)
+          ## Suzume KernelSU-Next for Samsung Galaxy A13X (SM-A135F / SM-A135M)
           properties() { '
-          kernel.string=Suzume KernelSU for Samsung Galaxy A13X by MAX ARAF
+          kernel.string=Suzume KernelSU-Next for Samsung Galaxy A13X by MAX ARAF
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -246,42 +291,44 @@ jobs:
           rm -rf "$AK3/.git" "$AK3/.github"
           rm -f "$AK3/README.md" "$AK3/README" "$AK3/.gitignore"
           find "$AK3" -name placeholder -type f -delete
-
           cd "$AK3"
-          zip -qr "$GITHUB_WORKSPACE/A13X-Suzume-KernelSU-AnyKernel3.zip" . \
+          zip -qr "$GITHUB_WORKSPACE/A13X-Suzume-KernelSU-Next-AnyKernel3.zip" . \
             -x '*/.git/*' '*/README*' '*placeholder'
-          unzip -t "$GITHUB_WORKSPACE/A13X-Suzume-KernelSU-AnyKernel3.zip"
+          unzip -t "$GITHUB_WORKSPACE/A13X-Suzume-KernelSU-Next-AnyKernel3.zip"
 
           KRELEASE="$(cd "$GITHUB_WORKSPACE/kernel" && make -s ARCH=arm64 kernelrelease)"
-          KSU_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel/KernelSU" rev-parse HEAD)"
+          KSU_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-parse HEAD)"
           KERNEL_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel" rev-parse HEAD)"
           {
             echo "Kernel release: $KRELEASE"
             echo "Kernel source: https://github.com/$KERNEL_REPO/tree/$KERNEL_BRANCH"
             echo "Kernel source commit: $KERNEL_COMMIT"
-            echo "KernelSU ref: $KSU_REF"
+            echo "KernelSU repository: https://github.com/$KSU_REPO"
+            echo "KernelSU ref requested: $KSU_REF"
             echo "KernelSU commit: $KSU_COMMIT"
+            echo "KernelSU method: KernelSU-Next pinned source with built-in syscall dispatcher / tracepoint hooks; legacy manual hook script not applied"
+            echo "KernelSU driver version: $((30000 + $(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-list --count HEAD)))"
             echo "Neutron Clang tag: $NEUTRON_TAG"
             echo "Architecture: arm64"
             echo "Defconfig: $DEFCONFIG"
-            echo "AnyKernel3 target: boot (A-only)"
-            echo "SUSFS: disabled / not integrated by this workflow"
-            echo "Note: A135F/A135M device boot testing has not been performed by CI."
+            echo "AnyKernel3 target: boot (non-A/B setting; verify on-device partition layout)"
+            echo "SUSFS: disabled / not integrated"
+            echo "Root access: must be verified on-device; CI cannot guarantee manager grant success"
           } > "$GITHUB_WORKSPACE/build-info.txt"
-          sha256sum "$GITHUB_WORKSPACE/A13X-Suzume-KernelSU-AnyKernel3.zip" > "$GITHUB_WORKSPACE/sha256sum.txt"
+          (cd "$GITHUB_WORKSPACE" && sha256sum A13X-Suzume-KernelSU-Next-AnyKernel3.zip > sha256sum.txt)
 
       - name: Upload flashable kernel ZIP and build info
         uses: actions/upload-artifact@v4
         with:
-          name: A13X-Suzume-KernelSU-AnyKernel3
+          name: A13X-Suzume-KernelSU-Next-AnyKernel3
           path: |
-            A13X-Suzume-KernelSU-AnyKernel3.zip
+            A13X-Suzume-KernelSU-Next-AnyKernel3.zip
             build-info.txt
             sha256sum.txt
           if-no-files-found: error
           retention-days: 14
 
-      - name: Collect diagnostics (runs even after a failed build)
+      - name: Collect diagnostics (runs even after failed build)
         if: always()
         shell: bash
         run: |
@@ -300,13 +347,13 @@ jobs:
             echo "Kernel branch: $KERNEL_BRANCH"
             echo "Defconfig: $DEFCONFIG"
             echo "Neutron release tag: $NEUTRON_TAG"
+            echo "KernelSU repo: $KSU_REPO"
             echo "KernelSU requested ref: $KSU_REF"
+            echo 'Legacy syscall hook patch: intentionally disabled; pinned KernelSU-Next revision owns its dispatcher hooks'
             echo
             echo '--- Toolchain ---'
-            command -v clang
-            clang --version
-            command -v ld.lld
-            ld.lld --version
+            if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
+            if command -v ld.lld >/dev/null 2>&1; then ld.lld --version; else echo 'ld.lld unavailable'; fi
             echo
             echo '--- Kernel source ---'
             if [[ -d "$GITHUB_WORKSPACE/kernel/.git" ]]; then
@@ -314,14 +361,17 @@ jobs:
               git -C "$GITHUB_WORKSPACE/kernel" log -1 --format='%H%n%ad%n%s' --date=iso-strict
               git -C "$GITHUB_WORKSPACE/kernel" status --short
               git -C "$GITHUB_WORKSPACE/kernel" diff --check
-              git -C "$GITHUB_WORKSPACE/kernel" diff -- drivers/input/touchscreen/ovt/td4150_spi/ovt_tcm_sec_fn_test.c
-              if [[ -d "$GITHUB_WORKSPACE/kernel/KernelSU/.git" ]]; then
-                echo '--- KernelSU commit ---'
-                git -C "$GITHUB_WORKSPACE/kernel/KernelSU" rev-parse HEAD
+              git -C "$GITHUB_WORKSPACE/kernel" diff --binary > "$DIAG/all-kernel-source-diffs.patch"
+              if [[ -d "$GITHUB_WORKSPACE/kernel/KernelSU-Next/.git" ]]; then
+                echo '--- KernelSU-Next commit ---'
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-parse HEAD
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" log -1 --format='%H%n%ad%n%s' --date=iso-strict
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" grep -n -E 'KSU_VERSION|ksu_syscall_hook_manager_init|register_trace_prio_sys_enter|ksu_register_syscall_hook|ksu_handle_execveat_sucompat|ksu_handle_faccessat_sucompat' HEAD -- kernel 2>/dev/null | head -200
+                echo "KSU Git revision count: $(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-list --count HEAD)"
               fi
               if [[ -f "$GITHUB_WORKSPACE/kernel/Makefile" ]]; then
                 echo "Kernel version: $(make -s -C "$GITHUB_WORKSPACE/kernel" kernelversion 2>&1)"
-                echo "Kernel release (if configured): $(make -s -C "$GITHUB_WORKSPACE/kernel" ARCH=arm64 kernelrelease 2>&1)"
+                echo "Kernel release: $(make -s -C "$GITHUB_WORKSPACE/kernel" ARCH=arm64 kernelrelease 2>&1)"
               fi
             else
               echo 'Kernel source checkout is unavailable.'
@@ -330,7 +380,7 @@ jobs:
 
           if [[ -f "$GITHUB_WORKSPACE/kernel/.config" ]]; then
             cp "$GITHUB_WORKSPACE/kernel/.config" "$DIAG/kernel.config"
-            grep -E '^(CONFIG_(KSU|KPROBES|KALLSYMS|KALLSYMS_ALL|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' \
+            grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' \
               "$GITHUB_WORKSPACE/kernel/.config" > "$DIAG/config-summary.txt" || true
           else
             echo 'Kernel .config was not generated.' > "$DIAG/config-summary.txt"
@@ -341,16 +391,14 @@ jobs:
               "$DIAG/kernel-build.log" > "$DIAG/errors-summary.txt" || true
             tail -n 250 "$DIAG/kernel-build.log" > "$DIAG/kernel-build-last-250-lines.txt" || true
           else
-            echo 'Compilation log was not created; the failure may have happened before the compile step.' > "$DIAG/errors-summary.txt"
+            echo 'Compilation log was not created; failure occurred before compile.' > "$DIAG/errors-summary.txt"
           fi
-
           {
-            echo 'Diagnostics artifact contents:'
+            echo 'Diagnostics files:'
             find "$DIAG" -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
             echo
-            echo 'The full compiler log, error summary, final 250 lines, kernel config, source diff, and toolchain/source versions are included when available.'
+            echo 'Includes toolchain info, source commit/diffs, KernelSU source/version/hook-manager inspection, kernel config, compile log, errors, and last 250 lines where available.'
           } > "$DIAG/README.txt"
-          echo 'Diagnostics collected. The A13X-Suzume-Build-Diagnostics artifact is uploaded even if earlier steps failed.'
 
       - name: Upload build diagnostics (always, including failures)
         if: always()
