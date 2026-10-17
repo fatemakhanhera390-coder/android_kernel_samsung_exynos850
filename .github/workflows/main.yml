@@ -330,6 +330,18 @@ jobs:
 
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+
+          # Linux 4.19's `kernelrelease` target does not sync Kconfig itself.
+          # The .config already says -Darknight, but setlocalversion reads
+          # include/config/auto.conf, which can still contain the defconfig's
+          # old local version (-exynos850) after olddefconfig. Refresh it now.
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" syncconfig
+          grep -Fxq 'CONFIG_LOCALVERSION="-Darknight"' include/config/auto.conf || {
+            echo 'include/config/auto.conf did not refresh CONFIG_LOCALVERSION to -Darknight.' >&2
+            grep -E '^CONFIG_LOCALVERSION(=|_)' include/config/auto.conf .config || true
+            exit 1
+          }
           for item in CONFIG_KSU=y CONFIG_KPROBES=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y CONFIG_EXT4_FS=y CONFIG_KSU_DEBUG=y CONFIG_FTRACE=y CONFIG_FTRACE_SYSCALLS=y; do
             grep -Fxq "$item" .config || { echo "Required config missing after olddefconfig: $item" >&2; exit 1; }
           done
@@ -494,6 +506,11 @@ jobs:
 
           if [[ -f "$GITHUB_WORKSPACE/kernel/.config" ]]; then
             cp "$GITHUB_WORKSPACE/kernel/.config" "$DIAG/kernel.config"
+            if [[ -f "$GITHUB_WORKSPACE/kernel/include/config/auto.conf" ]]; then
+              cp "$GITHUB_WORKSPACE/kernel/include/config/auto.conf" "$DIAG/kernel.auto.conf"
+              grep -E '^CONFIG_LOCALVERSION(=|_)' "$GITHUB_WORKSPACE/kernel/include/config/auto.conf" \
+                > "$DIAG/auto-localversion-summary.txt" || true
+            fi
             grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' \
               "$GITHUB_WORKSPACE/kernel/.config" > "$DIAG/config-summary.txt" || true
           else
