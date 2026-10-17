@@ -184,6 +184,82 @@ jobs:
           grep -q 'ksu_register_syscall_hook(__NR_execveat' KernelSU-Next/kernel/hook/syscall_hook_manager.c
           echo 'Pinned KernelSU-Next dispatcher integration sources verified.'
 
+      - name: Patch KernelSU-Next VFS operations for the Samsung 4.19.325 tree
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          KSU_FILE="KernelSU-Next/kernel/infra/file_wrapper.c"
+          test -f "$KSU_FILE" || { echo "KernelSU file_wrapper.c not found: $KSU_FILE" >&2; exit 1; }
+          python3 - "$KSU_FILE" <<'PYVFS'
+          from pathlib import Path
+          import re, sys
+
+          path = Path(sys.argv[1])
+          src = path.read_text()
+          original = src
+
+          # The target Samsung Exynos850 4.19.325 vendor tree lacks these
+          # optional struct file_operations members. Remove only their wrappers.
+          src, iopoll_block = re.subn(
+              r'#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 1, 0\)\n'
+              r'static int ksu_wrapper_iopoll\b.*?^#endif[ \t]*\n',
+              '', src, count=1, flags=re.S | re.M
+          )
+          if iopoll_block != 1:
+              raise SystemExit('Expected KernelSU-Next iopoll wrapper block not found exactly once; refusing unsafe patch.')
+
+          src, iopoll_assignment = re.subn(
+              r'^\s*p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;\s*\n',
+              '', src, count=1, flags=re.M
+          )
+          if iopoll_assignment != 1:
+              raise SystemExit('Expected iopoll assignment not found exactly once.')
+
+          src, remap_helper = re.subn(
+              r'^// no REMAP_FILE_DEDUP: use file_in\n.*?(?=^static int ksu_wrapper_fadvise\b)',
+              '', src, count=1, flags=re.S | re.M
+          )
+          if remap_helper != 1:
+              raise SystemExit('Expected remap_file_range wrapper block not found exactly once.')
+
+          src, remap_assignment = re.subn(
+              r'^\s*p->ops\.remap_file_range =\n'
+              r'\s*fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;\s*\n',
+              '', src, count=1, flags=re.M
+          )
+          if remap_assignment != 1:
+              raise SystemExit('Expected remap_file_range assignment not found exactly once.')
+
+          marker = '#include "infra/file_wrapper.h"\n'
+          comment = (
+              '\n/* Darknight target compatibility: the Samsung Exynos850 4.19.325 vendor tree\n'
+              ' * omits file_operations.iopoll and file_operations.remap_file_range.\n'
+              ' * The corresponding optional callbacks are omitted; other KernelSU-Next\n'
+              ' * file-wrapper operations remain unchanged.\n'
+              ' */\n'
+          )
+          if marker not in src:
+              raise SystemExit('Cannot locate stable include marker for compatibility note.')
+          if 'Darknight target compatibility:' not in src:
+              src = src.replace(marker, marker + comment, 1)
+
+          if src == original:
+              raise SystemExit('No KernelSU compatibility changes were made.')
+          path.write_text(src)
+          print('Applied 4.19 VFS compatibility patch: omitted iopoll/remap_file_range callbacks only.')
+          PYVFS
+          git -C KernelSU-Next diff --check
+          git -C KernelSU-Next diff --binary -- kernel/infra/file_wrapper.c \
+            > "$GITHUB_WORKSPACE/diagnostics/ksu-4.19-vfs-compatibility.patch"
+          cp "$KSU_FILE" "$GITHUB_WORKSPACE/diagnostics/ksu-file_wrapper.c.patched"
+          grep -q 'Darknight target compatibility:' "$KSU_FILE"
+          if grep -Eq 'p->ops\.iopoll|fp->f_op->iopoll|p->ops\.remap_file_range|fp->f_op->remap_file_range|REMAP_FILE_DEDUP' "$KSU_FILE"; then
+            echo 'Unsupported VFS callback references remain in KernelSU file_wrapper.c.' >&2
+            exit 1
+          fi
+          echo 'KernelSU VFS compatibility patch verified and saved in diagnostics.'
+
       - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
         shell: bash
         working-directory: kernel
@@ -223,7 +299,7 @@ jobs:
           test -f Makefile
           test -f "arch/arm64/configs/$DEFCONFIG"
           SOURCE_VERSION="$(make -s kernelversion)"
-          echo "Kernel source version: $SOURCE_VERSION"
+          echo "Kernel source version (base VERSION/PATCHLEVEL/SUBLEVEL/EXTRAVERSION only): $SOURCE_VERSION"
           [[ "$SOURCE_VERSION" == "4.19.325" ]] || {
             echo "Unexpected kernel version: $SOURCE_VERSION (expected 4.19.325)" >&2
             exit 1
@@ -261,7 +337,9 @@ jobs:
             echo 'A SUSFS option remains enabled; aborting.' >&2
             exit 1
           fi
-          make -s ARCH="$ARCH" kernelrelease | tee "$GITHUB_WORKSPACE/diagnostics/kernelrelease.txt"
+          KRELEASE="$(make -s ARCH="$ARCH" kernelrelease)"
+          echo "$KRELEASE" | tee "$GITHUB_WORKSPACE/diagnostics/kernelrelease.txt"
+          [[ "$KRELEASE" == "4.19.325-Darknight" ]] || { echo "Unexpected kernel release: $KRELEASE (expected exactly 4.19.325-Darknight)" >&2; exit 1; }
           cp .config "$GITHUB_WORKSPACE/diagnostics/kernel.config"
           grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' .config \
             > "$GITHUB_WORKSPACE/diagnostics/config-summary.txt" || true
@@ -276,7 +354,7 @@ jobs:
             echo "Neutron tag: $NEUTRON_TAG"
             clang --version
             ld.lld --version
-            echo "Command: make V=1 -j$(nproc --all) ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image"
+            echo "Command: make V=1 -j$(nproc --all) ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image (CONFIG_LOCALVERSION is set to -Darknight in .config)"
           } | tee "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
           make V=1 -j"$(nproc --all)" ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" Image 2>&1 | tee -a "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
@@ -335,6 +413,7 @@ jobs:
           KERNEL_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel" rev-parse HEAD)"
           {
             echo "Kernel release: $KRELEASE"
+            [[ "$KRELEASE" == "4.19.325-Darknight" ]] || { echo "Refusing to package kernel: expected 4.19.325-Darknight, got $KRELEASE" >&2; exit 1; }
             echo "Kernel source: https://github.com/$KERNEL_REPO/tree/$KERNEL_BRANCH"
             echo "Kernel source commit: $KERNEL_COMMIT"
             echo "KernelSU repository: https://github.com/$KSU_REPO"
@@ -384,6 +463,7 @@ jobs:
             echo "KernelSU repo: $KSU_REPO"
             echo "KernelSU requested ref: $KSU_REF"
             echo 'Legacy syscall hook patch: intentionally disabled; pinned KernelSU-Next revision owns its dispatcher hooks'
+            echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
             echo
             echo '--- Toolchain ---'
             if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
