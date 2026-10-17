@@ -1,4 +1,4 @@
-name: A13X Suzume KernelSU-Next Kernel
+name: A13X Darknight KernelSU-Next Kernel
 
 on:
   workflow_dispatch:
@@ -21,12 +21,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: a13x-suzume-${{ github.ref }}
+  group: a13x-darknight-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build A13X Suzume + KernelSU-Next + AnyKernel3
+    name: Build A13X Darknight + KernelSU-Next + AnyKernel3
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -71,6 +71,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/diagnostics/toolchain-install.log") 2>&1
           [[ "$NEUTRON_TAG" =~ ^[0-9]{8}$ ]] || {
             echo "Invalid Neutron tag: $NEUTRON_TAG (expected DDMMYYYY)" >&2
             exit 1
@@ -88,22 +89,55 @@ jobs:
           mkdir -p "$RUNNER_TEMP/neutron-clang"
           curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/neutron-clang.tar.zst"
           tar --zstd -xf "$RUNNER_TEMP/neutron-clang.tar.zst" -C "$RUNNER_TEMP/neutron-clang"
-          CLANG_BIN="$(find "$RUNNER_TEMP/neutron-clang" -type f -path '*/bin/clang' -print -quit)"
+
+          # Some Neutron catalogue archives ship the compiler as clang-24 rather than clang.
+          # Find both regular files and symlinks, then expose the conventional LLVM=1 tool names.
+          CLANG_BIN=""
+          for candidate in clang clang-24 clang-24.0 clang-24.0.0 clang-24.0.0git; do
+            CLANG_BIN="$(find "$RUNNER_TEMP/neutron-clang" \( -type f -o -type l \) \
+              -path '*/bin/*' -name "$candidate" -print -quit)"
+            [[ -n "$CLANG_BIN" ]] && break
+          done
           [[ -n "$CLANG_BIN" && -x "$CLANG_BIN" ]] || {
-            echo "Could not locate executable bin/clang inside release asset" >&2
-            find "$RUNNER_TEMP/neutron-clang" -maxdepth 4 -type f | head -100 || true
+            echo "Could not locate executable clang or clang-24 inside release asset." >&2
+            find "$RUNNER_TEMP/neutron-clang" \( -type f -o -type l \) -maxdepth 5 -print | sort | head -250 || true
             exit 1
           }
+
           TOOLCHAIN_BIN="$(dirname "$CLANG_BIN")"
+          if [[ "$(basename "$CLANG_BIN")" != "clang" ]]; then
+            ln -sfn "$(basename "$CLANG_BIN")" "$TOOLCHAIN_BIN/clang"
+          fi
+
+          # Supply conventional aliases for version-suffixed LLVM tools where needed.
+          for tool in clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-ranlib llvm-size llvm-strings llvm-cov; do
+            if [[ ! -x "$TOOLCHAIN_BIN/$tool" ]]; then
+              for suffix in -24 -24.0 -24.0.0 -24.0.0git; do
+                if [[ -x "$TOOLCHAIN_BIN/${tool}${suffix}" ]]; then
+                  ln -sfn "${tool}${suffix}" "$TOOLCHAIN_BIN/$tool"
+                  break
+                fi
+              done
+            fi
+          done
+          # Compiler packages may provide only clang-24, not clang++-24.
+          if [[ ! -x "$TOOLCHAIN_BIN/clang++" ]]; then
+            ln -sfn "$(basename "$CLANG_BIN")" "$TOOLCHAIN_BIN/clang++"
+          fi
           [[ -x "$TOOLCHAIN_BIN/ld.lld" ]] || {
-            echo "Could not locate ld.lld next to $CLANG_BIN" >&2
+            echo "Could not locate ld.lld in $TOOLCHAIN_BIN" >&2
+            find "$RUNNER_TEMP/neutron-clang" \( -type f -o -type l \) -path '*/bin/*' -print | sort | head -250 || true
             exit 1
           }
+
           echo "$TOOLCHAIN_BIN" >> "$GITHUB_PATH"
           echo "NEUTRON_CLANG_BIN=$TOOLCHAIN_BIN" >> "$GITHUB_ENV"
+          # GITHUB_PATH takes effect in following steps only; update this shell as well.
+          export PATH="$TOOLCHAIN_BIN:$PATH"
+          echo "Using compiler at: $(command -v clang)"
           clang --version
           ld.lld --version
-          clang --version | grep -q '24\.0\.0git' || {
+          clang --version | grep -Eq 'version 24\.0\.0git' || {
             echo "Expected Clang 24.0.0git from tag 06092026; actual compiler version differs." >&2
             exit 1
           }
@@ -261,9 +295,9 @@ jobs:
           cp "$GITHUB_WORKSPACE/kernel/arch/arm64/boot/Image" "$AK3/Image"
           cat > "$AK3/anykernel.sh" <<'AK3SCRIPT'
           ### AnyKernel3 Ramdisk Mod Script
-          ## Suzume KernelSU-Next for Samsung Galaxy A13X (SM-A135F / SM-A135M)
+          ## Darknight KernelSU-Next for Samsung Galaxy A13X (SM-A135F / SM-A135M)
           properties() { '
-          kernel.string=Suzume KernelSU-Next for Samsung Galaxy A13X by MAX ARAF
+          kernel.string=Darknight KernelSU-Next for Samsung Galaxy A13X by MAX ARAF
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -292,9 +326,9 @@ jobs:
           rm -f "$AK3/README.md" "$AK3/README" "$AK3/.gitignore"
           find "$AK3" -name placeholder -type f -delete
           cd "$AK3"
-          zip -qr "$GITHUB_WORKSPACE/A13X-Suzume-KernelSU-Next-AnyKernel3.zip" . \
+          zip -qr "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-AnyKernel3.zip" . \
             -x '*/.git/*' '*/README*' '*placeholder'
-          unzip -t "$GITHUB_WORKSPACE/A13X-Suzume-KernelSU-Next-AnyKernel3.zip"
+          unzip -t "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-AnyKernel3.zip"
 
           KRELEASE="$(cd "$GITHUB_WORKSPACE/kernel" && make -s ARCH=arm64 kernelrelease)"
           KSU_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-parse HEAD)"
@@ -315,14 +349,14 @@ jobs:
             echo "SUSFS: disabled / not integrated"
             echo "Root access: must be verified on-device; CI cannot guarantee manager grant success"
           } > "$GITHUB_WORKSPACE/build-info.txt"
-          (cd "$GITHUB_WORKSPACE" && sha256sum A13X-Suzume-KernelSU-Next-AnyKernel3.zip > sha256sum.txt)
+          (cd "$GITHUB_WORKSPACE" && sha256sum A13X-Darknight-KernelSU-Next-AnyKernel3.zip > sha256sum.txt)
 
       - name: Upload flashable kernel ZIP and build info
         uses: actions/upload-artifact@v4
         with:
-          name: A13X-Suzume-KernelSU-Next-AnyKernel3
+          name: A13X-Darknight-KernelSU-Next-AnyKernel3
           path: |
-            A13X-Suzume-KernelSU-Next-AnyKernel3.zip
+            A13X-Darknight-KernelSU-Next-AnyKernel3.zip
             build-info.txt
             sha256sum.txt
           if-no-files-found: error
@@ -336,7 +370,7 @@ jobs:
           DIAG="$GITHUB_WORKSPACE/diagnostics"
           mkdir -p "$DIAG"
           {
-            echo "A13X Suzume Kernel build diagnostics"
+            echo "A13X Darknight Kernel build diagnostics"
             echo "UTC time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "GitHub repository: $GITHUB_REPOSITORY"
             echo "Workflow run ID: $GITHUB_RUN_ID"
@@ -404,7 +438,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: A13X-Suzume-Build-Diagnostics-${{ github.run_id }}
+          name: A13X-Darknight-Build-Diagnostics-${{ github.run_id }}
           path: diagnostics/
           if-no-files-found: warn
           retention-days: 14
