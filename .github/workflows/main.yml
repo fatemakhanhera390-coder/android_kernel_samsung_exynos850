@@ -260,6 +260,65 @@ jobs:
           fi
           echo 'KernelSU VFS compatibility patch verified and saved in diagnostics.'
 
+      - name: Disable unsupported seccomp-cache internals on Linux 4.19
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          KSU_FILE="KernelSU-Next/kernel/infra/seccomp_cache.c"
+          test -f "$KSU_FILE" || { echo "KernelSU seccomp_cache.c not found: $KSU_FILE" >&2; exit 1; }
+          python3 - "$KSU_FILE" <<'PYSECCOMP'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          src = path.read_text()
+          marker = "DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS"
+          if marker in src:
+              raise SystemExit("Darknight seccomp compatibility wrapper is already present; refusing to wrap twice.")
+          if "SECCOMP_ARCH_NATIVE_NR" not in src or "ksu_seccomp_allow_cache" not in src or "ksu_seccomp_clear_cache" not in src:
+              raise SystemExit("KernelSU-Next seccomp_cache.c differs from the expected pinned source; refusing an unverified patch.")
+
+          prefix = """/*
+           * DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS
+           * Linux 4.19 has no SECCOMP_ARCH_NATIVE_NR/action-cache implementation.
+           * KernelSU-Next's newer seccomp_cache.c mirrors private seccomp_filter
+           * internals that do not exist in this kernel. Never fake the missing
+           * structure/NR definitions: the offsets would be unsafe at runtime.
+           * The helpers are no-ops when the target kernel has no seccomp action cache.
+           */
+          #include <linux/version.h>
+          #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+          #include <linux/seccomp.h>
+          #include "infra/seccomp_cache.h"
+
+          void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+
+          void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+          #else
+          """
+          suffix = "\n#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) */\n"
+          path.write_text(prefix + src + suffix)
+          print("Applied Darknight legacy seccomp-cache compatibility: no-op helpers for Linux < 5.15; original implementation retained for newer kernels.")
+          PYSECCOMP
+
+          git -C KernelSU-Next diff --check
+          git -C KernelSU-Next diff --binary -- kernel/infra/seccomp_cache.c \
+            > "$GITHUB_WORKSPACE/diagnostics/ksu-legacy-seccomp-cache-compatibility.patch"
+          cp "$KSU_FILE" "$GITHUB_WORKSPACE/diagnostics/ksu-seccomp_cache.c.patched"
+          grep -q 'DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS' "$KSU_FILE"
+          grep -q 'void ksu_seccomp_allow_cache(struct seccomp_filter \*filter, int nr)' "$KSU_FILE"
+          grep -q 'void ksu_seccomp_clear_cache(struct seccomp_filter \*filter, int nr)' "$KSU_FILE"
+          echo 'KernelSU-Next legacy seccomp-cache compatibility patch verified and saved in diagnostics.'
+
       - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
         shell: bash
         working-directory: kernel
@@ -476,6 +535,7 @@ jobs:
             echo "KernelSU requested ref: $KSU_REF"
             echo 'Legacy syscall hook patch: intentionally disabled; pinned KernelSU-Next revision owns its dispatcher hooks'
             echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
+            echo 'KernelSU 4.19 seccomp compatibility: no-op cache helpers because this kernel lacks the action-cache internals'
             echo
             echo '--- Toolchain ---'
             if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
@@ -493,6 +553,9 @@ jobs:
                 git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-parse HEAD
                 git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" log -1 --format='%H%n%ad%n%s' --date=iso-strict
                 git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" grep -n -E 'KSU_VERSION|ksu_syscall_hook_manager_init|register_trace_prio_sys_enter|ksu_register_syscall_hook|ksu_handle_execveat_sucompat|ksu_handle_faccessat_sucompat' HEAD -- kernel 2>/dev/null | head -200
+                echo '--- KernelSU seccomp-cache compatibility source (working tree) ---'
+                grep -n -E 'DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS|SECCOMP_ARCH_NATIVE_NR|ksu_seccomp_(allow|clear)_cache' "$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel/infra/seccomp_cache.c" 2>/dev/null | head -100
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" diff --binary > "$DIAG/ksu-all-source-diffs.patch"
                 echo "KSU Git revision count: $(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-list --count HEAD)"
               fi
               if [[ -f "$GITHUB_WORKSPACE/kernel/Makefile" ]]; then
