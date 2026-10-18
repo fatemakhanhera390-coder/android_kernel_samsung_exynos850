@@ -1,66 +1,134 @@
-
-name: M21 OneUI Kernel Build
+name: M21 OneUI Grass Kernel Build
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Grass Kernel branch or tag to build'
+        required: true
+        default: 'Grass-Unified2'
+        type: string
+      expected_kernel_version:
+        description: 'Expected result of make -s kernelversion (current branch previously reported 4.14.264)'
+        required: true
+        default: '4.14.264'
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: m21-oneui-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Build M21 / One UI kernel
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    env:
+      SOURCE_REF: ${{ inputs.source_ref }}
+      EXPECTED_KERNEL_VERSION: ${{ inputs.expected_kernel_version }}
 
     steps:
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            bash git make libssl-dev curl bc \
-            pkg-config m4 libtool automake autoconf \
-            flex bison python3 zip unzip
+          sudo apt-get install -y --no-install-recommends \
+            bash bc bison build-essential cpio curl file flex git \
+            libelf-dev libncurses-dev libssl-dev lz4 make m4 \
+            automake autoconf libtool perl pkg-config python3 \
+            python-is-python3 rsync unzip zip
 
-      - name: Checkout Grass Kernel source
+      - name: Clone selected Grass Kernel source (with submodules)
         run: |
-          git clone --depth=1 \
-            --branch Grass-Unified2 \
+          set -euxo pipefail
+          test -n "$SOURCE_REF"
+          git clone --depth=1 --recurse-submodules --single-branch \
+            --branch "$SOURCE_REF" \
             https://github.com/ghazzor/grass_kernel.git kernel-src
+          cd kernel-src
+          git submodule status --recursive
+          echo "Source ref: $SOURCE_REF" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify source kernel version
+      - name: Verify the real source kernel version
         working-directory: kernel-src
         run: |
-          VERSION=$(make -s kernelversion)
+          set -euo pipefail
+          VERSION="$(make -s kernelversion)"
           echo "Source kernel version: $VERSION"
-          if [ "$VERSION" != "4.14.186" ]; then
-            echo "::error::Source is $VERSION, not 4.14.186"
+          {
+            echo '### Source validation'
+            echo "- Requested ref: $SOURCE_REF"
+            echo "- Actual kernel version: $VERSION"
+            echo "- Expected kernel version: $EXPECTED_KERNEL_VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$VERSION" != "$EXPECTED_KERNEL_VERSION" ]; then
+            echo "::error::Source is $VERSION, not the requested expected version $EXPECTED_KERNEL_VERSION. Choose a branch/tag whose Makefile really reports that version; do not edit the version string to bypass this check."
             exit 1
           fi
 
-      - name: Install kernel toolchain
+      - name: Install the toolchain and build M21 One UI kernel
         working-directory: kernel-src
+        shell: bash
         run: |
+          set -euo pipefail
+          # The Grass Kernel README documents this version-pinned setup script.
           bash <(curl -fsSL \
-            https://gist.githubusercontent.com/roynatech2544/0feeeb35a6d1782b186990ff2a0b3657/raw/b170134a94dac3594df506716bc7b802add2724b/setup.sh)
+            'https://gist.githubusercontent.com/roynatech2544/0feeeb35a6d1782b186990ff2a0b3657/raw/b170134a94dac3594df506716bc7b802add2724b/setup.sh')
 
-      - name: Build M21 OneUI kernel
-        working-directory: kernel-src
-        run: |
+          # Standard M21 + KernelSU + One UI build; this does not modify the
+          # kernel version or patch any external/precompiled module.
           DEVICE=m21 KSU=1 ROM=oneui ./build_kernel.sh
 
-      - name: Verify build outputs
+      - name: Validate outputs and create build manifest
         working-directory: kernel-src
+        shell: bash
         run: |
-          test -s out/arch/arm64/boot/Image
-          find kernel_zip -maxdepth 1 \
-            -type f -name 'GRASS*.zip' -print
+          set -euo pipefail
+          test -s out/arch/arm64/boot/Image || {
+            echo '::error::Kernel Image was not produced.'
+            exit 1
+          }
+
+          shopt -s nullglob
+          zips=(kernel_zip/GRASS*.zip)
+          if (( ${#zips[@]} == 0 )); then
+            echo '::error::No kernel_zip/GRASS*.zip flashable archive was produced.'
+            echo 'Check the full build log and the source README for the packaging output path.'
+            exit 1
+          fi
+
+          {
+            echo "Device: Samsung Galaxy M21 (SM-M215F / Exynos 9611)"
+            echo "ROM target: One UI port (generic One UI build; exact port not identified)"
+            echo "Requested source ref: $SOURCE_REF"
+            echo "Source commit: $(git rev-parse HEAD)"
+            echo "Kernel version: $(make -s kernelversion)"
+            echo "KernelSU build flag: KSU=1"
+            echo "Build command: DEVICE=m21 KSU=1 ROM=oneui ./build_kernel.sh"
+            echo 'Note: successful compilation does not guarantee compatibility with every One UI port.'
+          } > build-info.txt
+
+          sha256sum out/arch/arm64/boot/Image "${zips[@]}" > SHA256SUMS.txt
+          {
+            echo '### Build outputs'
+            echo '- Kernel image: `out/arch/arm64/boot/Image`'
+            for zip in "${zips[@]}"; do echo "- Flashable archive: $zip"; done
+            echo '- SHA-256 checksums saved in `SHA256SUMS.txt`.'
+            echo '- Artifacts have not been device-tested; keep the known-good backup and recovery path.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: M21-OneUI-Kernel
+          name: M21-OneUI-Grass-Kernel
           path: |
             kernel-src/out/arch/arm64/boot/Image
             kernel-src/kernel_zip/GRASS*.zip
+            kernel-src/build-info.txt
+            kernel-src/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 7
