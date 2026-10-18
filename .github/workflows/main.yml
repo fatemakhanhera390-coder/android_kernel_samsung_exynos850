@@ -712,7 +712,10 @@ jobs:
           set -Eeuo pipefail
           KSU_ROOT="$GITHUB_WORKSPACE/kernel/KernelSU-Next"
           DIAG="$GITHUB_WORKSPACE/diagnostics/legacy-selinux-port"
-          mkdir -p "$DIAG"
+          PRISTINE="$GITHUB_WORKSPACE/diagnostics/legacy-selinux-port-pristine"
+          mkdir -p "$DIAG" "$PRISTINE"
+          : > "$DIAG/SHA256SUMS.txt"
+          : > "$DIAG/SHA256SUMS-upstream.txt"
 
           EXPECTED_DEV='8f902aeb16033024143ae36cf711df902cf02fae'
           COMPAT_REF="$KSU_LEGACY_SELINUX_COMPAT_REF"
@@ -761,12 +764,51 @@ jobs:
             target="$KSU_ROOT/$rel"
             tmp="$RUNNER_TEMP/ksu-legacy-$(basename "$rel").tmp"
             url="https://raw.githubusercontent.com/${KSU_REPO}/${COMPAT_REF}/${rel}"
-            mkdir -p "$(dirname "$target")" "$DIAG/$(dirname "$rel")"
+            pristine="$PRISTINE/$rel"
+            mkdir -p "$(dirname "$target")" "$DIAG/$(dirname "$rel")" "$(dirname "$pristine")"
             echo "Fetching pinned compatibility source: $url"
             curl --fail --location --silent --show-error --retry 3 --retry-all-errors "$url" -o "$tmp"
             test -s "$tmp" || { echo "Empty compatibility source: $rel" >&2; exit 1; }
+
+            # Preserve and hash the exact immutable upstream bytes for provenance.
+            # Some upstream compatibility files contain trailing spaces; when these
+            # files replace the pinned dev-version files, `git diff --check` correctly
+            # flags those newly-added lines. Normalize horizontal trailing whitespace
+            # in the working copy only (no code tokens or line endings are changed).
+            cp "$tmp" "$pristine"
+            printf 'upstream  ' >> "$DIAG/SHA256SUMS-upstream.txt"
+            sha256sum "$tmp" | tee -a "$DIAG/SHA256SUMS-upstream.txt"
             install -m 0644 "$tmp" "$target"
+            python3 - "$target" <<'PYTRAIL'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          data = p.read_bytes()
+          if b"\x00" in data:
+              raise SystemExit(f"Refusing to whitespace-normalize a binary source: {p}")
+
+          output = []
+          for line in data.splitlines(keepends=True):
+              if line.endswith(b"\r\n"):
+                  body, ending = line[:-2], b"\r\n"
+              elif line.endswith(b"\n"):
+                  body, ending = line[:-1], b"\n"
+              elif line.endswith(b"\r"):
+                  body, ending = line[:-1], b"\r"
+              else:
+                  body, ending = line, b""
+              output.append(body.rstrip(b" \t") + ending)
+
+          normalized = b"".join(output)
+          p.write_bytes(normalized)
+          for number, line in enumerate(normalized.splitlines(), start=1):
+              if line.endswith((b" ", b"\t")):
+                  raise SystemExit(f"Trailing horizontal whitespace remains in {p}:{number}")
+          print(f"Normalized trailing horizontal whitespace in {p}; upstream original preserved separately.")
+          PYTRAIL
             cp "$target" "$DIAG/$rel"
+            printf 'normalized  ' >> "$DIAG/SHA256SUMS.txt"
             sha256sum "$target" | tee -a "$DIAG/SHA256SUMS.txt"
           done
 
@@ -875,7 +917,11 @@ jobs:
           done
           grep -q 'SELINUX_POLICY_INSTEAD_SELINUX_SS' "$KSU_ROOT/kernel/selinux/rules.c"
           grep -q 'ksu_get_real_status_page' "$KSU_ROOT/kernel/feature/selinux_hide.c"
-          git -C "$KSU_ROOT" diff --check
+          if ! git -C "$KSU_ROOT" diff --check > "$DIAG/diff-check.txt" 2>&1; then
+            echo 'Whitespace/patch validation failed after normalization. Details:' >&2
+            cat "$DIAG/diff-check.txt" >&2
+            exit 1
+          fi
           git -C "$KSU_ROOT" diff --binary > "$GITHUB_WORKSPACE/diagnostics/ksu-selinux-legacy-backport.patch"
           {
             echo "KSU HEAD after file-level backport: $(git -C "$KSU_ROOT" rev-parse HEAD)"
@@ -1322,7 +1368,7 @@ jobs:
             echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
             echo 'KernelSU 4.19 seccomp compatibility: no-op cache helpers because this kernel lacks the action-cache internals'
             echo 'Preflight: compiles KernelSU objects before full Image and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
-            echo 'SELinux compatibility: immutable non-GKI file backport; version-gated API references are validated by Kbuild object preflight, not raw recursive grep; KSU HEAD and revision-derived driver version remain pinned.'
+            echo 'SELinux compatibility: immutable non-GKI file backport; exact upstream bytes/hashes are preserved separately, working copies have trailing horizontal whitespace normalized, and APIs are validated by Kbuild object preflight; KSU HEAD and revision-derived driver version remain pinned.'
             echo
             echo '--- Toolchain ---'
             if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
