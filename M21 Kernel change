@@ -1,0 +1,66 @@
+
+name: M21 OneUI Kernel Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bash git make libssl-dev curl bc \
+            pkg-config m4 libtool automake autoconf \
+            flex bison python3 zip unzip
+
+      - name: Checkout Grass Kernel source
+        run: |
+          git clone --depth=1 \
+            --branch Grass-Unified2 \
+            https://github.com/ghazzor/grass_kernel.git kernel-src
+
+      - name: Verify source kernel version
+        working-directory: kernel-src
+        run: |
+          VERSION=$(make -s kernelversion)
+          echo "Source kernel version: $VERSION"
+          if [ "$VERSION" != "4.14.186" ]; then
+            echo "::error::Source is $VERSION, not 4.14.186"
+            exit 1
+          fi
+
+      - name: Install kernel toolchain
+        working-directory: kernel-src
+        run: |
+          bash <(curl -fsSL \
+            https://gist.githubusercontent.com/roynatech2544/0feeeb35a6d1782b186990ff2a0b3657/raw/b170134a94dac3594df506716bc7b802add2724b/setup.sh)
+
+      - name: Build M21 OneUI kernel
+        working-directory: kernel-src
+        run: |
+          DEVICE=m21 KSU=1 ROM=oneui ./build_kernel.sh
+
+      - name: Verify build outputs
+        working-directory: kernel-src
+        run: |
+          test -s out/arch/arm64/boot/Image
+          find kernel_zip -maxdepth 1 \
+            -type f -name 'GRASS*.zip' -print
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: M21-OneUI-Kernel
+          path: |
+            kernel-src/out/arch/arm64/boot/Image
+            kernel-src/kernel_zip/GRASS*.zip
+          if-no-files-found: error
+          retention-days: 7
