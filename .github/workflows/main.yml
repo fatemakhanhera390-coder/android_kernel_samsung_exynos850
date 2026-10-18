@@ -33,6 +33,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl jq tar gzip xz-utils
 
+      - name: Download and verify latest ShellCheck release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          API_URL="https://api.github.com/repos/koalaman/shellcheck/releases/latest"
+          curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' "$API_URL" \
+            -o "$RUNNER_TEMP/shellcheck-release.json"
+          ASSET_URL="$(jq -r '[.assets[] | select(.name | test("linux[.]x86_64[.]tar[.]xz$"))][0].browser_download_url // empty' "$RUNNER_TEMP/shellcheck-release.json")"
+          if [[ -z "$ASSET_URL" ]]; then
+            echo 'Could not locate latest official ShellCheck linux.x86_64 tar.xz asset.' >&2
+            jq -r '.assets[].name' "$RUNNER_TEMP/shellcheck-release.json" >&2 || true
+            exit 1
+          fi
+          curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/shellcheck.tar.xz"
+          mkdir -p "$RUNNER_TEMP/shellcheck"
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP/shellcheck"
+          SHELLCHECK_BIN="$(find "$RUNNER_TEMP/shellcheck" -type f -name shellcheck -perm /111 -print -quit)"
+          [[ -n "$SHELLCHECK_BIN" && -x "$SHELLCHECK_BIN" ]] || {
+            echo 'ShellCheck executable was not found in the official release archive.' >&2
+            find "$RUNNER_TEMP/shellcheck" -maxdepth 4 -type f -print >&2 || true
+            exit 1
+          }
+          mkdir -p "$RUNNER_TEMP/shellcheck-bin"
+          ln -sfn "$SHELLCHECK_BIN" "$RUNNER_TEMP/shellcheck-bin/shellcheck"
+          echo "$RUNNER_TEMP/shellcheck-bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/shellcheck-bin:$PATH"
+          shellcheck --version
+
       - name: Download latest actionlint release
         shell: bash
         run: |
@@ -52,37 +81,6 @@ jobs:
           test -x "$RUNNER_TEMP/actionlint/actionlint"
           echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/actionlint/actionlint" -version
-
-      - name: Download latest ShellCheck release
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          curl -fsSL --retry 3 \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            https://api.github.com/repos/koalaman/shellcheck/releases/latest \
-            -o "$RUNNER_TEMP/shellcheck-release.json"
-          SHELLCHECK_TAG="$(jq -r '.tag_name // empty' "$RUNNER_TEMP/shellcheck-release.json")"
-          ASSET_URL="$(jq -r '[.assets[] | select(.name | endswith(".linux.x86_64.tar.xz"))][0].browser_download_url // empty' "$RUNNER_TEMP/shellcheck-release.json")"
-          if [[ -z "$SHELLCHECK_TAG" || -z "$ASSET_URL" ]]; then
-            echo 'Could not locate the latest ShellCheck Linux x86_64 release asset.' >&2
-            jq -r '.assets[].name' "$RUNNER_TEMP/shellcheck-release.json" >&2 || true
-            exit 1
-          fi
-          curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/shellcheck.tar.xz"
-          mkdir -p "$RUNNER_TEMP/shellcheck"
-          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP/shellcheck"
-          SHELLCHECK_BIN="$(find "$RUNNER_TEMP/shellcheck" -type f -name shellcheck -perm /111 -print -quit)"
-          [[ -n "$SHELLCHECK_BIN" && -x "$SHELLCHECK_BIN" ]] || {
-            echo 'The downloaded ShellCheck archive contains no executable shellcheck binary.' >&2
-            find "$RUNNER_TEMP/shellcheck" -maxdepth 5 -type f -print | sort >&2 || true
-            exit 1
-          }
-          SHELLCHECK_BIN_DIR="$(dirname "$SHELLCHECK_BIN")"
-          echo "$SHELLCHECK_BIN_DIR" >> "$GITHUB_PATH"
-          export PATH="$SHELLCHECK_BIN_DIR:$PATH"
-          echo "Installed latest ShellCheck release: $SHELLCHECK_TAG"
-          shellcheck --version
 
       - name: Lint all GitHub Actions workflows and embedded shell
         shell: bash
@@ -428,6 +426,284 @@ jobs:
           cp "$FILE" "$GITHUB_WORKSPACE/diagnostics/ksu-su_mount_ns.c.patched"
           grep -q 'DARKNIGHT_MOUNT_FLAGS_HEADER_FALLBACK' "$FILE"
 
+      - name: Apply validated KernelSU compatibility fixes for Linux 4.19.325
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYKSU419'
+          from pathlib import Path
+          import re
+
+          KSU = Path('KernelSU-Next/kernel')
+
+          def read(rel):
+              p = KSU / rel
+              if not p.is_file():
+                  raise SystemExit(f'Required pinned KernelSU source is missing: {p}')
+              return p, p.read_text()
+
+          def write_changed(path, old, new, description):
+              if new == old:
+                  raise SystemExit(f'No change produced for {description}; source differs from audited revision.')
+              path.write_text(new)
+              print(f'Applied: {description}')
+
+          # task_work_add() in Linux 4.19 takes bool notify, while the newer
+          # TWA_RESUME spelling is an enum/constant from newer kernels.
+          twa_macro = (
+              '\n/* DARKNIGHT_LINUX419_TWA_RESUME_COMPAT: task_work_add() uses bool notify in 4.19. */\n'
+              '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n'
+              '#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif\n#endif\n'
+          )
+          for rel in ('manager/pkg_observer.c', 'policy/allowlist.c', 'supercall/supercall.c'):
+              p, text = read(rel)
+              if 'DARKNIGHT_LINUX419_TWA_RESUME_COMPAT' in text:
+                  raise SystemExit(f'TWA_RESUME compatibility marker already exists in {p}; inspect instead of wrapping twice.')
+              if '#include <linux/version.h>' not in text:
+                  # Preserve SPDX/license line at the top; add the required version header immediately after it.
+                  lines = text.splitlines(keepends=True)
+                  insert_at = 1 if lines and lines[0].startswith('// SPDX-License-Identifier:') else 0
+                  lines.insert(insert_at, '#include <linux/version.h>\n')
+                  text = ''.join(lines)
+              text = text.replace('#include <linux/version.h>\n', '#include <linux/version.h>\n' + twa_macro, 1)
+              if '#include <linux/task_work.h>' not in text:
+                  marker = '#include <linux/version.h>\n'
+                  if marker not in text:
+                      raise SystemExit(f'{rel}: cannot locate version.h include for task_work compatibility.')
+                  text = text.replace(marker, '#include <linux/task_work.h>\n' + marker, 1)
+              write_changed(p, p.read_text(), text, f'{rel}: Linux 4.19 TWA_RESUME compatibility')
+
+          # allowlist.c calls put_task_struct(), declared by linux/sched/task.h
+          p, text = read('policy/allowlist.c')
+          if '#include <linux/sched/task.h>' not in text:
+              marker = '#include <linux/task_work.h>\n'
+              if marker not in text:
+                  raise SystemExit('allowlist.c changed: cannot locate linux/task_work.h include anchor.')
+              updated = text.replace(marker, marker + '#include <linux/sched/task.h>\n', 1)
+              write_changed(p, text, updated, 'allowlist.c: include declaration for put_task_struct')
+
+          # Linux 4.19 fsnotify_ops has handle_event(), not handle_inode_event().
+          p, text = read('manager/pkg_observer.c')
+          if '#include <linux/string.h>' not in text:
+              marker = '#include <linux/slab.h>\n'
+              if marker not in text:
+                  raise SystemExit('pkg_observer.c changed: cannot locate linux/slab.h include anchor for string.h.')
+              updated = text.replace(marker, marker + '#include <linux/string.h>\n', 1)
+              write_changed(p, text, updated, 'pkg_observer.c: explicit string API declaration')
+              text = updated
+          old_ops = '''static const struct fsnotify_ops ksu_ops = {
+          	.handle_inode_event = ksu_handle_inode_event,
+          };
+          '''
+          # Normalize tabs/spaces because upstream formatting can differ slightly.
+          pattern = re.compile(r'^static const struct fsnotify_ops ksu_ops = \{\n.*?^\};\n', re.M | re.S)
+          m = pattern.search(text)
+          if not m:
+              raise SystemExit('pkg_observer.c: expected fsnotify_ops initializer not found.')
+          if 'DARKNIGHT_LINUX419_FSNOTIFY_COMPAT' in text:
+              raise SystemExit('pkg_observer.c already contains fsnotify compatibility marker.')
+          new_ops = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+          /* DARKNIGHT_LINUX419_FSNOTIFY_COMPAT: adapt the legacy filename callback. */
+          static int ksu_handle_legacy_event(struct fsnotify_group *group,
+                                            struct inode *inode, u32 mask,
+                                            const void *data, int data_type,
+                                            const unsigned char *file_name,
+                                            u32 cookie,
+                                            struct fsnotify_iter_info *iter_info)
+          {
+              (void)group;
+              (void)inode;
+              (void)data;
+              (void)data_type;
+              (void)cookie;
+              (void)iter_info;
+              if (!file_name || (mask & FS_ISDIR))
+                  return 0;
+              if (!strcmp((const char *)file_name, "packages.list")) {
+                  pr_info("packages.list detected: %d\\n", mask);
+                  ksu_defer_track_throne();
+              }
+              return 0;
+          }
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_event = ksu_handle_legacy_event,
+          };
+          #else
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_inode_event = ksu_handle_inode_event,
+          };
+          #endif
+          '''
+          text = text[:m.start()] + new_ops + text[m.end():]
+          write_changed(p, p.read_text(), text, 'pkg_observer.c: Linux 4.19 fsnotify callback adaptation')
+
+          # Linux 4.19 seccomp does not have struct seccomp.filter_count.
+          p, text = read('policy/app_profile.c')
+          if 'DARKNIGHT_LINUX419_SECCOMP_FILTER_COUNT' in text:
+              raise SystemExit('app_profile.c seccomp filter_count guard already exists.')
+          needle = '    atomic_set(&current->seccomp.filter_count, 0);'
+          if text.count(needle) != 1:
+              raise SystemExit('app_profile.c: expected one filter_count reset; refusing to patch a different implementation.')
+          replacement = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+              /* DARKNIGHT_LINUX419_SECCOMP_FILTER_COUNT: field is absent in 4.19. */
+              atomic_set(&current->seccomp.filter_count, 0);
+          #endif'''
+          updated = text.replace(needle, replacement, 1)
+          write_changed(p, text, updated, 'app_profile.c: guard filter_count for kernels that contain the field')
+
+          # linux/minmax.h was introduced after the target 4.19 baseline; kernel.h
+          # provides the legacy min/max macros used by this source.
+          p, text = read('sulog/event.c')
+          old_include = '#include <linux/minmax.h>'
+          if 'DARKNIGHT_LINUX419_MINMAX_COMPAT' in text:
+              raise SystemExit('sulog/event.c minmax compatibility marker already exists.')
+          if text.count(old_include) != 1:
+              raise SystemExit('sulog/event.c: expected one linux/minmax.h include; inspect source.')
+          updated = text.replace(old_include, '''/* DARKNIGHT_LINUX419_MINMAX_COMPAT */
+          #if __has_include(<linux/minmax.h>)
+          #include <linux/minmax.h>
+          #else
+          #include <linux/kernel.h>
+          #endif''', 1)
+          write_changed(p, text, updated, 'sulog/event.c: legacy min/max header fallback')
+
+          # Linux 4.19 splits task-list, task-reference and init-task declarations
+          # across scheduler headers. Add any missing headers without relying on one
+          # particular include layout in the pinned KernelSU source.
+          p, text = read('supercall/dispatch.c')
+          if 'DARKNIGHT_LINUX419_SCHED_HEADERS' not in text:
+              missing = []
+              for header in ('linux/sched/signal.h', 'linux/sched/task.h', 'linux/init_task.h'):
+                  include = f'#include <{header}>\n'
+                  if include not in text:
+                      missing.append(include)
+              lines = text.splitlines(keepends=True)
+              insert_at = 1 if lines and lines[0].startswith('// SPDX-License-Identifier:') else 0
+              lines[insert_at:insert_at] = ['/* DARKNIGHT_LINUX419_SCHED_HEADERS */\n'] + missing
+              updated = ''.join(lines)
+              write_changed(p, text, updated, 'dispatch.c: include Linux 4.19 task-list and init-task declarations')
+
+
+          print('All source-level compatibility edits were applied with exact-anchor checks.')
+          PYKSU419
+
+          # Add narrowly scoped path_mount/path_umount compatibility interfaces to the
+          # actual 4.19 VFS. These wrappers intentionally support only the pinned KSU
+          # operations; they are not presented as a general new mount API backport.
+          python3 - <<'PYPATHAPI'
+          from pathlib import Path
+          import re
+          p = Path('fs/namespace.c')
+          text = p.read_text()
+          mount_marker = 'DARKNIGHT_KERNELSU_PATH_MOUNT_COMPAT'
+          umount_marker = 'DARKNIGHT_KERNELSU_PATH_UMOUNT_COMPAT'
+          if mount_marker in text or umount_marker in text:
+              raise SystemExit('Darknight path API compatibility markers already exist; refusing to insert duplicate VFS wrappers.')
+
+          mount_anchor = re.compile(r'/\*\n[ \t]*\* do loopback mount\.\n[ \t]*\*/\n', re.M)
+          mount_match = mount_anchor.search(text)
+          if not mount_match or len(mount_anchor.findall(text)) != 1:
+              raise SystemExit('fs/namespace.c: expected unique do_loopback_mount anchor after do_change_type().')
+          mount_impl = r'''/*
+           * DARKNIGHT_KERNELSU_PATH_MOUNT_COMPAT
+           * Linux 4.19 does not expose the newer path_mount() helper. The pinned
+           * KernelSU-Next caller only uses it to make the current root mount
+           * recursively private. Reject all other forms instead of faking a
+           * general new-mount API.
+           */
+          int path_mount(const char *dev_name, struct path *path,
+                         const char *type_page, unsigned long flags,
+                         void *data_page)
+          {
+              int error;
+
+              if (!path || !path->mnt || !path->dentry)
+                  return -EINVAL;
+              if (dev_name || type_page || data_page ||
+                  flags != (MS_PRIVATE | MS_REC))
+                  return -EOPNOTSUPP;
+
+              error = security_sb_mount(dev_name, path, type_page, flags, data_page);
+              if (error)
+                  return error;
+              if (!may_mount())
+                  return -EPERM;
+
+              return do_change_type(path, (int)flags);
+          }
+
+          '''
+          text = text[:mount_match.start()] + mount_impl + text[mount_match.start():]
+
+          # Put path_umount after may_mount() and do_umount() are both defined but
+          # before ksys_umount(), reusing the kernel's own mount checks and teardown.
+          umount_anchor = 'int ksys_umount(char __user *name, int flags)\n'
+          if text.count(umount_anchor) != 1:
+              raise SystemExit('fs/namespace.c: expected unique ksys_umount() anchor for path_umount compatibility.')
+          umount_impl = r'''/*
+           * DARKNIGHT_KERNELSU_PATH_UMOUNT_COMPAT
+           * The caller supplies a referenced mount-root path from kern_path().
+           * Mirror 4.19 ksys_umount's authorization, mount-root, namespace,
+           * locked-mount and forced-unmount checks, then consume that path ref.
+           */
+          int path_umount(struct path *path, int flags)
+          {
+              struct mount *mnt;
+              int retval;
+
+              if (!path || !path->mnt || !path->dentry)
+                  return -EINVAL;
+
+              mnt = real_mount(path->mnt);
+              retval = -EINVAL;
+              if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE))
+                  goto dput_and_out;
+              if (!may_mount()) {
+                  retval = -EPERM;
+                  goto dput_and_out;
+              }
+              if (path->dentry != path->mnt->mnt_root)
+                  goto dput_and_out;
+              if (!check_mnt(mnt))
+                  goto dput_and_out;
+              if (mnt->mnt.mnt_flags & MNT_LOCKED)
+                  goto dput_and_out;
+              retval = -EPERM;
+              if ((flags & MNT_FORCE) && !capable(CAP_SYS_ADMIN))
+                  goto dput_and_out;
+
+              retval = do_umount(mnt, flags);
+          dput_and_out:
+              /* Preserve mnt_expiry_mark semantics: do not use path_put(). */
+              dput(path->dentry);
+              mntput_no_expire(mnt);
+              return retval;
+          }
+
+          '''
+          text = text.replace(umount_anchor, umount_impl + umount_anchor, 1)
+          p.write_text(text)
+          print('Added narrow, checked path_mount/path_umount compatibility for pinned KernelSU-Next callers.')
+          PYPATHAPI
+
+          # Verify the source-level compatibility surface and persist exact patches.
+          grep -q 'DARKNIGHT_KERNELSU_PATH_MOUNT_COMPAT' fs/namespace.c
+          grep -q 'DARKNIGHT_KERNELSU_PATH_UMOUNT_COMPAT' fs/namespace.c
+          grep -q 'DARKNIGHT_LINUX419_FSNOTIFY_COMPAT' KernelSU-Next/kernel/manager/pkg_observer.c
+          grep -q 'DARKNIGHT_LINUX419_SECCOMP_FILTER_COUNT' KernelSU-Next/kernel/policy/app_profile.c
+          grep -q 'DARKNIGHT_LINUX419_MINMAX_COMPAT' KernelSU-Next/kernel/sulog/event.c
+          git diff --check
+          git diff --binary -- fs/namespace.c > "$GITHUB_WORKSPACE/diagnostics/kernel-4.19-path-api-compatibility.patch"
+          git -C KernelSU-Next diff --binary > "$GITHUB_WORKSPACE/diagnostics/ksu-linux419-compatibility.patch"
+          cp KernelSU-Next/kernel/manager/pkg_observer.c "$GITHUB_WORKSPACE/diagnostics/ksu-pkg_observer.c.patched"
+          cp KernelSU-Next/kernel/policy/allowlist.c "$GITHUB_WORKSPACE/diagnostics/ksu-allowlist.c.patched"
+          cp KernelSU-Next/kernel/policy/app_profile.c "$GITHUB_WORKSPACE/diagnostics/ksu-app_profile.c.patched"
+          cp KernelSU-Next/kernel/sulog/event.c "$GITHUB_WORKSPACE/diagnostics/ksu-event.c.patched"
+          cp KernelSU-Next/kernel/supercall/dispatch.c "$GITHUB_WORKSPACE/diagnostics/ksu-dispatch.c.patched"
+          cp KernelSU-Next/kernel/supercall/supercall.c "$GITHUB_WORKSPACE/diagnostics/ksu-supercall.c.patched"
+          echo 'Compatibility patches recorded and strict source markers verified.'
+
       - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
         shell: bash
         working-directory: kernel
@@ -505,6 +781,19 @@ jobs:
           # old local version (-exynos850) after olddefconfig. Refresh it now.
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" syncconfig
+
+          # Object-only preflight needs generated kernel headers just like a normal build.
+          # SELinux's flask.h is generated from classmap.h by scripts/selinux/genheaders/genheaders.
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" prepare scripts
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" security/selinux/flask.h
+          test -s security/selinux/flask.h || {
+            echo 'Generated security/selinux/flask.h is missing; refusing to run an incomplete object-only preflight.' >&2
+            exit 1
+          }
+          cp security/selinux/flask.h "$GITHUB_WORKSPACE/diagnostics/selinux-flask.h"
+
           grep -Fxq 'CONFIG_LOCALVERSION="-Darknight"' include/config/auto.conf || {
             echo 'include/config/auto.conf did not refresh CONFIG_LOCALVERSION to -Darknight.' >&2
             grep -E '^CONFIG_LOCALVERSION(=|_)' include/config/auto.conf .config || true
@@ -533,13 +822,13 @@ jobs:
           API_REPORT="$GITHUB_WORKSPACE/diagnostics/kernel-api-compatibility.txt"
           mkdir -p "$GITHUB_WORKSPACE/diagnostics"
           echo "Kernel release: $(make -s ARCH=arm64 kernelrelease)" | tee "$API_REPORT"
-          echo "Preflight mode: make -k -j2 drivers/kernelsu/; full Image build is gated on this passing." | tee -a "$API_REPORT"
+          echo "Preflight mode: make -k -j2 fs/namespace.o drivers/kernelsu/; full Image build is gated on this passing." | tee -a "$API_REPORT"
 
           # Compile the KernelSU directory first, before spending time building Image.
           # -k attempts independent objects so diagnostics capture more than one error.
           set +e
           make -k V=1 -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ 2>&1 | tee "$LOG"
+            CROSS_COMPILE="$CROSS_COMPILE" fs/namespace.o drivers/kernelsu/ 2>&1 | tee "$LOG"
           KSU_MAKE_RC=${PIPESTATUS[0]}
           set -e
           echo "KernelSU object preflight exit code: $KSU_MAKE_RC" | tee -a "$API_REPORT"
@@ -564,11 +853,11 @@ jobs:
           KSU_SRC="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
           for api in path_mount path_umount; do
             if grep -R -n --include='*.c' --include='*.h' --include='*.S' \
-              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+${api}[[:space:]]*\(" \
-              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/${api}-defs.txt"; then
+              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+$api[[:space:]]*\(" \
+              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/$api-defs.txt"; then
               echo "$api: a definition was found in the base kernel tree:" | tee -a "$API_REPORT"
-              tee -a "$API_REPORT" < "$RUNNER_TEMP/${api}-defs.txt"
-            elif grep -R -n --include='*.c' --include='*.h' "\b${api}[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
+              cat "$RUNNER_TEMP/$api-defs.txt" | tee -a "$API_REPORT"
+            elif grep -R -n --include='*.c' --include='*.h' "\b$api[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
               echo "BLOCKER: pinned KernelSU-Next references $api, but no implementation was found in the Linux 4.19 base tree." | tee -a "$API_REPORT"
               echo "A semantics-preserving port is required; refusing to guess a kernel API shim or proceed to full Image compilation." | tee -a "$API_REPORT"
               printf '%s\n' "$api" >> "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt"
@@ -583,6 +872,12 @@ jobs:
             echo 'Unresolved KernelSU kernel APIs remain; full kernel build is intentionally blocked.' >&2
             exit 1
           fi
+          {
+            echo
+            echo '--- Darknight compatibility markers in current sources ---'
+            grep -R -n --include='*.c' --include='*.h' 'DARKNIGHT_KERNELSU_PATH_\|DARKNIGHT_LINUX419_' \
+              fs/namespace.c KernelSU-Next/kernel 2>/dev/null || true
+          } >> "$API_REPORT"
           echo 'KernelSU object compile and kernel API preflight passed.'
 
       - name: Compile kernel Image
