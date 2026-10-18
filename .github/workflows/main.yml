@@ -858,11 +858,23 @@ jobs:
           grep -q 'KSU_COMPAT_USE_SELINUX_STATE' "$KSU_ROOT/kernel/feature/selinux_hide.c"
           grep -q 'compat/kernel_compat.o' "$KSU_ROOT/kernel/Kbuild"
           grep -q 'DARKNIGHT_LEGACY_SELINUX_COMPAT_PROBES' "$KSU_ROOT/kernel/Kbuild"
-          if grep -R -n -E 'ksu_dup_sepolicy|ksu_destroy_sepolicy|selinux_state\.policy_mutex|selinux_state\.status_lock|selinux_state\.status_page' \
-              "$KSU_ROOT/kernel/selinux" "$KSU_ROOT/kernel/feature/selinux_hide.c"; then
-            echo 'GKI-only SELinux policy/state references remain after compatibility backport.' >&2
+          # Do not reject every textual occurrence of newer SELinux fields/functions.
+          # The maintained compatibility sources intentionally retain some API references
+          # inside version-gated branches. A recursive grep cannot determine which branch
+          # is active for this kernel and caused a false failure before compilation.
+          # Verify that the actual build symlink resolves to the patched pinned source;
+          # the following Kbuild object preflight is the authoritative API compatibility test.
+          KSU_LINK_REAL="$(readlink -f "$GITHUB_WORKSPACE/kernel/drivers/kernelsu")"
+          KSU_ROOT_REAL="$(readlink -f "$KSU_ROOT/kernel")"
+          [[ -n "$KSU_LINK_REAL" && "$KSU_LINK_REAL" == "$KSU_ROOT_REAL" ]] || {
+            echo "drivers/kernelsu does not resolve to the patched pinned KernelSU-Next source: $KSU_LINK_REAL vs $KSU_ROOT_REAL" >&2
             exit 1
-          fi
+          }
+          for rel in kernel/selinux/rules.c kernel/selinux/sepolicy.c kernel/feature/selinux_hide.c; do
+            test -s "$KSU_ROOT/$rel" || { echo "Missing SELinux compatibility source: $rel" >&2; exit 1; }
+          done
+          grep -q 'SELINUX_POLICY_INSTEAD_SELINUX_SS' "$KSU_ROOT/kernel/selinux/rules.c"
+          grep -q 'ksu_get_real_status_page' "$KSU_ROOT/kernel/feature/selinux_hide.c"
           git -C "$KSU_ROOT" diff --check
           git -C "$KSU_ROOT" diff --binary > "$GITHUB_WORKSPACE/diagnostics/ksu-selinux-legacy-backport.patch"
           {
@@ -1310,7 +1322,7 @@ jobs:
             echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
             echo 'KernelSU 4.19 seccomp compatibility: no-op cache helpers because this kernel lacks the action-cache internals'
             echo 'Preflight: compiles KernelSU objects before full Image and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
-            echo 'SELinux compatibility: selected files are backported from an immutable upstream non-GKI compatibility commit; the requested KernelSU-Next HEAD remains pinned and driver version is still derived from its git revision count.'
+            echo 'SELinux compatibility: immutable non-GKI file backport; version-gated API references are validated by Kbuild object preflight, not raw recursive grep; KSU HEAD and revision-derived driver version remain pinned.'
             echo
             echo '--- Toolchain ---'
             if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
