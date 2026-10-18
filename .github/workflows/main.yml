@@ -1,4 +1,4 @@
-name: A13X Darknight KernelSU-Next Kernel (v10 boot-event compatibility)
+name: A13X Darknight KernelSU-Next Kernel (v11 seccomp link fix)
 
 on:
   workflow_dispatch:
@@ -552,6 +552,32 @@ jobs:
           #endif'''
           updated = text.replace(needle, replacement, 1)
           write_changed(p, text, updated, 'app_profile.c: guard filter_count for kernels that contain the field')
+          text = updated
+
+          # The pinned source calls seccomp_filter_release() unconditionally, but the
+          # exact Linux 4.19.325 tree implements put_seccomp_filter() instead. Select
+          # the kernel API by version; do not add a fake alias or unresolved symbol.
+          marker = 'DARKNIGHT_LINUX419_SECCOMP_RELEASE_COMPAT'
+          if marker in text:
+              raise SystemExit('app_profile.c seccomp-release compatibility patch already exists.')
+          decl = 'void seccomp_filter_release(struct task_struct *tsk);'
+          if text.count(decl) != 1:
+              raise SystemExit('app_profile.c: expected exactly one seccomp_filter_release declaration.')
+          guarded_decl = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+          void seccomp_filter_release(struct task_struct *tsk);
+          #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0) */'''
+          updated = text.replace(decl, guarded_decl, 1)
+          call = '    seccomp_filter_release(fake);'
+          if updated.count(call) != 1:
+              raise SystemExit('app_profile.c: expected exactly one seccomp_filter_release(fake) call.')
+          replacement_call = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+              seccomp_filter_release(fake);
+          #else
+              /* DARKNIGHT_LINUX419_SECCOMP_RELEASE_COMPAT: 4.19 provides put_seccomp_filter(). */
+              put_seccomp_filter(fake);
+          #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0) */'''
+          updated = updated.replace(call, replacement_call, 1)
+          write_changed(p, text, updated, 'app_profile.c: use put_seccomp_filter on Linux 4.19; retain seccomp_filter_release on 6.6+')
 
           # linux/minmax.h was introduced after the target 4.19 baseline; kernel.h
           # provides the legacy min/max macros used by this source.
@@ -693,6 +719,8 @@ jobs:
           grep -q 'DARKNIGHT_KERNELSU_PATH_UMOUNT_COMPAT' fs/namespace.c
           grep -q 'DARKNIGHT_LINUX419_FSNOTIFY_COMPAT' KernelSU-Next/kernel/manager/pkg_observer.c
           grep -q 'DARKNIGHT_LINUX419_SECCOMP_FILTER_COUNT' KernelSU-Next/kernel/policy/app_profile.c
+          grep -q 'DARKNIGHT_LINUX419_SECCOMP_RELEASE_COMPAT' KernelSU-Next/kernel/policy/app_profile.c
+          grep -q 'put_seccomp_filter(fake)' KernelSU-Next/kernel/policy/app_profile.c
           grep -q 'DARKNIGHT_LINUX419_MINMAX_COMPAT' KernelSU-Next/kernel/sulog/event.c
           git diff --check
           git diff --binary -- fs/namespace.c > "$GITHUB_WORKSPACE/diagnostics/kernel-4.19-path-api-compatibility.patch"
@@ -1302,6 +1330,32 @@ jobs:
             echo 'KernelSU object preflight failed; see ksu-preflight-build.log and ksu-preflight-errors.txt.' >&2
             exit "$KSU_MAKE_RC"
           fi
+
+          # Catch the exact class of late vmlinux link failure seen in the previous run.
+          # Object compilation alone does not prove that every referenced kernel API exists.
+          APP_PROFILE_OBJ='drivers/kernelsu/policy/app_profile.o'
+          test -s "$APP_PROFILE_OBJ" || {
+            echo "Expected compiled object is missing: $APP_PROFILE_OBJ" >&2
+            exit 1
+          }
+          grep -Eq '^[[:space:]]*void[[:space:]]+put_seccomp_filter[[:space:]]*\(' kernel/seccomp.c || {
+            echo 'Linux 4.19 seccomp.c does not define put_seccomp_filter(); cannot safely select the legacy API.' >&2
+            exit 1
+          }
+          NM_TOOL="$(command -v llvm-nm || command -v nm || true)"
+          [[ -n "$NM_TOOL" ]] || { echo 'Neither llvm-nm nor nm is available for the link-symbol audit.' >&2; exit 1; }
+          "$NM_TOOL" -u "$APP_PROFILE_OBJ" | tee "$GITHUB_WORKSPACE/diagnostics/app-profile-undefined-symbols.txt"
+          if grep -Eq '(^|[[:space:]])seccomp_filter_release([[:space:]]|$)' "$GITHUB_WORKSPACE/diagnostics/app-profile-undefined-symbols.txt"; then
+            echo 'BLOCKER: app_profile.o still references seccomp_filter_release, which is absent from the Linux 4.19.325 base tree.' >&2
+            echo 'The full vmlinux link is blocked to avoid repeating the previous late linker failure.' >&2
+            exit 1
+          fi
+          if ! grep -Eq '(^|[[:space:]])put_seccomp_filter([[:space:]]|$)' "$GITHUB_WORKSPACE/diagnostics/app-profile-undefined-symbols.txt"; then
+            echo 'Expected app_profile.o to use the Linux 4.19 put_seccomp_filter API, but the symbol audit did not find it.' >&2
+            exit 1
+          fi
+          echo 'Seccomp link-symbol audit passed: app_profile.o references put_seccomp_filter and does not reference seccomp_filter_release.' | tee -a "$API_REPORT"
+
           if [[ -s "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt" ]]; then
             echo 'Unresolved KernelSU kernel APIs remain; full kernel build is intentionally blocked.' >&2
             exit 1
@@ -1434,7 +1488,8 @@ jobs:
             echo "KernelSU requested ref: $KSU_REF"
             echo 'Legacy syscall hook patch: intentionally disabled; pinned KernelSU-Next revision owns its dispatcher hooks'
             echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
-            echo 'KernelSU 4.19 seccomp compatibility: no-op cache helpers because this kernel lacks the action-cache internals'
+            echo 'KernelSU 4.19 seccomp compatibility: legacy put_seccomp_filter selected; seccomp_filter_release is kept only for kernel 6.6+'
+            echo 'Link-level preflight audits app_profile.o for missing seccomp_filter_release before full vmlinux build'
             echo 'Preflight: compiles KernelSU objects before full Image and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
             echo 'SELinux compatibility: immutable non-GKI file backport; exact upstream bytes/hashes are preserved separately, working copies have trailing horizontal whitespace normalized, and APIs are validated by Kbuild object preflight; KSU HEAD and revision-derived driver version remain pinned.'
             echo
