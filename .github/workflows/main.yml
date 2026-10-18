@@ -31,7 +31,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl jq shellcheck tar gzip
+          sudo apt-get install -y curl jq tar gzip xz-utils
 
       - name: Download latest actionlint release
         shell: bash
@@ -52,6 +52,37 @@ jobs:
           test -x "$RUNNER_TEMP/actionlint/actionlint"
           echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/actionlint/actionlint" -version
+
+      - name: Download latest ShellCheck release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL --retry 3 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/koalaman/shellcheck/releases/latest \
+            -o "$RUNNER_TEMP/shellcheck-release.json"
+          SHELLCHECK_TAG="$(jq -r '.tag_name // empty' "$RUNNER_TEMP/shellcheck-release.json")"
+          ASSET_URL="$(jq -r '[.assets[] | select(.name | endswith(".linux.x86_64.tar.xz"))][0].browser_download_url // empty' "$RUNNER_TEMP/shellcheck-release.json")"
+          if [[ -z "$SHELLCHECK_TAG" || -z "$ASSET_URL" ]]; then
+            echo 'Could not locate the latest ShellCheck Linux x86_64 release asset.' >&2
+            jq -r '.assets[].name' "$RUNNER_TEMP/shellcheck-release.json" >&2 || true
+            exit 1
+          fi
+          curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/shellcheck.tar.xz"
+          mkdir -p "$RUNNER_TEMP/shellcheck"
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP/shellcheck"
+          SHELLCHECK_BIN="$(find "$RUNNER_TEMP/shellcheck" -type f -name shellcheck -perm /111 -print -quit)"
+          [[ -n "$SHELLCHECK_BIN" && -x "$SHELLCHECK_BIN" ]] || {
+            echo 'The downloaded ShellCheck archive contains no executable shellcheck binary.' >&2
+            find "$RUNNER_TEMP/shellcheck" -maxdepth 5 -type f -print | sort >&2 || true
+            exit 1
+          }
+          SHELLCHECK_BIN_DIR="$(dirname "$SHELLCHECK_BIN")"
+          echo "$SHELLCHECK_BIN_DIR" >> "$GITHUB_PATH"
+          export PATH="$SHELLCHECK_BIN_DIR:$PATH"
+          echo "Installed latest ShellCheck release: $SHELLCHECK_TAG"
+          shellcheck --version
 
       - name: Lint all GitHub Actions workflows and embedded shell
         shell: bash
@@ -533,11 +564,11 @@ jobs:
           KSU_SRC="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
           for api in path_mount path_umount; do
             if grep -R -n --include='*.c' --include='*.h' --include='*.S' \
-              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+$api[[:space:]]*\(" \
-              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/$api-defs.txt"; then
+              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+${api}[[:space:]]*\(" \
+              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/${api}-defs.txt"; then
               echo "$api: a definition was found in the base kernel tree:" | tee -a "$API_REPORT"
-              cat "$RUNNER_TEMP/$api-defs.txt" | tee -a "$API_REPORT"
-            elif grep -R -n --include='*.c' --include='*.h' "\b$api[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
+              tee -a "$API_REPORT" < "$RUNNER_TEMP/${api}-defs.txt"
+            elif grep -R -n --include='*.c' --include='*.h' "\b${api}[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
               echo "BLOCKER: pinned KernelSU-Next references $api, but no implementation was found in the Linux 4.19 base tree." | tee -a "$API_REPORT"
               echo "A semantics-preserving port is required; refusing to guess a kernel API shim or proceed to full Image compilation." | tee -a "$API_REPORT"
               printf '%s\n' "$api" >> "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt"
