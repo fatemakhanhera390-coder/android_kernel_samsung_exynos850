@@ -828,7 +828,10 @@ jobs:
           cp scripts/sortextable.c "$GITHUB_WORKSPACE/diagnostics/sortextable.c.patched"
           cp init/Kconfig.gki "$GITHUB_WORKSPACE/diagnostics/Kconfig.gki.patched"
           grep -Fq 'CONFIG_INIT_STACK_ALL_ZERO=y' arch/arm64/configs/exynos850-a13nsxx_defconfig
-          ! grep -Fq 'CONFIG_INIT_STACK_NONE=y' arch/arm64/configs/exynos850-a13nsxx_defconfig
+          if grep -Fq 'CONFIG_INIT_STACK_NONE=y' arch/arm64/configs/exynos850-a13nsxx_defconfig; then
+            echo 'Conflicting CONFIG_INIT_STACK_NONE=y remains in the target defconfig.' >&2
+            exit 1
+          fi
           grep -Eq '^[[:space:]]*select DRM_GEM_CMA_HELPER if \(HAS_IOMEM && DRM\)$' init/Kconfig.gki
           grep -Eq '^[[:space:]]*select DRM_MIPI_DSI if \(HAS_IOMEM && DRM\)$' init/Kconfig.gki
 
