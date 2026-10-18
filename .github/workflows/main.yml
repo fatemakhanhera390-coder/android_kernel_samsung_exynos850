@@ -2,17 +2,6 @@ name: A13X Darknight KernelSU-Next Kernel
 
 on:
   workflow_dispatch:
-    inputs:
-      neutron_tag:
-        description: 'Neutron Clang release tag (06092026 = Clang 24.0.0git)'
-        required: true
-        type: string
-        default: '06092026'
-      ksu_ref:
-        description: 'KernelSU-Next commit/ref (default is the requested 33333 driver baseline)'
-        required: true
-        type: string
-        default: '8f902ae'
   push:
     branches:
       - main
@@ -25,7 +14,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  workflow-preflight:
+    name: Validate workflow and shell before kernel build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install lint dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq shellcheck tar gzip
+
+      - name: Download latest actionlint release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL --retry 3 https://api.github.com/repos/rhysd/actionlint/releases/latest \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' -o "$RUNNER_TEMP/actionlint-release.json"
+          ASSET_URL="$(jq -r '[.assets[] | select(.name | test("linux_amd64[.]tar[.]gz$"))][0].browser_download_url // empty' "$RUNNER_TEMP/actionlint-release.json")"
+          if [[ -z "$ASSET_URL" ]]; then
+            echo 'Could not locate the latest actionlint linux_amd64 tar.gz release asset.' >&2
+            jq -r '.assets[].name' "$RUNNER_TEMP/actionlint-release.json" >&2 || true
+            exit 1
+          fi
+          curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/actionlint.tar.gz"
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint"
+          test -x "$RUNNER_TEMP/actionlint/actionlint"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/actionlint/actionlint" -version
+
+      - name: Lint all GitHub Actions workflows and embedded shell
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          actionlint -color -oneline .github/workflows/main.yml
+
   build:
+    needs: workflow-preflight
     name: Build A13X Darknight + KernelSU-Next + AnyKernel3
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -37,13 +72,17 @@ jobs:
       CROSS_COMPILE: aarch64-linux-gnu-
       LLVM: '1'
       LLVM_IAS: '1'
-      NEUTRON_TAG: ${{ inputs.neutron_tag || '06092026' }}
-      KSU_REF: ${{ inputs.ksu_ref || '8f902ae' }}
+      # These two versions are intentionally pinned to the user's requirements.
+      # Other CI utilities/actions are updated independently.
+      NEUTRON_TAG: '06092026'
+      KSU_REF: '8f902aeb16033024143ae36cf711df902cf02fae'
+      EXPECTED_KSU_COMMIT: '8f902aeb16033024143ae36cf711df902cf02fae'
       KSU_REPO: KernelSU-Next/KernelSU-Next
+      KERNEL_BUILD_JOBS: '2'
 
     steps:
       - name: Checkout A13 kernel source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850
           ref: lineage-24.0
@@ -157,6 +196,10 @@ jobs:
           test -d KernelSU-Next/.git
           KSU_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
           echo "KernelSU-Next commit: $KSU_COMMIT" | tee "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
+          if [[ "$KSU_COMMIT" != "$EXPECTED_KSU_COMMIT" ]]; then
+            echo "Pinned KernelSU-Next commit mismatch: got $KSU_COMMIT, expected $EXPECTED_KSU_COMMIT" >&2
+            exit 1
+          fi
           echo "Requested KernelSU-Next ref: $KSU_REF" >> "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
           git -C KernelSU-Next status --short >> "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
           # KernelSU-Next at this pinned revision uses its own syscall dispatcher / tracepoint
@@ -319,6 +362,41 @@ jobs:
           grep -q 'void ksu_seccomp_clear_cache(struct seccomp_filter \*filter, int nr)' "$KSU_FILE"
           echo 'KernelSU-Next legacy seccomp-cache compatibility patch verified and saved in diagnostics.'
 
+      - name: Fix legacy mount-flags header include for Linux 4.19
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          FILE="KernelSU-Next/kernel/infra/su_mount_ns.c"
+          test -f "$FILE" || { echo "Expected pinned KernelSU source not found: $FILE" >&2; exit 1; }
+          python3 - "$FILE" <<'PYMOUNT'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          s = p.read_text()
+          old = '#include <uapi/linux/mount.h>'
+          lines = [
+              '#if __has_include(<uapi/linux/mount.h>)',
+              '#include <uapi/linux/mount.h>',
+              '#else',
+              '/* Linux 4.19 vendor tree keeps MS_* mount flags in uapi/linux/fs.h. */',
+              '#include <uapi/linux/fs.h>',
+              '#endif',
+          ]
+          new = '/* DARKNIGHT_MOUNT_FLAGS_HEADER_FALLBACK */\n' + '\n'.join(lines) + '\n'
+          if 'DARKNIGHT_MOUNT_FLAGS_HEADER_FALLBACK' in s:
+              raise SystemExit('Mount header fallback already present; refusing to patch twice.')
+          if s.count(old) != 1:
+              raise SystemExit('Expected exactly one <uapi/linux/mount.h> include in su_mount_ns.c; inspect source before patching.')
+          p.write_text(s.replace(old, new, 1))
+          print('Applied conditional UAPI mount-flags header fallback.')
+          PYMOUNT
+          git -C KernelSU-Next diff --check
+          git -C KernelSU-Next diff --binary -- kernel/infra/su_mount_ns.c \
+            > "$GITHUB_WORKSPACE/diagnostics/ksu-mount-header-fallback.patch"
+          cp "$FILE" "$GITHUB_WORKSPACE/diagnostics/ksu-su_mount_ns.c.patched"
+          grep -q 'DARKNIGHT_MOUNT_FLAGS_HEADER_FALLBACK' "$FILE"
+
       - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
         shell: bash
         working-directory: kernel
@@ -415,6 +493,67 @@ jobs:
           grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' .config \
             > "$GITHUB_WORKSPACE/diagnostics/config-summary.txt" || true
 
+      - name: Preflight KernelSU objects and report compatibility blockers
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          LOG="$GITHUB_WORKSPACE/diagnostics/ksu-preflight-build.log"
+          API_REPORT="$GITHUB_WORKSPACE/diagnostics/kernel-api-compatibility.txt"
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+          echo "Kernel release: $(make -s ARCH=arm64 kernelrelease)" | tee "$API_REPORT"
+          echo "Preflight mode: make -k -j2 drivers/kernelsu/; full Image build is gated on this passing." | tee -a "$API_REPORT"
+
+          # Compile the KernelSU directory first, before spending time building Image.
+          # -k attempts independent objects so diagnostics capture more than one error.
+          set +e
+          make -k V=1 -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" drivers/kernelsu/ 2>&1 | tee "$LOG"
+          KSU_MAKE_RC=${PIPESTATUS[0]}
+          set -e
+          echo "KernelSU object preflight exit code: $KSU_MAKE_RC" | tee -a "$API_REPORT"
+
+          python3 - "$LOG" "$GITHUB_WORKSPACE/diagnostics/ksu-preflight-errors.txt" <<'PYERR'
+          from pathlib import Path
+          import re, sys
+          src = Path(sys.argv[1]).read_text(errors='replace').splitlines()
+          out = []
+          pat = re.compile(r'(?:fatal error:|\berror:|undefined reference to|No such file or directory|make(?:\[[0-9]+\])?: \*\*\*|Error [0-9]+|LLVM ERROR:)')
+          for i, line in enumerate(src):
+              if pat.search(line):
+                  out.append(f'--- line {i+1} ---')
+                  for j in range(max(0, i-2), min(len(src), i+4)):
+                      out.append(f'{j+1}: {src[j]}')
+          Path(sys.argv[2]).write_text('\n'.join(out) + ('\n' if out else 'No compiler/linker/make errors detected in KSU preflight log.\n'))
+          print(f'Wrote {len(out)} diagnostic lines to {sys.argv[2]}')
+          PYERR
+
+          # Detect APIs referenced by the pinned KSU tree but not implemented in this 4.19 kernel.
+          # This is a safety gate: never invent a prototype for a missing kernel implementation.
+          KSU_SRC="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
+          for api in path_mount path_umount; do
+            if grep -R -n --include='*.c' --include='*.h' --include='*.S' \
+              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+$api[[:space:]]*\(" \
+              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/$api-defs.txt"; then
+              echo "$api: a definition was found in the base kernel tree:" | tee -a "$API_REPORT"
+              cat "$RUNNER_TEMP/$api-defs.txt" | tee -a "$API_REPORT"
+            elif grep -R -n --include='*.c' --include='*.h' "\b$api[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
+              echo "BLOCKER: pinned KernelSU-Next references $api, but no implementation was found in the Linux 4.19 base tree." | tee -a "$API_REPORT"
+              echo "A semantics-preserving port is required; refusing to guess a kernel API shim or proceed to full Image compilation." | tee -a "$API_REPORT"
+              printf '%s\n' "$api" >> "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt"
+            fi
+          done
+
+          if [[ "$KSU_MAKE_RC" -ne 0 ]]; then
+            echo 'KernelSU object preflight failed; see ksu-preflight-build.log and ksu-preflight-errors.txt.' >&2
+            exit "$KSU_MAKE_RC"
+          fi
+          if [[ -s "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt" ]]; then
+            echo 'Unresolved KernelSU kernel APIs remain; full kernel build is intentionally blocked.' >&2
+            exit 1
+          fi
+          echo 'KernelSU object compile and kernel API preflight passed.'
+
       - name: Compile kernel Image
         shell: bash
         working-directory: kernel
@@ -425,9 +564,9 @@ jobs:
             echo "Neutron tag: $NEUTRON_TAG"
             clang --version
             ld.lld --version
-            echo "Command: make V=1 -j$(nproc --all) ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image (CONFIG_LOCALVERSION is set to -Darknight in .config)"
+            echo "Command: make V=1 -j${KERNEL_BUILD_JOBS} ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image (CONFIG_LOCALVERSION is set to -Darknight in .config)"
           } | tee "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
-          make V=1 -j"$(nproc --all)" ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+          make V=1 -j"$KERNEL_BUILD_JOBS" ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" Image 2>&1 | tee -a "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
           test -s arch/arm64/boot/Image
           file arch/arm64/boot/Image | tee "$GITHUB_WORKSPACE/diagnostics/kernel-image-file.txt"
@@ -502,7 +641,7 @@ jobs:
           (cd "$GITHUB_WORKSPACE" && sha256sum A13X-Darknight-KernelSU-Next-AnyKernel3.zip > sha256sum.txt)
 
       - name: Upload flashable kernel ZIP and build info
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: A13X-Darknight-KernelSU-Next-AnyKernel3
           path: |
@@ -536,6 +675,7 @@ jobs:
             echo 'Legacy syscall hook patch: intentionally disabled; pinned KernelSU-Next revision owns its dispatcher hooks'
             echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
             echo 'KernelSU 4.19 seccomp compatibility: no-op cache helpers because this kernel lacks the action-cache internals'
+            echo 'Preflight: compiles KernelSU objects before full Image and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
             echo
             echo '--- Toolchain ---'
             if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
@@ -580,23 +720,63 @@ jobs:
             echo 'Kernel .config was not generated.' > "$DIAG/config-summary.txt"
           fi
 
+          : > "$DIAG/errors-summary.txt"
+          for log in "$DIAG"/*.log; do
+            [[ -f "$log" ]] || continue
+            {
+              echo "===== $(basename "$log") ====="
+              grep -nE -i '(^|[[:space:]])(fatal )?error:|error generated|errors? generated|make\[[0-9]+\]: \*\*\*|Error [0-9]+|undefined reference to|No such file or directory|LLVM ERROR:|Broken pipe|warning:' "$log" || true
+              echo
+            } >> "$DIAG/errors-summary.txt"
+          done
           if [[ -f "$DIAG/kernel-build.log" ]]; then
-            grep -nE -i '(^|[[:space:]])(fatal )?error:|error generated|errors? generated|make\[[0-9]+\]: \*\*\*|Error [0-9]+|Broken pipe|warning:' \
-              "$DIAG/kernel-build.log" > "$DIAG/errors-summary.txt" || true
             tail -n 250 "$DIAG/kernel-build.log" > "$DIAG/kernel-build-last-250-lines.txt" || true
-          else
-            echo 'Compilation log was not created; failure occurred before compile.' > "$DIAG/errors-summary.txt"
           fi
+          python3 - "$DIAG" <<'PYDIAG'
+          from pathlib import Path
+          import re, sys
+          d = Path(sys.argv[1])
+          sources = [p for p in d.glob('*.log') if p.is_file()]
+          primary = []
+          warnings = []
+          broken = 0
+          error_pat = re.compile(r'(:\d+(?::\d+)?:\s*(?:fatal )?error:|undefined reference to|No such file or directory|make(?:\[[0-9]+\])?: \*\*\*|Error [0-9]+|LLVM ERROR:)')
+          for p in sources:
+              lines = p.read_text(errors='replace').splitlines()
+              for i, line in enumerate(lines):
+                  if 'Broken pipe' in line:
+                      broken += 1
+                      continue
+                  if error_pat.search(line):
+                      ctx = lines[max(0, i-1):min(len(lines), i+3)]
+                      primary.append((p.name, i+1, '\n'.join(ctx)))
+                  elif 'warning:' in line.lower():
+                      warnings.append(f'{p.name}:{i+1}: {line}')
+          seen = set()
+          out = []
+          for name, line_no, block in primary:
+              key = (name, block)
+              if key in seen:
+                  continue
+              seen.add(key)
+              out.extend([f'[{name}:{line_no}]', block, ''])
+          if not out:
+              out = ['No matching compiler/linker/make errors found in captured logs.']
+          out += ['', f'Broken-pipe messages (possibly secondary): {broken}', f'Warnings captured: {len(warnings)}', 'See errors-summary.txt and individual logs for full context.']
+          (d/'primary-errors.txt').write_text('\n'.join(out) + '\n')
+          (d/'warnings-summary.txt').write_text('\n'.join(warnings) + ('\n' if warnings else 'No warnings captured.\n'))
+          print(f'Primary diagnostic blocks: {len(seen)}; warnings: {len(warnings)}; broken pipes: {broken}')
+          PYDIAG
           {
             echo 'Diagnostics files:'
             find "$DIAG" -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
             echo
-            echo 'Includes toolchain info, source commit/diffs, KernelSU source/version/hook-manager inspection, kernel config, compile log, errors, and last 250 lines where available.'
+            echo 'Includes toolchain info, source commit/diffs, KernelSU source/version/hook-manager inspection, config, KSU preflight compile, kernel compile, grouped primary errors, warnings, and full logs.'
           } > "$DIAG/README.txt"
 
       - name: Upload build diagnostics (always, including failures)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: A13X-Darknight-Build-Diagnostics-${{ github.run_id }}
           path: diagnostics/
