@@ -107,6 +107,7 @@ jobs:
       KSU_REF: '8f902aeb16033024143ae36cf711df902cf02fae'
       EXPECTED_KSU_COMMIT: '8f902aeb16033024143ae36cf711df902cf02fae'
       KSU_REPO: KernelSU-Next/KernelSU-Next
+      KSU_LEGACY_SELINUX_COMPAT_REF: 'd51ca52c6d370d8e9d62aabde10e41f17ff3ae94'
       KERNEL_BUILD_JOBS: '2'
 
     steps:
@@ -704,6 +705,176 @@ jobs:
           cp KernelSU-Next/kernel/supercall/supercall.c "$GITHUB_WORKSPACE/diagnostics/ksu-supercall.c.patched"
           echo 'Compatibility patches recorded and strict source markers verified.'
 
+      - name: Backport maintained non-GKI SELinux compatibility files (keep pinned KSU HEAD)
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          KSU_ROOT="$GITHUB_WORKSPACE/kernel/KernelSU-Next"
+          DIAG="$GITHUB_WORKSPACE/diagnostics/legacy-selinux-port"
+          mkdir -p "$DIAG"
+
+          EXPECTED_DEV='8f902aeb16033024143ae36cf711df902cf02fae'
+          COMPAT_REF="$KSU_LEGACY_SELINUX_COMPAT_REF"
+          ACTUAL_DEV="$(git -C "$KSU_ROOT" rev-parse HEAD)"
+          [[ "$ACTUAL_DEV" == "$EXPECTED_DEV" ]] || {
+            echo "Refusing SELinux backport: pinned KernelSU-Next HEAD changed: $ACTUAL_DEV" >&2
+            exit 1
+          }
+          [[ "$COMPAT_REF" == 'd51ca52c6d370d8e9d62aabde10e41f17ff3ae94' ]] || {
+            echo "Unexpected compatibility source ref: $COMPAT_REF" >&2
+            exit 1
+          }
+          REV_COUNT="$(git -C "$KSU_ROOT" rev-list --count HEAD)"
+          DRIVER_VERSION="$((30000 + REV_COUNT))"
+          [[ "$REV_COUNT" == '3333' && "$DRIVER_VERSION" == '33333' ]] || {
+            echo "Pinned driver's real revision-derived version changed: count=$REV_COUNT version=$DRIVER_VERSION" >&2
+            exit 1
+          }
+
+          # The pinned dev/GKI SELinux files use post-5.10 selinux_policy fields,
+          # while this target is a non-GKI Linux 4.19 tree. Select only the
+          # maintained compatibility-layer files from an immutable upstream commit;
+          # do NOT check out/switch the KernelSU-Next repository branch.
+          files=(
+            kernel/compat/kernel_compat.c
+            kernel/compat/kernel_compat.h
+            kernel/selinux/rules.c
+            kernel/selinux/selinux.c
+            kernel/selinux/selinux.h
+            kernel/selinux/sepolicy.c
+            kernel/selinux/sepolicy.h
+            kernel/feature/selinux_hide.c
+            kernel/feature/selinux_hide.h
+          )
+          {
+            echo "Pinned KernelSU-Next dev HEAD: $ACTUAL_DEV"
+            echo "Pinned KernelSU-Next git revision count: $REV_COUNT"
+            echo "Real revision-derived driver version: $DRIVER_VERSION"
+            echo "Selected upstream non-GKI compatibility source commit: $COMPAT_REF"
+            echo 'Compatibility method: file-level SELinux/non-GKI backport only; repository HEAD/branch stays pinned to the requested dev commit.'
+            echo 'SUSFS: not added.'
+            echo
+          } | tee "$DIAG/PROVENANCE.txt"
+
+          for rel in "${files[@]}"; do
+            target="$KSU_ROOT/$rel"
+            tmp="$RUNNER_TEMP/ksu-legacy-$(basename "$rel").tmp"
+            url="https://raw.githubusercontent.com/${KSU_REPO}/${COMPAT_REF}/${rel}"
+            mkdir -p "$(dirname "$target")" "$DIAG/$(dirname "$rel")"
+            echo "Fetching pinned compatibility source: $url"
+            curl --fail --location --silent --show-error --retry 3 --retry-all-errors "$url" -o "$tmp"
+            test -s "$tmp" || { echo "Empty compatibility source: $rel" >&2; exit 1; }
+            install -m 0644 "$tmp" "$target"
+            cp "$target" "$DIAG/$rel"
+            sha256sum "$target" | tee -a "$DIAG/SHA256SUMS.txt"
+          done
+
+          # Make Kbuild include the compatibility object and detect which APIs
+          # truly exist in the target Linux 4.19 tree. These guards match the
+          # upstream legacy compatibility implementation and prevent duplicate
+          # path_mount definitions when the base-tree compatibility patch provides it.
+          python3 - "$KSU_ROOT/kernel/Kbuild" <<'PYKBUILD'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          src = p.read_text()
+          original = src
+          marker = 'DARKNIGHT_LEGACY_SELINUX_COMPAT_PROBES'
+          if marker in src:
+              raise SystemExit('Kbuild compatibility probe marker already exists; refusing a duplicate insertion.')
+
+          object_line = 'kernelsu-objs += compat/kernel_compat.o\n'
+          object_anchor = 'kernelsu-objs := core/init.o\n'
+          if src.count(object_anchor) != 1:
+              raise SystemExit('Could not find exactly one Kbuild core/init.o anchor.')
+          if object_line in src:
+              raise SystemExit('compat/kernel_compat.o is already listed; inspect Kbuild instead of duplicating it.')
+          src = src.replace(object_anchor, object_anchor + object_line, 1)
+
+          block = '''# DARKNIGHT_LEGACY_SELINUX_COMPAT_PROBES
+          # Feature detection from the maintained KernelSU-Next non-GKI compatibility layer.
+          ifeq ($(shell grep -q "current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_CURRENT_SID
+          endif
+          ifeq ($(shell grep -q "struct selinux_state " $(srctree)/security/selinux/include/security.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_USE_SELINUX_STATE
+          endif
+          ifeq ($(shell grep -q "^DEFINE_RWLOCK(policy_rwlock);" $(srctree)/security/selinux/ss/services.c; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK
+          endif
+          ifeq ($(shell grep -q "cpus_ptr;" $(srctree)/include/linux/sched.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_BACKPORTED_CPUS_PTR
+          endif
+          ifeq ($(shell grep -q "strncpy_from_user_nofault" $(srctree)/include/linux/uaccess.h; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_STRNCPY
+          endif
+          ifeq ($(shell grep -q "ssize_t kernel_read" $(srctree)/fs/read_write.c; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_KERNEL_READ
+          endif
+          ifeq ($(shell grep "ssize_t kernel_write" $(srctree)/fs/read_write.c | grep -q "const void"; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_KERNEL_WRITE
+          endif
+          ifeq ($(shell grep -q "int path_mount" $(srctree)/fs/namespace.c; echo $$?),0)
+          ccflags-y += -DKSU_HAS_PATH_MOUNT
+          endif
+          ifeq ($(shell grep -q "int path_umount" $(srctree)/fs/namespace.c; echo $$?),0)
+          ccflags-y += -DKSU_HAS_PATH_UMOUNT
+          endif
+          ifneq ($(shell grep -wq "put_seccomp_filter" $(srctree)/kernel/seccomp.c $(srctree)/include/linux/seccomp.h; echo $$?),0)
+          ifeq ($(shell grep -wq "seccomp_filter_release" $(srctree)/kernel/seccomp.c $(srctree)/include/linux/seccomp.h; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_SECCOMP_FILTER_RELEASE
+          endif
+          endif
+          ifeq ($(shell grep -q "security_inode_init_security_anon" $(srctree)/include/linux/security.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_INIT_SEC_ANON
+          endif
+          ifeq ($(shell grep -q "CONFIG_KDP_CRED" $(srctree)/kernel/cred.c; echo $$?),0)
+          ccflags-y += -DSAMSUNG_UH_DRIVER_EXIST
+          endif
+          ifeq ($(shell grep -q "SEC_SELINUX_PORTING_COMMON" $(srctree)/security/selinux/avc.c; echo $$?),0)
+          ccflags-y += -DSAMSUNG_SELINUX_PORTING
+          endif
+          '''
+          # Dedent the embedded Makefile fragment without depending on workflow indentation.
+          import textwrap
+          block = textwrap.dedent(block)
+          kbuild_anchor = '# Keep a new line here!! Because someone may append config'
+          if src.count(kbuild_anchor) != 1:
+              raise SystemExit('Could not find exactly one Kbuild end anchor for compatibility probes.')
+          src = src.replace(kbuild_anchor, block + '\n' + kbuild_anchor, 1)
+          if src == original:
+              raise SystemExit('Kbuild changes were not applied.')
+          if src.count(object_line) != 1 or src.count(marker) != 1:
+              raise SystemExit('Kbuild postcondition failed: duplicate or missing compatibility entries.')
+          p.write_text(src)
+          print('Added compat/kernel_compat.o and one guarded Linux API feature-detection block.')
+          PYKBUILD
+
+          # Verify that the non-GKI implementations were selected, and that all
+          # GKI-only policy-cloning structure references are gone from this layer.
+          grep -q 'KSU_COMPAT_USE_SELINUX_STATE' "$KSU_ROOT/kernel/selinux/rules.c"
+          grep -q 'KSU_COMPAT_USE_SELINUX_STATE' "$KSU_ROOT/kernel/feature/selinux_hide.c"
+          grep -q 'compat/kernel_compat.o' "$KSU_ROOT/kernel/Kbuild"
+          grep -q 'DARKNIGHT_LEGACY_SELINUX_COMPAT_PROBES' "$KSU_ROOT/kernel/Kbuild"
+          if grep -R -n -E 'ksu_dup_sepolicy|ksu_destroy_sepolicy|selinux_state\.policy_mutex|selinux_state\.status_lock|selinux_state\.status_page' \
+              "$KSU_ROOT/kernel/selinux" "$KSU_ROOT/kernel/feature/selinux_hide.c"; then
+            echo 'GKI-only SELinux policy/state references remain after compatibility backport.' >&2
+            exit 1
+          fi
+          git -C "$KSU_ROOT" diff --check
+          git -C "$KSU_ROOT" diff --binary > "$GITHUB_WORKSPACE/diagnostics/ksu-selinux-legacy-backport.patch"
+          {
+            echo "KSU HEAD after file-level backport: $(git -C "$KSU_ROOT" rev-parse HEAD)"
+            echo "KSU revision count after file-level backport: $(git -C "$KSU_ROOT" rev-list --count HEAD)"
+            echo "Driver version after file-level backport: $((30000 + $(git -C "$KSU_ROOT" rev-list --count HEAD)))"
+            echo 'SELinux source backport provenance and per-file hashes: legacy-selinux-port/PROVENANCE.txt and legacy-selinux-port/SHA256SUMS.txt'
+          } | tee -a "$DIAG/PROVENANCE.txt"
+          [[ "$(git -C "$KSU_ROOT" rev-parse HEAD)" == "$EXPECTED_DEV" ]]
+          [[ "$((30000 + $(git -C "$KSU_ROOT" rev-list --count HEAD)))" == '33333' ]]
+          echo 'SELinux non-GKI file-level compatibility backport applied; pinned HEAD and revision-derived driver version preserved.'
+
       - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
         shell: bash
         working-directory: kernel
@@ -1139,6 +1310,7 @@ jobs:
             echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
             echo 'KernelSU 4.19 seccomp compatibility: no-op cache helpers because this kernel lacks the action-cache internals'
             echo 'Preflight: compiles KernelSU objects before full Image and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
+            echo 'SELinux compatibility: selected files are backported from an immutable upstream non-GKI compatibility commit; the requested KernelSU-Next HEAD remains pinned and driver version is still derived from its git revision count.'
             echo
             echo '--- Toolchain ---'
             if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
