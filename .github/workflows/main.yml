@@ -1,4 +1,4 @@
-name: A13X Darknight KernelSU-Next Kernel
+name: A13X Darknight KernelSU-Next Kernel (v10 boot-event compatibility)
 
 on:
   workflow_dispatch:
@@ -811,6 +811,74 @@ jobs:
             printf 'normalized  ' >> "$DIAG/SHA256SUMS.txt"
             sha256sum "$target" | tee -a "$DIAG/SHA256SUMS.txt"
           done
+
+          # Compatibility bridge: the pinned dev runtime still calls
+          # ksu_selinux_hide_drop_backup_if_unused(), but the maintained legacy
+          # non-GKI selinux_hide implementation no longer owns backup_sepolicy.
+          # Verify that the legacy implementation has no backup object; only then
+          # provide the semantically correct no-op bridge and restore its prototype.
+          python3 - "$KSU_ROOT/kernel/feature/selinux_hide.c" "$KSU_ROOT/kernel/feature/selinux_hide.h" "$DIAG/selinux-hide-backup-bridge.txt" <<'PYBRIDGE'
+          from pathlib import Path
+          import re, sys
+
+          c_path, h_path, report_path = map(Path, sys.argv[1:])
+          c_src = c_path.read_text()
+          h_src = h_path.read_text()
+          symbol = 'ksu_selinux_hide_drop_backup_if_unused'
+
+          if 'backup_sepolicy' in c_src:
+              raise SystemExit('Refusing no-op bridge: legacy selinux_hide.c unexpectedly references backup_sepolicy.')
+          if symbol in c_src or symbol in h_src:
+              raise SystemExit('Backup-cleanup bridge already exists in compatibility source; refusing duplicate patch.')
+
+          header_anchor = 'void ksu_selinux_hide_exit();\n'
+          if h_src.count(header_anchor) != 1:
+              raise SystemExit('Could not locate exactly one selinux_hide.h prototype anchor.')
+          h_src = h_src.replace(
+              header_anchor,
+              header_anchor + 'void ksu_selinux_hide_drop_backup_if_unused(void);\n',
+              1,
+          )
+
+          function = """\n/*
+           * Compatibility bridge for the pinned dev-branch boot_event.c.
+           * The selected maintained non-GKI implementation does not create or
+           * own backup_sepolicy, so there is no backup object to release here.
+           * Keep the cross-file API available without touching SELinux state.
+           */
+          void ksu_selinux_hide_drop_backup_if_unused(void)
+          {
+          }
+          """
+          # Use an explicit column-zero function definition in the actual C file.
+          function = function.lstrip('\n')
+          if not c_src.endswith('\n'):
+              c_src += '\n'
+          c_src += '\n' + function
+
+          if h_src.count(symbol) != 1:
+              raise SystemExit('Backup-cleanup prototype postcondition failed.')
+          if len(re.findall(r'\bvoid\s+' + symbol + r'\s*\(void\s*\)', c_src)) != 1:
+              raise SystemExit('Backup-cleanup compatibility definition postcondition failed.')
+          c_path.write_text(c_src)
+          h_path.write_text(h_src)
+          report_path.write_text(
+              'Bridge: ksu_selinux_hide_drop_backup_if_unused(void)\n'
+              'Reason: pinned runtime/boot_event.c calls this API, but the selected '
+              'legacy non-GKI SELinux-hide implementation does not own/create backup_sepolicy.\n'
+              'Action: restored the header prototype and supplied a documented no-op.\n'
+              'Safety guard: patch refuses to apply if backup_sepolicy exists in the selected legacy implementation.\n'
+              'Runtime SELinux/root behavior still requires device validation.\n'
+          )
+          print('Added guarded backup-cleanup compatibility bridge for pinned boot_event.c.')
+          PYBRIDGE
+          cp "$KSU_ROOT/kernel/feature/selinux_hide.c" "$DIAG/kernel/feature/selinux_hide.c"
+          cp "$KSU_ROOT/kernel/feature/selinux_hide.h" "$DIAG/kernel/feature/selinux_hide.h"
+          git -C "$KSU_ROOT" diff --binary -- kernel/feature/selinux_hide.c kernel/feature/selinux_hide.h \
+            > "$DIAG/selinux-hide-backup-bridge.patch"
+          grep -q 'ksu_selinux_hide_drop_backup_if_unused(void)' "$KSU_ROOT/kernel/feature/selinux_hide.h"
+          grep -q 'void ksu_selinux_hide_drop_backup_if_unused(void)' "$KSU_ROOT/kernel/feature/selinux_hide.c"
+          cat "$DIAG/selinux-hide-backup-bridge.txt"
 
           # Make Kbuild include the compatibility object and detect which APIs
           # truly exist in the target Linux 4.19 tree. These guards match the
