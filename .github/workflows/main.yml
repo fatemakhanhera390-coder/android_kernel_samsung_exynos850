@@ -853,11 +853,11 @@ jobs:
           KSU_SRC="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
           for api in path_mount path_umount; do
             if grep -R -n --include='*.c' --include='*.h' --include='*.S' \
-              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+$api[[:space:]]*\(" \
-              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/$api-defs.txt"; then
+              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+${api}[[:space:]]*\(" \
+              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/${api}-defs.txt"; then
               echo "$api: a definition was found in the base kernel tree:" | tee -a "$API_REPORT"
-              cat "$RUNNER_TEMP/$api-defs.txt" | tee -a "$API_REPORT"
-            elif grep -R -n --include='*.c' --include='*.h' "\b$api[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
+              tee -a "$API_REPORT" < "$RUNNER_TEMP/${api}-defs.txt"
+            elif grep -R -n --include='*.c' --include='*.h' "\b${api}[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
               echo "BLOCKER: pinned KernelSU-Next references $api, but no implementation was found in the Linux 4.19 base tree." | tee -a "$API_REPORT"
               echo "A semantics-preserving port is required; refusing to guess a kernel API shim or proceed to full Image compilation." | tee -a "$API_REPORT"
               printf '%s\n' "$api" >> "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt"
