@@ -735,11 +735,109 @@ jobs:
           git diff --binary -- "$FILE" > "$GITHUB_WORKSPACE/diagnostics/touchscreen-source-fix.patch"
           cp "$FILE" "$GITHUB_WORKSPACE/diagnostics/ovt_tcm_sec_fn_test.c.patched"
 
+
+      - name: Fix known legacy host-tool warnings and conflicting defconfig choice
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/diagnostics/host-tool-warning-fixes.log") 2>&1
+          python3 - <<'PYWARN'
+          from pathlib import Path
+          import re
+
+          # Apply only verified, narrowly scoped fixes:
+          # - remove the unused legacy DTC lexer state and assignment;
+          # - annotate only sortextable dispatch pointers that are set but unused
+          #   for this host build;
+          # - remove the conflicting INIT_STACK_NONE choice while preserving ZERO;
+          # - gate GKI hidden DRM helper selects on their real DRM dependencies.
+
+          lexer = Path("scripts/dtc/dtc-lexer.l")
+          src = lexer.read_text()
+          src, decl_count = re.subn(
+              r"(?m)^[ \t]*static int dts_version = 1;[ \t]*$", "", src, count=1
+          )
+          if decl_count != 1:
+              raise SystemExit("Expected exactly one unused dts_version declaration in scripts/dtc/dtc-lexer.l.")
+          src, assign_count = re.subn(
+              r"(?m)^[ \t]*dts_version = 1;[ \t]*$", "", src, count=1
+          )
+          if assign_count != 1:
+              raise SystemExit("Expected exactly one unused dts_version assignment in scripts/dtc/dtc-lexer.l.")
+          if "dts_version" in src:
+              raise SystemExit("dts_version references remain after the targeted DTC warning fix.")
+          lexer.write_text(src)
+
+          sortextable = Path("scripts/sortextable.c")
+          src = sortextable.read_text()
+          for name, typ in (("w8", "uint64_t"), ("w2", "uint16_t")):
+              pat = re.compile(
+                  rf"(?m)^([ \t]*static void \(\*{re.escape(name)}\)\({typ}, {typ} \*\))[ \t]*;$"
+              )
+              src, count = pat.subn(r"\1 __attribute__((unused));", src, count=1)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one {name} function-pointer declaration in scripts/sortextable.c.")
+          sortextable.write_text(src)
+
+          defconfig = Path("arch/arm64/configs/exynos850-a13nsxx_defconfig")
+          src = defconfig.read_text()
+          lines = src.splitlines(keepends=True)
+          none_lines = [line for line in lines if line.rstrip("\r\n") == "CONFIG_INIT_STACK_NONE=y"]
+          zero_lines = [line for line in lines if line.rstrip("\r\n") == "CONFIG_INIT_STACK_ALL_ZERO=y"]
+          if len(none_lines) != 1 or len(zero_lines) != 1:
+              raise SystemExit("Expected exactly one INIT_STACK_NONE=y and one INIT_STACK_ALL_ZERO=y choice in the target defconfig.")
+          src = "".join(line for line in lines if line.rstrip("\r\n") != "CONFIG_INIT_STACK_NONE=y")
+          defconfig.write_text(src)
+
+          kconfig = Path("init/Kconfig.gki")
+          src = kconfig.read_text()
+          block_match = re.search(
+              r"(?ms)^config GKI_HIDDEN_DRM_CONFIGS[ \t]*\n.*?(?=^(?:config|menuconfig)[ \t]+[A-Z0-9_]+[ \t]*$|\Z)",
+              src,
+          )
+          if not block_match:
+              raise SystemExit("Could not find the GKI_HIDDEN_DRM_CONFIGS Kconfig block.")
+          block = block_match.group(0)
+          for symbol in ("DRM_GEM_CMA_HELPER", "DRM_MIPI_DSI"):
+              plain = re.compile(rf"(?m)^([ \t]*select {symbol})[ \t]*$")
+              guarded = re.compile(
+                  rf"(?m)^([ \t]*select {symbol}[ \t]+if[ \t]*\([ \t]*HAS_IOMEM[ \t]*&&[ \t]*DRM[ \t]*\))[ \t]*$"
+              )
+              plain_count = len(plain.findall(block))
+              guarded_count = len(guarded.findall(block))
+              if plain_count == 1 and guarded_count == 0:
+                  block, count = plain.subn(r"\1 if (HAS_IOMEM && DRM)", block, count=1)
+                  if count != 1:
+                      raise SystemExit(f"Failed to guard select {symbol} with its direct DRM dependencies.")
+              elif plain_count == 0 and guarded_count == 1:
+                  pass  # Already patched in this working tree; keep the patch idempotent.
+              else:
+                  raise SystemExit(f"Unexpected {symbol} select pattern in GKI_HIDDEN_DRM_CONFIGS; refusing an unverified Kconfig edit.")
+          src = src[:block_match.start()] + block + src[block_match.end():]
+          kconfig.write_text(src)
+
+          print("Applied targeted host-warning fixes and guarded GKI DRM helper selects with (HAS_IOMEM && DRM).")
+          print("Preserved CONFIG_INIT_STACK_ALL_ZERO=y and removed the conflicting CONFIG_INIT_STACK_NONE=y.")
+          PYWARN
+          git diff --check
+          git diff --binary -- scripts/dtc/dtc-lexer.l scripts/sortextable.c \
+            arch/arm64/configs/exynos850-a13nsxx_defconfig init/Kconfig.gki \
+            > "$GITHUB_WORKSPACE/diagnostics/host-warning-fixes.patch"
+          cp scripts/dtc/dtc-lexer.l "$GITHUB_WORKSPACE/diagnostics/dtc-lexer.l.patched"
+          cp scripts/sortextable.c "$GITHUB_WORKSPACE/diagnostics/sortextable.c.patched"
+          cp init/Kconfig.gki "$GITHUB_WORKSPACE/diagnostics/Kconfig.gki.patched"
+          grep -Fq 'CONFIG_INIT_STACK_ALL_ZERO=y' arch/arm64/configs/exynos850-a13nsxx_defconfig
+          ! grep -Fq 'CONFIG_INIT_STACK_NONE=y' arch/arm64/configs/exynos850-a13nsxx_defconfig
+          grep -Eq '^[[:space:]]*select DRM_GEM_CMA_HELPER if \(HAS_IOMEM && DRM\)$' init/Kconfig.gki
+          grep -Eq '^[[:space:]]*select DRM_MIPI_DSI if \(HAS_IOMEM && DRM\)$' init/Kconfig.gki
+
       - name: Configure kernel and verify KSU config
         shell: bash
         working-directory: kernel
         run: |
           set -Eeuo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/diagnostics/configure-build.log") 2>&1
           test -f Makefile
           test -f "arch/arm64/configs/$DEFCONFIG"
           SOURCE_VERSION="$(make -s kernelversion)"
@@ -782,17 +880,37 @@ jobs:
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" syncconfig
 
-          # Object-only preflight needs generated kernel headers just like a normal build.
-          # SELinux's flask.h is generated from classmap.h by scripts/selinux/genheaders/genheaders.
+          # Generate host tools and standard kernel headers first.
           make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
             CROSS_COMPILE="$CROSS_COMPILE" prepare scripts
-          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
-            CROSS_COMPILE="$CROSS_COMPILE" security/selinux/flask.h
+
+          # Linux 4.19's SELinux Makefile defines this as a subdirectory-local
+          # target ($(obj)/flask.h), so asking the top-level Makefile directly for
+          # security/selinux/flask.h can fail with "No rule to make target".
+          # Run the exact generator command from security/selinux/Makefile instead.
+          SELINUX_GENHDR="scripts/selinux/genheaders/genheaders"
+          test -x "$SELINUX_GENHDR" || {
+            echo "SELinux genheaders host tool was not built: $SELINUX_GENHDR" >&2
+            exit 1
+          }
+          "$SELINUX_GENHDR" security/selinux/flask.h security/selinux/av_permissions.h
           test -s security/selinux/flask.h || {
-            echo 'Generated security/selinux/flask.h is missing; refusing to run an incomplete object-only preflight.' >&2
+            echo 'SELinux flask.h generation failed.' >&2
+            exit 1
+          }
+          test -s security/selinux/av_permissions.h || {
+            echo 'SELinux av_permissions.h generation failed.' >&2
             exit 1
           }
           cp security/selinux/flask.h "$GITHUB_WORKSPACE/diagnostics/selinux-flask.h"
+          cp security/selinux/av_permissions.h "$GITHUB_WORKSPACE/diagnostics/selinux-av_permissions.h"
+
+          # Verify that the patched lexer source was regenerated before host DTC
+          # compilation; do not silently accept a stale generated file.
+          if grep -q 'dts_version' scripts/dtc/dtc-lexer.lex.c; then
+            echo 'Generated dtc-lexer.lex.c still contains the removed unused dts_version state; lexer regeneration did not occur.' >&2
+            exit 1
+          fi
 
           grep -Fxq 'CONFIG_LOCALVERSION="-Darknight"' include/config/auto.conf || {
             echo 'include/config/auto.conf did not refresh CONFIG_LOCALVERSION to -Darknight.' >&2
@@ -810,8 +928,24 @@ jobs:
           echo "$KRELEASE" | tee "$GITHUB_WORKSPACE/diagnostics/kernelrelease.txt"
           [[ "$KRELEASE" == "4.19.325-Darknight" ]] || { echo "Unexpected kernel release: $KRELEASE (expected exactly 4.19.325-Darknight)" >&2; exit 1; }
           cp .config "$GITHUB_WORKSPACE/diagnostics/kernel.config"
-          grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' .config \
+          grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO|GKI_HIDDEN_DRM_CONFIGS|DRM|DRM_MIPI_DSI|DRM_GEM_CMA_HELPER)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' .config \
             > "$GITHUB_WORKSPACE/diagnostics/config-summary.txt" || true
+
+          # Validate that the targeted Kconfig select guards actually resolved the
+          # unmet-dependency warnings without enabling DRM or disabling the whole GKI
+          # hidden-config umbrella.
+          if grep -Fxq 'CONFIG_GKI_HIDDEN_DRM_CONFIGS=y' .config && \
+             ! grep -Fxq 'CONFIG_DRM=y' .config; then
+            for symbol in CONFIG_DRM_MIPI_DSI CONFIG_DRM_GEM_CMA_HELPER; do
+              if grep -Fxq "${symbol}=y" .config; then
+                echo "Kconfig dependency guard failed: ${symbol}=y while CONFIG_DRM is unset." >&2
+                echo "See init/Kconfig.gki compatibility patch and configure-build.log." >&2
+                exit 1
+              fi
+            done
+            echo 'Kconfig dependency guard validated: hidden DRM helper symbols remain disabled while DRM=n.' \
+              | tee "$GITHUB_WORKSPACE/diagnostics/kconfig-drm-guard.txt"
+          fi
 
       - name: Preflight KernelSU objects and report compatibility blockers
         shell: bash
@@ -1051,7 +1185,7 @@ jobs:
             [[ -f "$log" ]] || continue
             {
               echo "===== $(basename "$log") ====="
-              grep -nE -i '(^|[[:space:]])(fatal )?error:|error generated|errors? generated|make\[[0-9]+\]: \*\*\*|Error [0-9]+|undefined reference to|No such file or directory|LLVM ERROR:|Broken pipe|warning:' "$log" || true
+              grep -nE -i '(^|[[:space:]])(fatal )?error:|error generated|errors? generated|make(:|\[[0-9]+\]:) \*\*\*|No rule to make target|Error [0-9]+|undefined reference to|No such file or directory|LLVM ERROR:|Broken pipe|warning:|WARNING: unmet direct dependencies|warning: override:' "$log" || true
               echo
             } >> "$DIAG/errors-summary.txt"
           done
@@ -1066,7 +1200,7 @@ jobs:
           primary = []
           warnings = []
           broken = 0
-          error_pat = re.compile(r'(:\d+(?::\d+)?:\s*(?:fatal )?error:|undefined reference to|No such file or directory|make(?:\[[0-9]+\])?: \*\*\*|Error [0-9]+|LLVM ERROR:)')
+          error_pat = re.compile(r'(?i)(?::\d+(?::\d+)?:\s*(?:fatal )?error:|undefined reference to|No such file or directory|No rule to make target|make(?:\[[0-9]+\])?: \*\*\*|Error [0-9]+|LLVM ERROR:|error generated|errors generated)')
           for p in sources:
               lines = p.read_text(errors='replace').splitlines()
               for i, line in enumerate(lines):
