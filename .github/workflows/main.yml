@@ -1,134 +1,1645 @@
-name: M21 OneUI Grass Kernel Build
+name: A13X Darknight KernelSU-Next Kernel (v12 workflow and integration audit)
 
 on:
   workflow_dispatch:
-    inputs:
-      source_ref:
-        description: 'Grass Kernel branch or tag to build'
-        required: true
-        default: 'Grass-Unified2'
-        type: string
-      expected_kernel_version:
-        description: 'Expected result of make -s kernelversion (current branch previously reported 4.14.264)'
-        required: true
-        default: '4.14.264'
-        type: string
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 concurrency:
-  group: m21-oneui-kernel-${{ github.ref }}
-  cancel-in-progress: false
+  group: a13x-darknight-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build M21 / One UI kernel
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
-    env:
-      SOURCE_REF: ${{ inputs.source_ref }}
-      EXPECTED_KERNEL_VERSION: ${{ inputs.expected_kernel_version }}
-
+  workflow-preflight:
+    name: Validate workflow and shell before kernel build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - name: Install build dependencies
+      - name: Checkout workflow repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install lint dependencies
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bash bc bison build-essential cpio curl file flex git \
-            libelf-dev libncurses-dev libssl-dev lz4 make m4 \
-            automake autoconf libtool perl pkg-config python3 \
-            python-is-python3 rsync unzip zip
+          sudo apt-get install -y curl jq tar gzip xz-utils
 
-      - name: Clone selected Grass Kernel source (with submodules)
+      - name: Download and verify latest ShellCheck release
+        shell: bash
         run: |
-          set -euxo pipefail
-          test -n "$SOURCE_REF"
-          git clone --depth=1 --recurse-submodules --single-branch \
-            --branch "$SOURCE_REF" \
-            https://github.com/ghazzor/grass_kernel.git kernel-src
-          cd kernel-src
-          git submodule status --recursive
-          echo "Source ref: $SOURCE_REF" >> "$GITHUB_STEP_SUMMARY"
-          echo "Source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify the real source kernel version
-        working-directory: kernel-src
-        run: |
-          set -euo pipefail
-          VERSION="$(make -s kernelversion)"
-          echo "Source kernel version: $VERSION"
-          {
-            echo '### Source validation'
-            echo "- Requested ref: $SOURCE_REF"
-            echo "- Actual kernel version: $VERSION"
-            echo "- Expected kernel version: $EXPECTED_KERNEL_VERSION"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$VERSION" != "$EXPECTED_KERNEL_VERSION" ]; then
-            echo "::error::Source is $VERSION, not the requested expected version $EXPECTED_KERNEL_VERSION. Choose a branch/tag whose Makefile really reports that version; do not edit the version string to bypass this check."
+          set -Eeuo pipefail
+          API_URL="https://api.github.com/repos/koalaman/shellcheck/releases/latest"
+          curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' "$API_URL" \
+            -o "$RUNNER_TEMP/shellcheck-release.json"
+          ASSET_URL="$(jq -r '[.assets[] | select(.name | test("linux[.]x86_64[.]tar[.]xz$"))][0].browser_download_url // empty' "$RUNNER_TEMP/shellcheck-release.json")"
+          if [[ -z "$ASSET_URL" ]]; then
+            echo 'Could not locate latest official ShellCheck linux.x86_64 tar.xz asset.' >&2
+            jq -r '.assets[].name' "$RUNNER_TEMP/shellcheck-release.json" >&2 || true
             exit 1
           fi
+          curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/shellcheck.tar.xz"
+          mkdir -p "$RUNNER_TEMP/shellcheck"
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP/shellcheck"
+          SHELLCHECK_BIN="$(find "$RUNNER_TEMP/shellcheck" -type f -name shellcheck -perm /111 -print -quit)"
+          [[ -n "$SHELLCHECK_BIN" && -x "$SHELLCHECK_BIN" ]] || {
+            echo 'ShellCheck executable was not found in the official release archive.' >&2
+            find "$RUNNER_TEMP/shellcheck" -maxdepth 4 -type f -print >&2 || true
+            exit 1
+          }
+          mkdir -p "$RUNNER_TEMP/shellcheck-bin"
+          ln -sfn "$SHELLCHECK_BIN" "$RUNNER_TEMP/shellcheck-bin/shellcheck"
+          echo "$RUNNER_TEMP/shellcheck-bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/shellcheck-bin:$PATH"
+          shellcheck --version
 
-      - name: Install the toolchain and build M21 One UI kernel
-        working-directory: kernel-src
+      - name: Download latest actionlint release
         shell: bash
         run: |
-          set -euo pipefail
-          # The Grass Kernel README documents this version-pinned setup script.
-          bash <(curl -fsSL \
-            'https://gist.githubusercontent.com/roynatech2544/0feeeb35a6d1782b186990ff2a0b3657/raw/b170134a94dac3594df506716bc7b802add2724b/setup.sh')
+          set -Eeuo pipefail
+          curl -fsSL --retry 3 https://api.github.com/repos/rhysd/actionlint/releases/latest \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' -o "$RUNNER_TEMP/actionlint-release.json"
+          ASSET_URL="$(jq -r '[.assets[] | select(.name | test("linux_amd64[.]tar[.]gz$"))][0].browser_download_url // empty' "$RUNNER_TEMP/actionlint-release.json")"
+          if [[ -z "$ASSET_URL" ]]; then
+            echo 'Could not locate the latest actionlint linux_amd64 tar.gz release asset.' >&2
+            jq -r '.assets[].name' "$RUNNER_TEMP/actionlint-release.json" >&2 || true
+            exit 1
+          fi
+          curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/actionlint.tar.gz"
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint"
+          test -x "$RUNNER_TEMP/actionlint/actionlint"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/actionlint/actionlint" -version
 
-          # Standard M21 + KernelSU + One UI build; this does not modify the
-          # kernel version or patch any external/precompiled module.
-          DEVICE=m21 KSU=1 ROM=oneui ./build_kernel.sh
-
-      - name: Validate outputs and create build manifest
-        working-directory: kernel-src
+      - name: Lint all GitHub Actions workflows and embedded shell
         shell: bash
         run: |
-          set -euo pipefail
-          test -s out/arch/arm64/boot/Image || {
-            echo '::error::Kernel Image was not produced.'
+          set -Eeuo pipefail
+          # Do not hard-code main.yml: the uploaded workflow may be named
+          # main-darknight-preflight-v11-1.yml or another valid workflow filename.
+          mapfile -t WORKFLOW_FILES < <(
+            find .github/workflows -maxdepth 1 -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) -print | sort
+          )
+          if (( ${#WORKFLOW_FILES[@]} == 0 )); then
+            echo 'No .yml/.yaml workflow files found under .github/workflows.' >&2
+            exit 1
+          fi
+          printf 'Linting workflow files:\n'
+          printf '  %s\n' "${WORKFLOW_FILES[@]}"
+          actionlint -color -oneline "${WORKFLOW_FILES[@]}"
+
+  build:
+    needs: workflow-preflight
+    name: Build A13X Darknight + KernelSU-Next + AnyKernel3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      KERNEL_REPO: Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850
+      KERNEL_BRANCH: lineage-24.0
+      DEFCONFIG: exynos850-a13nsxx_defconfig
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      LLVM: '1'
+      LLVM_IAS: '1'
+      # These two versions are intentionally pinned to the user's requirements.
+      # Other CI utilities/actions are updated independently.
+      NEUTRON_TAG: '06092026'
+      KSU_REF: '8f902aeb16033024143ae36cf711df902cf02fae'
+      EXPECTED_KSU_COMMIT: '8f902aeb16033024143ae36cf711df902cf02fae'
+      KSU_REPO: KernelSU-Next/KernelSU-Next
+      KSU_LEGACY_SELINUX_COMPAT_REF: 'd51ca52c6d370d8e9d62aabde10e41f17ff3ae94'
+      KERNEL_BUILD_JOBS: '2'
+
+    steps:
+      - name: Checkout A13 kernel source
+        uses: actions/checkout@v7
+        with:
+          repository: Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850
+          ref: lineage-24.0
+          path: kernel
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize diagnostics directory
+        if: always()
+        shell: bash
+        run: mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio curl flex git jq \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libelf-dev libncurses-dev libssl-dev python3 python-is-python3 \
+            rsync dwarves zstd lz4 zip unzip file
+
+      - name: Download Neutron Clang 24 release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/diagnostics/toolchain-install.log") 2>&1
+          [[ "$NEUTRON_TAG" =~ ^[0-9]{8}$ ]] || {
+            echo "Invalid Neutron tag: $NEUTRON_TAG (expected DDMMYYYY)" >&2
+            exit 1
+          }
+          API_URL="https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/tags/${NEUTRON_TAG}"
+          curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' "$API_URL" \
+            -o "$RUNNER_TEMP/neutron-release.json"
+          ASSET_URL="$(jq -r '[.assets[] | select(.name | endswith(".tar.zst"))][0].browser_download_url // empty' "$RUNNER_TEMP/neutron-release.json")"
+          if [[ -z "$ASSET_URL" || "$ASSET_URL" == null ]]; then
+            echo "No .tar.zst Neutron Clang asset found for tag $NEUTRON_TAG" >&2
+            jq -r '.assets[].name' "$RUNNER_TEMP/neutron-release.json" || true
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/neutron-clang"
+          curl -fL --retry 3 "$ASSET_URL" -o "$RUNNER_TEMP/neutron-clang.tar.zst"
+          tar --zstd -xf "$RUNNER_TEMP/neutron-clang.tar.zst" -C "$RUNNER_TEMP/neutron-clang"
+
+          # Some Neutron catalogue archives ship the compiler as clang-24 rather than clang.
+          # Find both regular files and symlinks, then expose the conventional LLVM=1 tool names.
+          CLANG_BIN=""
+          for candidate in clang clang-24 clang-24.0 clang-24.0.0 clang-24.0.0git; do
+            CLANG_BIN="$(find "$RUNNER_TEMP/neutron-clang" \( -type f -o -type l \) \
+              -path '*/bin/*' -name "$candidate" -print -quit)"
+            [[ -n "$CLANG_BIN" ]] && break
+          done
+          [[ -n "$CLANG_BIN" && -x "$CLANG_BIN" ]] || {
+            echo "Could not locate executable clang or clang-24 inside release asset." >&2
+            find "$RUNNER_TEMP/neutron-clang" \( -type f -o -type l \) -maxdepth 5 -print | sort | head -250 || true
             exit 1
           }
 
-          shopt -s nullglob
-          zips=(kernel_zip/GRASS*.zip)
-          if (( ${#zips[@]} == 0 )); then
-            echo '::error::No kernel_zip/GRASS*.zip flashable archive was produced.'
-            echo 'Check the full build log and the source README for the packaging output path.'
+          TOOLCHAIN_BIN="$(dirname "$CLANG_BIN")"
+          if [[ "$(basename "$CLANG_BIN")" != "clang" ]]; then
+            ln -sfn "$(basename "$CLANG_BIN")" "$TOOLCHAIN_BIN/clang"
+          fi
+
+          # Supply conventional aliases for version-suffixed LLVM tools where needed.
+          for tool in clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-ranlib llvm-size llvm-strings llvm-cov; do
+            if [[ ! -x "$TOOLCHAIN_BIN/$tool" ]]; then
+              for suffix in -24 -24.0 -24.0.0 -24.0.0git; do
+                if [[ -x "$TOOLCHAIN_BIN/${tool}${suffix}" ]]; then
+                  ln -sfn "${tool}${suffix}" "$TOOLCHAIN_BIN/$tool"
+                  break
+                fi
+              done
+            fi
+          done
+          # Compiler packages may provide only clang-24, not clang++-24.
+          if [[ ! -x "$TOOLCHAIN_BIN/clang++" ]]; then
+            ln -sfn "$(basename "$CLANG_BIN")" "$TOOLCHAIN_BIN/clang++"
+          fi
+          [[ -x "$TOOLCHAIN_BIN/ld.lld" ]] || {
+            echo "Could not locate ld.lld in $TOOLCHAIN_BIN" >&2
+            find "$RUNNER_TEMP/neutron-clang" \( -type f -o -type l \) -path '*/bin/*' -print | sort | head -250 || true
+            exit 1
+          }
+
+          echo "$TOOLCHAIN_BIN" >> "$GITHUB_PATH"
+          echo "NEUTRON_CLANG_BIN=$TOOLCHAIN_BIN" >> "$GITHUB_ENV"
+          # GITHUB_PATH takes effect in following steps only; update this shell as well.
+          export PATH="$TOOLCHAIN_BIN:$PATH"
+          echo "Using compiler at: $(command -v clang)"
+          clang --version
+          ld.lld --version
+          clang --version | grep -Eq 'version 24\.0\.0git' || {
+            echo "Expected Clang 24.0.0git from tag 06092026; actual compiler version differs." >&2
+            exit 1
+          }
+
+      - name: Integrate pinned KernelSU-Next (no SUSFS)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_REF}/kernel/setup.sh" \
+            -o "$RUNNER_TEMP/ksu-setup.sh"
+          cd "$GITHUB_WORKSPACE/kernel"
+          bash "$RUNNER_TEMP/ksu-setup.sh" "$KSU_REF" 2>&1 | tee "$GITHUB_WORKSPACE/diagnostics/ksu-setup.log"
+          test -L drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+          test -f drivers/kernelsu/Makefile
+          test -d KernelSU-Next/.git
+          KSU_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
+          echo "KernelSU-Next commit: $KSU_COMMIT" | tee "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
+          if [[ "$KSU_COMMIT" != "$EXPECTED_KSU_COMMIT" ]]; then
+            echo "Pinned KernelSU-Next commit mismatch: got $KSU_COMMIT, expected $EXPECTED_KSU_COMMIT" >&2
+            exit 1
+          fi
+          echo "Requested KernelSU-Next ref: $KSU_REF" >> "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
+          git -C KernelSU-Next status --short >> "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
+          # KernelSU-Next at this pinned revision uses its own syscall dispatcher / tracepoint
+          # hook manager. Do NOT apply the older backslashxx legacy manual-call-site script:
+          # it expects APIs such as ksu_handle_execveat that this revision does not export.
+          KSU_REV_COUNT="$(git -C KernelSU-Next rev-list --count HEAD)"
+          KSU_DRIVER_VERSION="$((30000 + KSU_REV_COUNT))"
+          {
+            echo "KernelSU-Next commit: $KSU_COMMIT"
+            echo "KernelSU-Next git revision count: $KSU_REV_COUNT"
+            echo "Calculated KernelSU driver version: $KSU_DRIVER_VERSION"
+            echo "Expected manager/driver baseline: 33333"
+            echo 'Integration model: KernelSU-Next syscall dispatcher + syscall tracepoint hook manager'
+            echo 'Legacy syscall_hook_patches.sh: intentionally NOT applied (API mismatch with this KSU-Next revision)'
+          } | tee "$GITHUB_WORKSPACE/diagnostics/ksu-version-info.txt"
+          if [[ "$KSU_DRIVER_VERSION" != "33333" ]]; then
+            echo "KernelSU driver version mismatch: calculated $KSU_DRIVER_VERSION, expected 33333. Refuse to build an incompatible image." >&2
+            exit 1
+          fi
+          for source in kernel/hook/syscall_hook_manager.c kernel/hook/syscall_event_bridge.c kernel/hook/arm64/syscall_hook.c kernel/feature/sucompat.c; do
+            test -s "KernelSU-Next/$source" || { echo "Required KernelSU-Next source missing: $source" >&2; exit 1; }
+          done
+          grep -q 'ksu_syscall_hook_manager_init' KernelSU-Next/kernel/hook/syscall_hook_manager.c
+          grep -q 'register_trace_prio_sys_enter' KernelSU-Next/kernel/hook/syscall_hook_manager.c
+          grep -q 'ksu_register_syscall_hook(__NR_execveat' KernelSU-Next/kernel/hook/syscall_hook_manager.c
+          echo 'Pinned KernelSU-Next dispatcher integration sources verified.'
+
+      - name: Patch KernelSU-Next VFS operations for the Samsung 4.19.325 tree
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          KSU_FILE="KernelSU-Next/kernel/infra/file_wrapper.c"
+          test -f "$KSU_FILE" || { echo "KernelSU file_wrapper.c not found: $KSU_FILE" >&2; exit 1; }
+          python3 - "$KSU_FILE" <<'PYVFS'
+          from pathlib import Path
+          import re, sys
+
+          path = Path(sys.argv[1])
+          src = path.read_text()
+          original = src
+
+          # The target Samsung Exynos850 4.19.325 vendor tree lacks these
+          # optional struct file_operations members. Remove only their wrappers.
+          src, iopoll_block = re.subn(
+              r'#if LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 1, 0\)\n'
+              r'static int ksu_wrapper_iopoll\b.*?^#endif[ \t]*\n',
+              '', src, count=1, flags=re.S | re.M
+          )
+          if iopoll_block != 1:
+              raise SystemExit('Expected KernelSU-Next iopoll wrapper block not found exactly once; refusing unsafe patch.')
+
+          src, iopoll_assignment = re.subn(
+              r'^\s*p->ops\.iopoll = fp->f_op->iopoll \? ksu_wrapper_iopoll : NULL;\s*\n',
+              '', src, count=1, flags=re.M
+          )
+          if iopoll_assignment != 1:
+              raise SystemExit('Expected iopoll assignment not found exactly once.')
+
+          src, remap_helper = re.subn(
+              r'^// no REMAP_FILE_DEDUP: use file_in\n.*?(?=^static int ksu_wrapper_fadvise\b)',
+              '', src, count=1, flags=re.S | re.M
+          )
+          if remap_helper != 1:
+              raise SystemExit('Expected remap_file_range wrapper block not found exactly once.')
+
+          src, remap_assignment = re.subn(
+              r'^\s*p->ops\.remap_file_range =\n'
+              r'\s*fp->f_op->remap_file_range \? ksu_wrapper_remap_file_range : NULL;\s*\n',
+              '', src, count=1, flags=re.M
+          )
+          if remap_assignment != 1:
+              raise SystemExit('Expected remap_file_range assignment not found exactly once.')
+
+          marker = '#include "infra/file_wrapper.h"\n'
+          comment = (
+              '\n/* Darknight target compatibility: the Samsung Exynos850 4.19.325 vendor tree\n'
+              ' * omits file_operations.iopoll and file_operations.remap_file_range.\n'
+              ' * The corresponding optional callbacks are omitted; other KernelSU-Next\n'
+              ' * file-wrapper operations remain unchanged.\n'
+              ' */\n'
+          )
+          if marker not in src:
+              raise SystemExit('Cannot locate stable include marker for compatibility note.')
+          if 'Darknight target compatibility:' not in src:
+              src = src.replace(marker, marker + comment, 1)
+
+          if src == original:
+              raise SystemExit('No KernelSU compatibility changes were made.')
+          path.write_text(src)
+          print('Applied 4.19 VFS compatibility patch: omitted iopoll/remap_file_range callbacks only.')
+          PYVFS
+          git -C KernelSU-Next diff --check
+          git -C KernelSU-Next diff --binary -- kernel/infra/file_wrapper.c \
+            > "$GITHUB_WORKSPACE/diagnostics/ksu-4.19-vfs-compatibility.patch"
+          cp "$KSU_FILE" "$GITHUB_WORKSPACE/diagnostics/ksu-file_wrapper.c.patched"
+          grep -q 'Darknight target compatibility:' "$KSU_FILE"
+          if grep -Eq 'p->ops\.iopoll|fp->f_op->iopoll|p->ops\.remap_file_range|fp->f_op->remap_file_range|REMAP_FILE_DEDUP' "$KSU_FILE"; then
+            echo 'Unsupported VFS callback references remain in KernelSU file_wrapper.c.' >&2
+            exit 1
+          fi
+          echo 'KernelSU VFS compatibility patch verified and saved in diagnostics.'
+
+      - name: Add Linux 4.19 seccomp-cache compatibility stubs
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          KSU_FILE="KernelSU-Next/kernel/infra/seccomp_cache.c"
+          test -f "$KSU_FILE" || { echo "KernelSU seccomp_cache.c not found: $KSU_FILE" >&2; exit 1; }
+          python3 - "$KSU_FILE" <<'PYSECCOMP'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          src = path.read_text()
+          marker = "DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS"
+          if marker in src:
+              raise SystemExit("Darknight seccomp compatibility wrapper is already present; refusing to wrap twice.")
+          if "SECCOMP_ARCH_NATIVE_NR" not in src or "ksu_seccomp_allow_cache" not in src or "ksu_seccomp_clear_cache" not in src:
+              raise SystemExit("KernelSU-Next seccomp_cache.c differs from the expected pinned source; refusing an unverified patch.")
+
+          prefix = """/*
+           * DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS
+           * Linux 4.19 has no SECCOMP_ARCH_NATIVE_NR/action-cache implementation.
+           * KernelSU-Next's newer seccomp_cache.c mirrors private seccomp_filter
+           * internals that do not exist in this kernel. Never fake the missing
+           * structure/NR definitions: the offsets would be unsafe at runtime.
+           * The helpers are no-ops when the target kernel has no seccomp action cache.
+           */
+          #include <linux/version.h>
+          #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+          #include <linux/seccomp.h>
+          #include "infra/seccomp_cache.h"
+
+          void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+
+          void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+          #else
+          """
+          suffix = "\n#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) */\n"
+          path.write_text(prefix + src + suffix)
+          print("Applied Darknight legacy seccomp-cache compatibility: no-op helpers for Linux < 5.15; original implementation retained for newer kernels.")
+          PYSECCOMP
+
+          git -C KernelSU-Next diff --check
+          git -C KernelSU-Next diff --binary -- kernel/infra/seccomp_cache.c \
+            > "$GITHUB_WORKSPACE/diagnostics/ksu-legacy-seccomp-cache-compatibility.patch"
+          cp "$KSU_FILE" "$GITHUB_WORKSPACE/diagnostics/ksu-seccomp_cache.c.patched"
+          grep -q 'DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS' "$KSU_FILE"
+          grep -q 'void ksu_seccomp_allow_cache(struct seccomp_filter \*filter, int nr)' "$KSU_FILE"
+          grep -q 'void ksu_seccomp_clear_cache(struct seccomp_filter \*filter, int nr)' "$KSU_FILE"
+          echo 'KernelSU-Next legacy seccomp-cache compatibility patch verified and saved in diagnostics.'
+
+      - name: Fix legacy mount-flags header include for Linux 4.19
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          FILE="KernelSU-Next/kernel/infra/su_mount_ns.c"
+          test -f "$FILE" || { echo "Expected pinned KernelSU source not found: $FILE" >&2; exit 1; }
+          python3 - "$FILE" <<'PYMOUNT'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          s = p.read_text()
+          old = '#include <uapi/linux/mount.h>'
+          lines = [
+              '#if __has_include(<uapi/linux/mount.h>)',
+              '#include <uapi/linux/mount.h>',
+              '#else',
+              '/* Linux 4.19 vendor tree keeps MS_* mount flags in uapi/linux/fs.h. */',
+              '#include <uapi/linux/fs.h>',
+              '#endif',
+          ]
+          new = '/* DARKNIGHT_MOUNT_FLAGS_HEADER_FALLBACK */\n' + '\n'.join(lines) + '\n'
+          if 'DARKNIGHT_MOUNT_FLAGS_HEADER_FALLBACK' in s:
+              raise SystemExit('Mount header fallback already present; refusing to patch twice.')
+          if s.count(old) != 1:
+              raise SystemExit('Expected exactly one <uapi/linux/mount.h> include in su_mount_ns.c; inspect source before patching.')
+          p.write_text(s.replace(old, new, 1))
+          print('Applied conditional UAPI mount-flags header fallback.')
+          PYMOUNT
+          git -C KernelSU-Next diff --check
+          git -C KernelSU-Next diff --binary -- kernel/infra/su_mount_ns.c \
+            > "$GITHUB_WORKSPACE/diagnostics/ksu-mount-header-fallback.patch"
+          cp "$FILE" "$GITHUB_WORKSPACE/diagnostics/ksu-su_mount_ns.c.patched"
+          grep -q 'DARKNIGHT_MOUNT_FLAGS_HEADER_FALLBACK' "$FILE"
+
+      - name: Apply validated KernelSU compatibility fixes for Linux 4.19.325
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYKSU419'
+          from pathlib import Path
+          import re
+
+          KSU = Path('KernelSU-Next/kernel')
+
+          def read(rel):
+              p = KSU / rel
+              if not p.is_file():
+                  raise SystemExit(f'Required pinned KernelSU source is missing: {p}')
+              return p, p.read_text()
+
+          def write_changed(path, old, new, description):
+              if new == old:
+                  raise SystemExit(f'No change produced for {description}; source differs from audited revision.')
+              path.write_text(new)
+              print(f'Applied: {description}')
+
+          # task_work_add() in Linux 4.19 takes bool notify, while the newer
+          # TWA_RESUME spelling is an enum/constant from newer kernels.
+          twa_macro = (
+              '\n/* DARKNIGHT_LINUX419_TWA_RESUME_COMPAT: task_work_add() uses bool notify in 4.19. */\n'
+              '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n'
+              '#ifndef TWA_RESUME\n#define TWA_RESUME 1\n#endif\n#endif\n'
+          )
+          for rel in ('manager/pkg_observer.c', 'policy/allowlist.c', 'supercall/supercall.c'):
+              p, text = read(rel)
+              if 'DARKNIGHT_LINUX419_TWA_RESUME_COMPAT' in text:
+                  raise SystemExit(f'TWA_RESUME compatibility marker already exists in {p}; inspect instead of wrapping twice.')
+              if '#include <linux/version.h>' not in text:
+                  # Preserve SPDX/license line at the top; add the required version header immediately after it.
+                  lines = text.splitlines(keepends=True)
+                  insert_at = 1 if lines and lines[0].startswith('// SPDX-License-Identifier:') else 0
+                  lines.insert(insert_at, '#include <linux/version.h>\n')
+                  text = ''.join(lines)
+              text = text.replace('#include <linux/version.h>\n', '#include <linux/version.h>\n' + twa_macro, 1)
+              if '#include <linux/task_work.h>' not in text:
+                  marker = '#include <linux/version.h>\n'
+                  if marker not in text:
+                      raise SystemExit(f'{rel}: cannot locate version.h include for task_work compatibility.')
+                  text = text.replace(marker, '#include <linux/task_work.h>\n' + marker, 1)
+              write_changed(p, p.read_text(), text, f'{rel}: Linux 4.19 TWA_RESUME compatibility')
+
+          # allowlist.c calls put_task_struct(), declared by linux/sched/task.h
+          p, text = read('policy/allowlist.c')
+          if '#include <linux/sched/task.h>' not in text:
+              marker = '#include <linux/task_work.h>\n'
+              if marker not in text:
+                  raise SystemExit('allowlist.c changed: cannot locate linux/task_work.h include anchor.')
+              updated = text.replace(marker, marker + '#include <linux/sched/task.h>\n', 1)
+              write_changed(p, text, updated, 'allowlist.c: include declaration for put_task_struct')
+
+          # Linux 4.19 fsnotify_ops has handle_event(), not handle_inode_event().
+          p, text = read('manager/pkg_observer.c')
+          if '#include <linux/string.h>' not in text:
+              marker = '#include <linux/slab.h>\n'
+              if marker not in text:
+                  raise SystemExit('pkg_observer.c changed: cannot locate linux/slab.h include anchor for string.h.')
+              updated = text.replace(marker, marker + '#include <linux/string.h>\n', 1)
+              write_changed(p, text, updated, 'pkg_observer.c: explicit string API declaration')
+              text = updated
+          old_ops = '''static const struct fsnotify_ops ksu_ops = {
+          	.handle_inode_event = ksu_handle_inode_event,
+          };
+          '''
+          # Normalize tabs/spaces because upstream formatting can differ slightly.
+          pattern = re.compile(r'^static const struct fsnotify_ops ksu_ops = \{\n.*?^\};\n', re.M | re.S)
+          m = pattern.search(text)
+          if not m:
+              raise SystemExit('pkg_observer.c: expected fsnotify_ops initializer not found.')
+          if 'DARKNIGHT_LINUX419_FSNOTIFY_COMPAT' in text:
+              raise SystemExit('pkg_observer.c already contains fsnotify compatibility marker.')
+          new_ops = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+          /* DARKNIGHT_LINUX419_FSNOTIFY_COMPAT: adapt the legacy filename callback. */
+          static int ksu_handle_legacy_event(struct fsnotify_group *group,
+                                            struct inode *inode, u32 mask,
+                                            const void *data, int data_type,
+                                            const unsigned char *file_name,
+                                            u32 cookie,
+                                            struct fsnotify_iter_info *iter_info)
+          {
+              (void)group;
+              (void)inode;
+              (void)data;
+              (void)data_type;
+              (void)cookie;
+              (void)iter_info;
+              if (!file_name || (mask & FS_ISDIR))
+                  return 0;
+              if (!strcmp((const char *)file_name, "packages.list")) {
+                  pr_info("packages.list detected: %d\\n", mask);
+                  ksu_defer_track_throne();
+              }
+              return 0;
+          }
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_event = ksu_handle_legacy_event,
+          };
+          #else
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_inode_event = ksu_handle_inode_event,
+          };
+          #endif
+          '''
+          text = text[:m.start()] + new_ops + text[m.end():]
+          write_changed(p, p.read_text(), text, 'pkg_observer.c: Linux 4.19 fsnotify callback adaptation')
+
+          # Linux 4.19 seccomp does not have struct seccomp.filter_count.
+          p, text = read('policy/app_profile.c')
+          if 'DARKNIGHT_LINUX419_SECCOMP_FILTER_COUNT' in text:
+              raise SystemExit('app_profile.c seccomp filter_count guard already exists.')
+          needle = '    atomic_set(&current->seccomp.filter_count, 0);'
+          if text.count(needle) != 1:
+              raise SystemExit('app_profile.c: expected one filter_count reset; refusing to patch a different implementation.')
+          replacement = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+              /* DARKNIGHT_LINUX419_SECCOMP_FILTER_COUNT: field is absent in 4.19. */
+              atomic_set(&current->seccomp.filter_count, 0);
+          #endif'''
+          updated = text.replace(needle, replacement, 1)
+          write_changed(p, text, updated, 'app_profile.c: guard filter_count for kernels that contain the field')
+          text = updated
+
+          # The pinned source calls seccomp_filter_release() unconditionally, but the
+          # exact Linux 4.19.325 tree implements put_seccomp_filter() instead. Select
+          # the kernel API by version; do not add a fake alias or unresolved symbol.
+          marker = 'DARKNIGHT_LINUX419_SECCOMP_RELEASE_COMPAT'
+          if marker in text:
+              raise SystemExit('app_profile.c seccomp-release compatibility patch already exists.')
+          decl = 'void seccomp_filter_release(struct task_struct *tsk);'
+          if text.count(decl) != 1:
+              raise SystemExit('app_profile.c: expected exactly one seccomp_filter_release declaration.')
+          guarded_decl = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+          void seccomp_filter_release(struct task_struct *tsk);
+          #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0) */'''
+          updated = text.replace(decl, guarded_decl, 1)
+          call = '    seccomp_filter_release(fake);'
+          if updated.count(call) != 1:
+              raise SystemExit('app_profile.c: expected exactly one seccomp_filter_release(fake) call.')
+          replacement_call = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+              seccomp_filter_release(fake);
+          #else
+              /* DARKNIGHT_LINUX419_SECCOMP_RELEASE_COMPAT: 4.19 provides put_seccomp_filter(). */
+              put_seccomp_filter(fake);
+          #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0) */'''
+          updated = updated.replace(call, replacement_call, 1)
+          write_changed(p, text, updated, 'app_profile.c: use put_seccomp_filter on Linux 4.19; retain seccomp_filter_release on 6.6+')
+
+          # linux/minmax.h was introduced after the target 4.19 baseline; kernel.h
+          # provides the legacy min/max macros used by this source.
+          p, text = read('sulog/event.c')
+          old_include = '#include <linux/minmax.h>'
+          if 'DARKNIGHT_LINUX419_MINMAX_COMPAT' in text:
+              raise SystemExit('sulog/event.c minmax compatibility marker already exists.')
+          if text.count(old_include) != 1:
+              raise SystemExit('sulog/event.c: expected one linux/minmax.h include; inspect source.')
+          updated = text.replace(old_include, '''/* DARKNIGHT_LINUX419_MINMAX_COMPAT */
+          #if __has_include(<linux/minmax.h>)
+          #include <linux/minmax.h>
+          #else
+          #include <linux/kernel.h>
+          #endif''', 1)
+          write_changed(p, text, updated, 'sulog/event.c: legacy min/max header fallback')
+
+          # Linux 4.19 splits task-list, task-reference and init-task declarations
+          # across scheduler headers. Add any missing headers without relying on one
+          # particular include layout in the pinned KernelSU source.
+          p, text = read('supercall/dispatch.c')
+          if 'DARKNIGHT_LINUX419_SCHED_HEADERS' not in text:
+              missing = []
+              for header in ('linux/sched/signal.h', 'linux/sched/task.h', 'linux/init_task.h'):
+                  include = f'#include <{header}>\n'
+                  if include not in text:
+                      missing.append(include)
+              lines = text.splitlines(keepends=True)
+              insert_at = 1 if lines and lines[0].startswith('// SPDX-License-Identifier:') else 0
+              lines[insert_at:insert_at] = ['/* DARKNIGHT_LINUX419_SCHED_HEADERS */\n'] + missing
+              updated = ''.join(lines)
+              write_changed(p, text, updated, 'dispatch.c: include Linux 4.19 task-list and init-task declarations')
+
+
+          print('All source-level compatibility edits were applied with exact-anchor checks.')
+          PYKSU419
+
+          # Add narrowly scoped path_mount/path_umount compatibility interfaces to the
+          # actual 4.19 VFS. These wrappers intentionally support only the pinned KSU
+          # operations; they are not presented as a general new mount API backport.
+          python3 - <<'PYPATHAPI'
+          from pathlib import Path
+          import re
+          p = Path('fs/namespace.c')
+          text = p.read_text()
+          mount_marker = 'DARKNIGHT_KERNELSU_PATH_MOUNT_COMPAT'
+          umount_marker = 'DARKNIGHT_KERNELSU_PATH_UMOUNT_COMPAT'
+          if mount_marker in text or umount_marker in text:
+              raise SystemExit('Darknight path API compatibility markers already exist; refusing to insert duplicate VFS wrappers.')
+
+          mount_anchor = re.compile(r'/\*\n[ \t]*\* do loopback mount\.\n[ \t]*\*/\n', re.M)
+          mount_match = mount_anchor.search(text)
+          if not mount_match or len(mount_anchor.findall(text)) != 1:
+              raise SystemExit('fs/namespace.c: expected unique do_loopback_mount anchor after do_change_type().')
+          mount_impl = r'''/*
+           * DARKNIGHT_KERNELSU_PATH_MOUNT_COMPAT
+           * Linux 4.19 does not expose the newer path_mount() helper. The pinned
+           * KernelSU-Next caller only uses it to make the current root mount
+           * recursively private. Reject all other forms instead of faking a
+           * general new-mount API.
+           */
+          int path_mount(const char *dev_name, struct path *path,
+                         const char *type_page, unsigned long flags,
+                         void *data_page)
+          {
+              int error;
+
+              if (!path || !path->mnt || !path->dentry)
+                  return -EINVAL;
+              if (dev_name || type_page || data_page ||
+                  flags != (MS_PRIVATE | MS_REC))
+                  return -EOPNOTSUPP;
+
+              error = security_sb_mount(dev_name, path, type_page, flags, data_page);
+              if (error)
+                  return error;
+              if (!may_mount())
+                  return -EPERM;
+
+              return do_change_type(path, (int)flags);
+          }
+
+          '''
+          text = text[:mount_match.start()] + mount_impl + text[mount_match.start():]
+
+          # Put path_umount after may_mount() and do_umount() are both defined but
+          # before ksys_umount(), reusing the kernel's own mount checks and teardown.
+          umount_anchor = 'int ksys_umount(char __user *name, int flags)\n'
+          if text.count(umount_anchor) != 1:
+              raise SystemExit('fs/namespace.c: expected unique ksys_umount() anchor for path_umount compatibility.')
+          umount_impl = r'''/*
+           * DARKNIGHT_KERNELSU_PATH_UMOUNT_COMPAT
+           * The caller supplies a referenced mount-root path from kern_path().
+           * Mirror 4.19 ksys_umount's authorization, mount-root, namespace,
+           * locked-mount and forced-unmount checks, then consume that path ref.
+           */
+          int path_umount(struct path *path, int flags)
+          {
+              struct mount *mnt;
+              int retval;
+
+              if (!path || !path->mnt || !path->dentry)
+                  return -EINVAL;
+
+              mnt = real_mount(path->mnt);
+              retval = -EINVAL;
+              if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE))
+                  goto dput_and_out;
+              if (!may_mount()) {
+                  retval = -EPERM;
+                  goto dput_and_out;
+              }
+              if (path->dentry != path->mnt->mnt_root)
+                  goto dput_and_out;
+              if (!check_mnt(mnt))
+                  goto dput_and_out;
+              if (mnt->mnt.mnt_flags & MNT_LOCKED)
+                  goto dput_and_out;
+              retval = -EPERM;
+              if ((flags & MNT_FORCE) && !capable(CAP_SYS_ADMIN))
+                  goto dput_and_out;
+
+              retval = do_umount(mnt, flags);
+          dput_and_out:
+              /* Preserve mnt_expiry_mark semantics: do not use path_put(). */
+              dput(path->dentry);
+              mntput_no_expire(mnt);
+              return retval;
+          }
+
+          '''
+          text = text.replace(umount_anchor, umount_impl + umount_anchor, 1)
+          p.write_text(text)
+          print('Added narrow, checked path_mount/path_umount compatibility for pinned KernelSU-Next callers.')
+          PYPATHAPI
+
+          # Verify the source-level compatibility surface and persist exact patches.
+          grep -q 'DARKNIGHT_KERNELSU_PATH_MOUNT_COMPAT' fs/namespace.c
+          grep -q 'DARKNIGHT_KERNELSU_PATH_UMOUNT_COMPAT' fs/namespace.c
+          grep -q 'DARKNIGHT_LINUX419_FSNOTIFY_COMPAT' KernelSU-Next/kernel/manager/pkg_observer.c
+          grep -q 'DARKNIGHT_LINUX419_SECCOMP_FILTER_COUNT' KernelSU-Next/kernel/policy/app_profile.c
+          grep -q 'DARKNIGHT_LINUX419_SECCOMP_RELEASE_COMPAT' KernelSU-Next/kernel/policy/app_profile.c
+          grep -q 'put_seccomp_filter(fake)' KernelSU-Next/kernel/policy/app_profile.c
+          grep -q 'DARKNIGHT_LINUX419_MINMAX_COMPAT' KernelSU-Next/kernel/sulog/event.c
+          git diff --check
+          git diff --binary -- fs/namespace.c > "$GITHUB_WORKSPACE/diagnostics/kernel-4.19-path-api-compatibility.patch"
+          git -C KernelSU-Next diff --binary > "$GITHUB_WORKSPACE/diagnostics/ksu-linux419-compatibility.patch"
+          cp KernelSU-Next/kernel/manager/pkg_observer.c "$GITHUB_WORKSPACE/diagnostics/ksu-pkg_observer.c.patched"
+          cp KernelSU-Next/kernel/policy/allowlist.c "$GITHUB_WORKSPACE/diagnostics/ksu-allowlist.c.patched"
+          cp KernelSU-Next/kernel/policy/app_profile.c "$GITHUB_WORKSPACE/diagnostics/ksu-app_profile.c.patched"
+          cp KernelSU-Next/kernel/sulog/event.c "$GITHUB_WORKSPACE/diagnostics/ksu-event.c.patched"
+          cp KernelSU-Next/kernel/supercall/dispatch.c "$GITHUB_WORKSPACE/diagnostics/ksu-dispatch.c.patched"
+          cp KernelSU-Next/kernel/supercall/supercall.c "$GITHUB_WORKSPACE/diagnostics/ksu-supercall.c.patched"
+          echo 'Compatibility patches recorded and strict source markers verified.'
+
+      - name: Backport maintained non-GKI SELinux compatibility files (keep pinned KSU HEAD)
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          KSU_ROOT="$GITHUB_WORKSPACE/kernel/KernelSU-Next"
+          DIAG="$GITHUB_WORKSPACE/diagnostics/legacy-selinux-port"
+          PRISTINE="$GITHUB_WORKSPACE/diagnostics/legacy-selinux-port-pristine"
+          mkdir -p "$DIAG" "$PRISTINE"
+          : > "$DIAG/SHA256SUMS.txt"
+          : > "$DIAG/SHA256SUMS-upstream.txt"
+
+          EXPECTED_DEV='8f902aeb16033024143ae36cf711df902cf02fae'
+          COMPAT_REF="$KSU_LEGACY_SELINUX_COMPAT_REF"
+          ACTUAL_DEV="$(git -C "$KSU_ROOT" rev-parse HEAD)"
+          [[ "$ACTUAL_DEV" == "$EXPECTED_DEV" ]] || {
+            echo "Refusing SELinux backport: pinned KernelSU-Next HEAD changed: $ACTUAL_DEV" >&2
+            exit 1
+          }
+          [[ "$COMPAT_REF" == 'd51ca52c6d370d8e9d62aabde10e41f17ff3ae94' ]] || {
+            echo "Unexpected compatibility source ref: $COMPAT_REF" >&2
+            exit 1
+          }
+          REV_COUNT="$(git -C "$KSU_ROOT" rev-list --count HEAD)"
+          DRIVER_VERSION="$((30000 + REV_COUNT))"
+          [[ "$REV_COUNT" == '3333' && "$DRIVER_VERSION" == '33333' ]] || {
+            echo "Pinned driver's real revision-derived version changed: count=$REV_COUNT version=$DRIVER_VERSION" >&2
+            exit 1
+          }
+
+          # The pinned dev/GKI SELinux files use post-5.10 selinux_policy fields,
+          # while this target is a non-GKI Linux 4.19 tree. Select only the
+          # maintained compatibility-layer files from an immutable upstream commit;
+          # do NOT check out/switch the KernelSU-Next repository branch.
+          files=(
+            kernel/compat/kernel_compat.c
+            kernel/compat/kernel_compat.h
+            kernel/selinux/rules.c
+            kernel/selinux/selinux.c
+            kernel/selinux/selinux.h
+            kernel/selinux/sepolicy.c
+            kernel/selinux/sepolicy.h
+            kernel/feature/selinux_hide.c
+            kernel/feature/selinux_hide.h
+          )
+          {
+            echo "Pinned KernelSU-Next dev HEAD: $ACTUAL_DEV"
+            echo "Pinned KernelSU-Next git revision count: $REV_COUNT"
+            echo "Real revision-derived driver version: $DRIVER_VERSION"
+            echo "Selected upstream non-GKI compatibility source commit: $COMPAT_REF"
+            echo 'Compatibility method: file-level SELinux/non-GKI backport only; repository HEAD/branch stays pinned to the requested dev commit.'
+            echo 'SUSFS: not added.'
+            echo
+          } | tee "$DIAG/PROVENANCE.txt"
+
+          for rel in "${files[@]}"; do
+            target="$KSU_ROOT/$rel"
+            tmp="$RUNNER_TEMP/ksu-legacy-$(basename "$rel").tmp"
+            url="https://raw.githubusercontent.com/${KSU_REPO}/${COMPAT_REF}/${rel}"
+            pristine="$PRISTINE/$rel"
+            mkdir -p "$(dirname "$target")" "$DIAG/$(dirname "$rel")" "$(dirname "$pristine")"
+            echo "Fetching pinned compatibility source: $url"
+            curl --fail --location --silent --show-error --retry 3 --retry-all-errors "$url" -o "$tmp"
+            test -s "$tmp" || { echo "Empty compatibility source: $rel" >&2; exit 1; }
+
+            # Preserve and hash the exact immutable upstream bytes for provenance.
+            # Some upstream compatibility files contain trailing spaces; when these
+            # files replace the pinned dev-version files, `git diff --check` correctly
+            # flags those newly-added lines. Normalize horizontal trailing whitespace
+            # in the working copy only (no code tokens or line endings are changed).
+            cp "$tmp" "$pristine"
+            printf 'upstream  ' >> "$DIAG/SHA256SUMS-upstream.txt"
+            sha256sum "$tmp" | tee -a "$DIAG/SHA256SUMS-upstream.txt"
+            install -m 0644 "$tmp" "$target"
+            python3 - "$target" <<'PYTRAIL'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          data = p.read_bytes()
+          if b"\x00" in data:
+              raise SystemExit(f"Refusing to whitespace-normalize a binary source: {p}")
+
+          output = []
+          for line in data.splitlines(keepends=True):
+              if line.endswith(b"\r\n"):
+                  body, ending = line[:-2], b"\r\n"
+              elif line.endswith(b"\n"):
+                  body, ending = line[:-1], b"\n"
+              elif line.endswith(b"\r"):
+                  body, ending = line[:-1], b"\r"
+              else:
+                  body, ending = line, b""
+              output.append(body.rstrip(b" \t") + ending)
+
+          normalized = b"".join(output)
+          p.write_bytes(normalized)
+          for number, line in enumerate(normalized.splitlines(), start=1):
+              if line.endswith((b" ", b"\t")):
+                  raise SystemExit(f"Trailing horizontal whitespace remains in {p}:{number}")
+          print(f"Normalized trailing horizontal whitespace in {p}; upstream original preserved separately.")
+          PYTRAIL
+            cp "$target" "$DIAG/$rel"
+            printf 'normalized  ' >> "$DIAG/SHA256SUMS.txt"
+            sha256sum "$target" | tee -a "$DIAG/SHA256SUMS.txt"
+          done
+
+          # Compatibility bridge: the pinned dev runtime still calls
+          # ksu_selinux_hide_drop_backup_if_unused(), but the maintained legacy
+          # non-GKI selinux_hide implementation no longer owns backup_sepolicy.
+          # Verify that the legacy implementation has no backup object; only then
+          # provide the semantically correct no-op bridge and restore its prototype.
+          python3 - "$KSU_ROOT/kernel/feature/selinux_hide.c" "$KSU_ROOT/kernel/feature/selinux_hide.h" "$DIAG/selinux-hide-backup-bridge.txt" <<'PYBRIDGE'
+          from pathlib import Path
+          import re, sys
+
+          c_path, h_path, report_path = map(Path, sys.argv[1:])
+          c_src = c_path.read_text()
+          h_src = h_path.read_text()
+          symbol = 'ksu_selinux_hide_drop_backup_if_unused'
+
+          if 'backup_sepolicy' in c_src:
+              raise SystemExit('Refusing no-op bridge: legacy selinux_hide.c unexpectedly references backup_sepolicy.')
+          if symbol in c_src or symbol in h_src:
+              raise SystemExit('Backup-cleanup bridge already exists in compatibility source; refusing duplicate patch.')
+
+          header_anchor = 'void ksu_selinux_hide_exit();\n'
+          if h_src.count(header_anchor) != 1:
+              raise SystemExit('Could not locate exactly one selinux_hide.h prototype anchor.')
+          h_src = h_src.replace(
+              header_anchor,
+              header_anchor + 'void ksu_selinux_hide_drop_backup_if_unused(void);\n',
+              1,
+          )
+
+          function = """\n/*
+           * Compatibility bridge for the pinned dev-branch boot_event.c.
+           * The selected maintained non-GKI implementation does not create or
+           * own backup_sepolicy, so there is no backup object to release here.
+           * Keep the cross-file API available without touching SELinux state.
+           */
+          void ksu_selinux_hide_drop_backup_if_unused(void)
+          {
+          }
+          """
+          # Use an explicit column-zero function definition in the actual C file.
+          function = function.lstrip('\n')
+          if not c_src.endswith('\n'):
+              c_src += '\n'
+          c_src += '\n' + function
+
+          if h_src.count(symbol) != 1:
+              raise SystemExit('Backup-cleanup prototype postcondition failed.')
+          if len(re.findall(r'\bvoid\s+' + symbol + r'\s*\(void\s*\)', c_src)) != 1:
+              raise SystemExit('Backup-cleanup compatibility definition postcondition failed.')
+          c_path.write_text(c_src)
+          h_path.write_text(h_src)
+          report_path.write_text(
+              'Bridge: ksu_selinux_hide_drop_backup_if_unused(void)\n'
+              'Reason: pinned runtime/boot_event.c calls this API, but the selected '
+              'legacy non-GKI SELinux-hide implementation does not own/create backup_sepolicy.\n'
+              'Action: restored the header prototype and supplied a documented no-op.\n'
+              'Safety guard: patch refuses to apply if backup_sepolicy exists in the selected legacy implementation.\n'
+              'Runtime SELinux/root behavior still requires device validation.\n'
+          )
+          print('Added guarded backup-cleanup compatibility bridge for pinned boot_event.c.')
+          PYBRIDGE
+          cp "$KSU_ROOT/kernel/feature/selinux_hide.c" "$DIAG/kernel/feature/selinux_hide.c"
+          cp "$KSU_ROOT/kernel/feature/selinux_hide.h" "$DIAG/kernel/feature/selinux_hide.h"
+          git -C "$KSU_ROOT" diff --binary -- kernel/feature/selinux_hide.c kernel/feature/selinux_hide.h \
+            > "$DIAG/selinux-hide-backup-bridge.patch"
+          grep -q 'ksu_selinux_hide_drop_backup_if_unused(void)' "$KSU_ROOT/kernel/feature/selinux_hide.h"
+          grep -q 'void ksu_selinux_hide_drop_backup_if_unused(void)' "$KSU_ROOT/kernel/feature/selinux_hide.c"
+          cat "$DIAG/selinux-hide-backup-bridge.txt"
+
+          # Make Kbuild include the compatibility object and detect which APIs
+          # truly exist in the target Linux 4.19 tree. These guards match the
+          # upstream legacy compatibility implementation and prevent duplicate
+          # path_mount definitions when the base-tree compatibility patch provides it.
+          python3 - "$KSU_ROOT/kernel/Kbuild" <<'PYKBUILD'
+          from pathlib import Path
+          import sys
+
+          p = Path(sys.argv[1])
+          src = p.read_text()
+          original = src
+          marker = 'DARKNIGHT_LEGACY_SELINUX_COMPAT_PROBES'
+          if marker in src:
+              raise SystemExit('Kbuild compatibility probe marker already exists; refusing a duplicate insertion.')
+
+          object_line = 'kernelsu-objs += compat/kernel_compat.o\n'
+          object_anchor = 'kernelsu-objs := core/init.o\n'
+          if src.count(object_anchor) != 1:
+              raise SystemExit('Could not find exactly one Kbuild core/init.o anchor.')
+          if object_line in src:
+              raise SystemExit('compat/kernel_compat.o is already listed; inspect Kbuild instead of duplicating it.')
+          src = src.replace(object_anchor, object_anchor + object_line, 1)
+
+          block = '''# DARKNIGHT_LEGACY_SELINUX_COMPAT_PROBES
+          # Feature detection from the maintained KernelSU-Next non-GKI compatibility layer.
+          ifeq ($(shell grep -q "current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_CURRENT_SID
+          endif
+          ifeq ($(shell grep -q "struct selinux_state " $(srctree)/security/selinux/include/security.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_USE_SELINUX_STATE
+          endif
+          ifeq ($(shell grep -q "^DEFINE_RWLOCK(policy_rwlock);" $(srctree)/security/selinux/ss/services.c; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK
+          endif
+          ifeq ($(shell grep -q "cpus_ptr;" $(srctree)/include/linux/sched.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_BACKPORTED_CPUS_PTR
+          endif
+          ifeq ($(shell grep -q "strncpy_from_user_nofault" $(srctree)/include/linux/uaccess.h; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_STRNCPY
+          endif
+          ifeq ($(shell grep -q "ssize_t kernel_read" $(srctree)/fs/read_write.c; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_KERNEL_READ
+          endif
+          ifeq ($(shell grep "ssize_t kernel_write" $(srctree)/fs/read_write.c | grep -q "const void"; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_KERNEL_WRITE
+          endif
+          ifeq ($(shell grep -q "int path_mount" $(srctree)/fs/namespace.c; echo $$?),0)
+          ccflags-y += -DKSU_HAS_PATH_MOUNT
+          endif
+          ifeq ($(shell grep -q "int path_umount" $(srctree)/fs/namespace.c; echo $$?),0)
+          ccflags-y += -DKSU_HAS_PATH_UMOUNT
+          endif
+          ifneq ($(shell grep -wq "put_seccomp_filter" $(srctree)/kernel/seccomp.c $(srctree)/include/linux/seccomp.h; echo $$?),0)
+          ifeq ($(shell grep -wq "seccomp_filter_release" $(srctree)/kernel/seccomp.c $(srctree)/include/linux/seccomp.h; echo $$?),0)
+          ccflags-y += -DKSU_OPTIONAL_SECCOMP_FILTER_RELEASE
+          endif
+          endif
+          ifeq ($(shell grep -q "security_inode_init_security_anon" $(srctree)/include/linux/security.h; echo $$?),0)
+          ccflags-y += -DKSU_COMPAT_HAS_INIT_SEC_ANON
+          endif
+          ifeq ($(shell grep -q "CONFIG_KDP_CRED" $(srctree)/kernel/cred.c; echo $$?),0)
+          ccflags-y += -DSAMSUNG_UH_DRIVER_EXIST
+          endif
+          ifeq ($(shell grep -q "SEC_SELINUX_PORTING_COMMON" $(srctree)/security/selinux/avc.c; echo $$?),0)
+          ccflags-y += -DSAMSUNG_SELINUX_PORTING
+          endif
+          '''
+          # Dedent the embedded Makefile fragment without depending on workflow indentation.
+          import textwrap
+          block = textwrap.dedent(block)
+          kbuild_anchor = '# Keep a new line here!! Because someone may append config'
+          if src.count(kbuild_anchor) != 1:
+              raise SystemExit('Could not find exactly one Kbuild end anchor for compatibility probes.')
+          src = src.replace(kbuild_anchor, block + '\n' + kbuild_anchor, 1)
+          if src == original:
+              raise SystemExit('Kbuild changes were not applied.')
+          if src.count(object_line) != 1 or src.count(marker) != 1:
+              raise SystemExit('Kbuild postcondition failed: duplicate or missing compatibility entries.')
+          p.write_text(src)
+          print('Added compat/kernel_compat.o and one guarded Linux API feature-detection block.')
+          PYKBUILD
+
+          # Verify that the non-GKI implementations were selected, and that all
+          # GKI-only policy-cloning structure references are gone from this layer.
+          grep -q 'KSU_COMPAT_USE_SELINUX_STATE' "$KSU_ROOT/kernel/selinux/rules.c"
+          grep -q 'KSU_COMPAT_USE_SELINUX_STATE' "$KSU_ROOT/kernel/feature/selinux_hide.c"
+          grep -q 'compat/kernel_compat.o' "$KSU_ROOT/kernel/Kbuild"
+          grep -q 'DARKNIGHT_LEGACY_SELINUX_COMPAT_PROBES' "$KSU_ROOT/kernel/Kbuild"
+          # Do not reject every textual occurrence of newer SELinux fields/functions.
+          # The maintained compatibility sources intentionally retain some API references
+          # inside version-gated branches. A recursive grep cannot determine which branch
+          # is active for this kernel and caused a false failure before compilation.
+          # Verify that the actual build symlink resolves to the patched pinned source;
+          # the following Kbuild object preflight is the authoritative API compatibility test.
+          KSU_LINK_REAL="$(readlink -f "$GITHUB_WORKSPACE/kernel/drivers/kernelsu")"
+          KSU_ROOT_REAL="$(readlink -f "$KSU_ROOT/kernel")"
+          [[ -n "$KSU_LINK_REAL" && "$KSU_LINK_REAL" == "$KSU_ROOT_REAL" ]] || {
+            echo "drivers/kernelsu does not resolve to the patched pinned KernelSU-Next source: $KSU_LINK_REAL vs $KSU_ROOT_REAL" >&2
+            exit 1
+          }
+          for rel in kernel/selinux/rules.c kernel/selinux/sepolicy.c kernel/feature/selinux_hide.c; do
+            test -s "$KSU_ROOT/$rel" || { echo "Missing SELinux compatibility source: $rel" >&2; exit 1; }
+          done
+          grep -q 'SELINUX_POLICY_INSTEAD_SELINUX_SS' "$KSU_ROOT/kernel/selinux/rules.c"
+          grep -q 'ksu_get_real_status_page' "$KSU_ROOT/kernel/feature/selinux_hide.c"
+          if ! git -C "$KSU_ROOT" diff --check > "$DIAG/diff-check.txt" 2>&1; then
+            echo 'Whitespace/patch validation failed after normalization. Details:' >&2
+            cat "$DIAG/diff-check.txt" >&2
+            exit 1
+          fi
+          git -C "$KSU_ROOT" diff --binary > "$GITHUB_WORKSPACE/diagnostics/ksu-selinux-legacy-backport.patch"
+          {
+            echo "KSU HEAD after file-level backport: $(git -C "$KSU_ROOT" rev-parse HEAD)"
+            echo "KSU revision count after file-level backport: $(git -C "$KSU_ROOT" rev-list --count HEAD)"
+            echo "Driver version after file-level backport: $((30000 + $(git -C "$KSU_ROOT" rev-list --count HEAD)))"
+            echo 'SELinux source backport provenance and per-file hashes: legacy-selinux-port/PROVENANCE.txt and legacy-selinux-port/SHA256SUMS.txt'
+          } | tee -a "$DIAG/PROVENANCE.txt"
+          [[ "$(git -C "$KSU_ROOT" rev-parse HEAD)" == "$EXPECTED_DEV" ]]
+          [[ "$((30000 + $(git -C "$KSU_ROOT" rev-list --count HEAD)))" == '33333' ]]
+          echo 'SELinux non-GKI file-level compatibility backport applied; pinned HEAD and revision-derived driver version preserved.'
+
+      - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          FILE="drivers/input/touchscreen/ovt/td4150_spi/ovt_tcm_sec_fn_test.c"
+          test -f "$FILE" || { echo "Expected touchscreen source not found: $FILE" >&2; exit 1; }
+          python3 - "$FILE" <<'PYFIX'
+          from pathlib import Path
+          import re, sys
+
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          pattern = re.compile(
+              r'snprintf\(\s*tcm_hcd->print_buf\s*,\s*'
+              r'sizeof\(\s*tcm_hcd->print_buf\s*\)\s*,\s*"NG"\s*\)\s*;'
+          )
+          fixed, count = pattern.subn(
+              'memcpy(tcm_hcd->print_buf, "NG", sizeof("NG"));', source
+          )
+          if count < 1:
+              raise SystemExit(
+                  'No expected sizeof(pointer) NG call found; inspect source and diagnostics.'
+              )
+          path.write_text(fixed)
+          print(f'Fixed {count} snprintf(sizeof(pointer)) call(s) in {path}.')
+          PYFIX
+          git diff --check
+          git diff --binary -- "$FILE" > "$GITHUB_WORKSPACE/diagnostics/touchscreen-source-fix.patch"
+          cp "$FILE" "$GITHUB_WORKSPACE/diagnostics/ovt_tcm_sec_fn_test.c.patched"
+
+
+      - name: Fix known legacy host-tool warnings and conflicting defconfig choice
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/diagnostics/host-tool-warning-fixes.log") 2>&1
+          python3 - <<'PYWARN'
+          from pathlib import Path
+          import re
+
+          # Apply only verified, narrowly scoped fixes:
+          # - remove the unused legacy DTC lexer state and assignment;
+          # - annotate only sortextable dispatch pointers that are set but unused
+          #   for this host build;
+          # - remove the conflicting INIT_STACK_NONE choice while preserving ZERO;
+          # - gate GKI hidden DRM helper selects on their real DRM dependencies.
+
+          lexer = Path("scripts/dtc/dtc-lexer.l")
+          src = lexer.read_text()
+          src, decl_count = re.subn(
+              r"(?m)^[ \t]*static int dts_version = 1;[ \t]*$", "", src, count=1
+          )
+          if decl_count != 1:
+              raise SystemExit("Expected exactly one unused dts_version declaration in scripts/dtc/dtc-lexer.l.")
+          src, assign_count = re.subn(
+              r"(?m)^[ \t]*dts_version = 1;[ \t]*$", "", src, count=1
+          )
+          if assign_count != 1:
+              raise SystemExit("Expected exactly one unused dts_version assignment in scripts/dtc/dtc-lexer.l.")
+          if "dts_version" in src:
+              raise SystemExit("dts_version references remain after the targeted DTC warning fix.")
+          lexer.write_text(src)
+
+          sortextable = Path("scripts/sortextable.c")
+          src = sortextable.read_text()
+          for name, typ in (("w8", "uint64_t"), ("w2", "uint16_t")):
+              pat = re.compile(
+                  rf"(?m)^([ \t]*static void \(\*{re.escape(name)}\)\({typ}, {typ} \*\))[ \t]*;$"
+              )
+              src, count = pat.subn(r"\1 __attribute__((unused));", src, count=1)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one {name} function-pointer declaration in scripts/sortextable.c.")
+          sortextable.write_text(src)
+
+          defconfig = Path("arch/arm64/configs/exynos850-a13nsxx_defconfig")
+          src = defconfig.read_text()
+          lines = src.splitlines(keepends=True)
+          none_lines = [line for line in lines if line.rstrip("\r\n") == "CONFIG_INIT_STACK_NONE=y"]
+          zero_lines = [line for line in lines if line.rstrip("\r\n") == "CONFIG_INIT_STACK_ALL_ZERO=y"]
+          if len(none_lines) != 1 or len(zero_lines) != 1:
+              raise SystemExit("Expected exactly one INIT_STACK_NONE=y and one INIT_STACK_ALL_ZERO=y choice in the target defconfig.")
+          src = "".join(line for line in lines if line.rstrip("\r\n") != "CONFIG_INIT_STACK_NONE=y")
+          defconfig.write_text(src)
+
+          kconfig = Path("init/Kconfig.gki")
+          src = kconfig.read_text()
+          block_match = re.search(
+              r"(?ms)^config GKI_HIDDEN_DRM_CONFIGS[ \t]*\n.*?(?=^(?:config|menuconfig)[ \t]+[A-Z0-9_]+[ \t]*$|\Z)",
+              src,
+          )
+          if not block_match:
+              raise SystemExit("Could not find the GKI_HIDDEN_DRM_CONFIGS Kconfig block.")
+          block = block_match.group(0)
+          for symbol in ("DRM_GEM_CMA_HELPER", "DRM_MIPI_DSI"):
+              plain = re.compile(rf"(?m)^([ \t]*select {symbol})[ \t]*$")
+              guarded = re.compile(
+                  rf"(?m)^([ \t]*select {symbol}[ \t]+if[ \t]*\([ \t]*HAS_IOMEM[ \t]*&&[ \t]*DRM[ \t]*\))[ \t]*$"
+              )
+              plain_count = len(plain.findall(block))
+              guarded_count = len(guarded.findall(block))
+              if plain_count == 1 and guarded_count == 0:
+                  block, count = plain.subn(r"\1 if (HAS_IOMEM && DRM)", block, count=1)
+                  if count != 1:
+                      raise SystemExit(f"Failed to guard select {symbol} with its direct DRM dependencies.")
+              elif plain_count == 0 and guarded_count == 1:
+                  pass  # Already patched in this working tree; keep the patch idempotent.
+              else:
+                  raise SystemExit(f"Unexpected {symbol} select pattern in GKI_HIDDEN_DRM_CONFIGS; refusing an unverified Kconfig edit.")
+          src = src[:block_match.start()] + block + src[block_match.end():]
+          kconfig.write_text(src)
+
+          print("Applied targeted host-warning fixes and guarded GKI DRM helper selects with (HAS_IOMEM && DRM).")
+          print("Preserved CONFIG_INIT_STACK_ALL_ZERO=y and removed the conflicting CONFIG_INIT_STACK_NONE=y.")
+          PYWARN
+          git diff --check
+          git diff --binary -- scripts/dtc/dtc-lexer.l scripts/sortextable.c \
+            arch/arm64/configs/exynos850-a13nsxx_defconfig init/Kconfig.gki \
+            > "$GITHUB_WORKSPACE/diagnostics/host-warning-fixes.patch"
+          cp scripts/dtc/dtc-lexer.l "$GITHUB_WORKSPACE/diagnostics/dtc-lexer.l.patched"
+          cp scripts/sortextable.c "$GITHUB_WORKSPACE/diagnostics/sortextable.c.patched"
+          cp init/Kconfig.gki "$GITHUB_WORKSPACE/diagnostics/Kconfig.gki.patched"
+          grep -Fq 'CONFIG_INIT_STACK_ALL_ZERO=y' arch/arm64/configs/exynos850-a13nsxx_defconfig
+          if grep -Fq 'CONFIG_INIT_STACK_NONE=y' arch/arm64/configs/exynos850-a13nsxx_defconfig; then
+            echo 'Conflicting CONFIG_INIT_STACK_NONE=y remains in the target defconfig.' >&2
+            exit 1
+          fi
+          grep -Eq '^[[:space:]]*select DRM_GEM_CMA_HELPER if \(HAS_IOMEM && DRM\)$' init/Kconfig.gki
+          grep -Eq '^[[:space:]]*select DRM_MIPI_DSI if \(HAS_IOMEM && DRM\)$' init/Kconfig.gki
+
+      - name: Configure kernel and verify KSU config
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/diagnostics/configure-build.log") 2>&1
+          test -f Makefile
+          test -f "arch/arm64/configs/$DEFCONFIG"
+          SOURCE_VERSION="$(make -s kernelversion)"
+          echo "Kernel source version (base VERSION/PATCHLEVEL/SUBLEVEL/EXTRAVERSION only): $SOURCE_VERSION"
+          [[ "$SOURCE_VERSION" == "4.19.325" ]] || {
+            echo "Unexpected kernel version: $SOURCE_VERSION (expected 4.19.325)" >&2
+            exit 1
+          }
+
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
+          scripts/config --file .config --enable KSU
+          scripts/config --file .config --enable KPROBES
+          scripts/config --file .config --enable KALLSYMS
+          scripts/config --file .config --enable KALLSYMS_ALL
+          scripts/config --file .config --enable KSU_DEBUG
+          scripts/config --file .config --enable FTRACE
+          scripts/config --file .config --enable FTRACE_SYSCALLS
+          scripts/config --file .config --enable KRETPROBES
+          scripts/config --file .config --set-str LOCALVERSION '-Darknight'
+          scripts/config --file .config --disable LOCALVERSION_AUTO
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, subprocess
+          config = Path('.config').read_text()
+          symbols = sorted(set(re.findall(r'^(?:# )?(CONFIG_[A-Z0-9_]*SUSFS[A-Z0-9_]*)', config, re.M)))
+          for symbol in symbols:
+              subprocess.run(['scripts/config', '--file', '.config', '--disable', symbol.removeprefix('CONFIG_')], check=True)
+          print(f'Disabled {len(symbols)} SUSFS config option(s). No SUSFS repository or patches are added.')
+          PY
+
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+
+          # Linux 4.19's `kernelrelease` target does not sync Kconfig itself.
+          # The .config already says -Darknight, but setlocalversion reads
+          # include/config/auto.conf, which can still contain the defconfig's
+          # old local version (-exynos850) after olddefconfig. Refresh it now.
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" syncconfig
+
+          # Generate host tools and standard kernel headers first.
+          make ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" prepare scripts
+
+          # Linux 4.19's SELinux Makefile defines this as a subdirectory-local
+          # target ($(obj)/flask.h), so asking the top-level Makefile directly for
+          # security/selinux/flask.h can fail with "No rule to make target".
+          # Run the exact generator command from security/selinux/Makefile instead.
+          SELINUX_GENHDR="scripts/selinux/genheaders/genheaders"
+          test -x "$SELINUX_GENHDR" || {
+            echo "SELinux genheaders host tool was not built: $SELINUX_GENHDR" >&2
+            exit 1
+          }
+          "$SELINUX_GENHDR" security/selinux/flask.h security/selinux/av_permissions.h
+          test -s security/selinux/flask.h || {
+            echo 'SELinux flask.h generation failed.' >&2
+            exit 1
+          }
+          test -s security/selinux/av_permissions.h || {
+            echo 'SELinux av_permissions.h generation failed.' >&2
+            exit 1
+          }
+          cp security/selinux/flask.h "$GITHUB_WORKSPACE/diagnostics/selinux-flask.h"
+          cp security/selinux/av_permissions.h "$GITHUB_WORKSPACE/diagnostics/selinux-av_permissions.h"
+
+          # Verify that the patched lexer source was regenerated before host DTC
+          # compilation; do not silently accept a stale generated file.
+          if grep -q 'dts_version' scripts/dtc/dtc-lexer.lex.c; then
+            echo 'Generated dtc-lexer.lex.c still contains the removed unused dts_version state; lexer regeneration did not occur.' >&2
             exit 1
           fi
 
-          {
-            echo "Device: Samsung Galaxy M21 (SM-M215F / Exynos 9611)"
-            echo "ROM target: One UI port (generic One UI build; exact port not identified)"
-            echo "Requested source ref: $SOURCE_REF"
-            echo "Source commit: $(git rev-parse HEAD)"
-            echo "Kernel version: $(make -s kernelversion)"
-            echo "KernelSU build flag: KSU=1"
-            echo "Build command: DEVICE=m21 KSU=1 ROM=oneui ./build_kernel.sh"
-            echo 'Note: successful compilation does not guarantee compatibility with every One UI port.'
-          } > build-info.txt
+          grep -Fxq 'CONFIG_LOCALVERSION="-Darknight"' include/config/auto.conf || {
+            echo 'include/config/auto.conf did not refresh CONFIG_LOCALVERSION to -Darknight.' >&2
+            grep -E '^CONFIG_LOCALVERSION(=|_)' include/config/auto.conf .config || true
+            exit 1
+          }
+          for item in CONFIG_KSU=y CONFIG_KPROBES=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y CONFIG_EXT4_FS=y CONFIG_KSU_DEBUG=y CONFIG_FTRACE=y CONFIG_FTRACE_SYSCALLS=y; do
+            grep -Fxq "$item" .config || { echo "Required config missing after olddefconfig: $item" >&2; exit 1; }
+          done
+          if grep -Eq '^CONFIG_[A-Z0-9_]*SUSFS[A-Z0-9_]*=y' .config; then
+            echo 'A SUSFS option remains enabled; aborting.' >&2
+            exit 1
+          fi
+          KRELEASE="$(make -s ARCH="$ARCH" kernelrelease)"
+          echo "$KRELEASE" | tee "$GITHUB_WORKSPACE/diagnostics/kernelrelease.txt"
+          [[ "$KRELEASE" == "4.19.325-Darknight" ]] || { echo "Unexpected kernel release: $KRELEASE (expected exactly 4.19.325-Darknight)" >&2; exit 1; }
+          cp .config "$GITHUB_WORKSPACE/diagnostics/kernel.config"
+          grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO|GKI_HIDDEN_DRM_CONFIGS|DRM|DRM_MIPI_DSI|DRM_GEM_CMA_HELPER)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' .config \
+            > "$GITHUB_WORKSPACE/diagnostics/config-summary.txt" || true
 
-          sha256sum out/arch/arm64/boot/Image "${zips[@]}" > SHA256SUMS.txt
-          {
-            echo '### Build outputs'
-            echo '- Kernel image: `out/arch/arm64/boot/Image`'
-            for zip in "${zips[@]}"; do echo "- Flashable archive: $zip"; done
-            echo '- SHA-256 checksums saved in `SHA256SUMS.txt`.'
-            echo '- Artifacts have not been device-tested; keep the known-good backup and recovery path.'
-          } >> "$GITHUB_STEP_SUMMARY"
+          # Validate that the targeted Kconfig select guards actually resolved the
+          # unmet-dependency warnings without enabling DRM or disabling the whole GKI
+          # hidden-config umbrella.
+          if grep -Fxq 'CONFIG_GKI_HIDDEN_DRM_CONFIGS=y' .config && \
+             ! grep -Fxq 'CONFIG_DRM=y' .config; then
+            for symbol in CONFIG_DRM_MIPI_DSI CONFIG_DRM_GEM_CMA_HELPER; do
+              if grep -Fxq "${symbol}=y" .config; then
+                echo "Kconfig dependency guard failed: ${symbol}=y while CONFIG_DRM is unset." >&2
+                echo "See init/Kconfig.gki compatibility patch and configure-build.log." >&2
+                exit 1
+              fi
+            done
+            echo 'Kconfig dependency guard validated: hidden DRM helper symbols remain disabled while DRM=n.' \
+              | tee "$GITHUB_WORKSPACE/diagnostics/kconfig-drm-guard.txt"
+          fi
 
-      - name: Upload kernel artifacts
-        uses: actions/upload-artifact@v4
+      - name: Preflight KernelSU objects and report compatibility blockers
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          LOG="$GITHUB_WORKSPACE/diagnostics/ksu-preflight-build.log"
+          API_REPORT="$GITHUB_WORKSPACE/diagnostics/kernel-api-compatibility.txt"
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+          echo "Kernel release: $(make -s ARCH=arm64 kernelrelease)" | tee "$API_REPORT"
+          echo "Preflight mode: make -k -j2 fs/namespace.o drivers/kernelsu/; full Image build is gated on this passing." | tee -a "$API_REPORT"
+
+          # Compile the KernelSU directory first, before spending time building Image.
+          # -k attempts independent objects so diagnostics capture more than one error.
+          set +e
+          make -k V=1 -j2 ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" fs/namespace.o drivers/kernelsu/ 2>&1 | tee "$LOG"
+          KSU_MAKE_RC=${PIPESTATUS[0]}
+          set -e
+          echo "KernelSU object preflight exit code: $KSU_MAKE_RC" | tee -a "$API_REPORT"
+
+          python3 - "$LOG" "$GITHUB_WORKSPACE/diagnostics/ksu-preflight-errors.txt" <<'PYERR'
+          from pathlib import Path
+          import re, sys
+          src = Path(sys.argv[1]).read_text(errors='replace').splitlines()
+          out = []
+          pat = re.compile(r'(?:fatal error:|\berror:|undefined reference to|No such file or directory|make(?:\[[0-9]+\])?: \*\*\*|Error [0-9]+|LLVM ERROR:)')
+          for i, line in enumerate(src):
+              if pat.search(line):
+                  out.append(f'--- line {i+1} ---')
+                  for j in range(max(0, i-2), min(len(src), i+4)):
+                      out.append(f'{j+1}: {src[j]}')
+          Path(sys.argv[2]).write_text('\n'.join(out) + ('\n' if out else 'No compiler/linker/make errors detected in KSU preflight log.\n'))
+          print(f'Wrote {len(out)} diagnostic lines to {sys.argv[2]}')
+          PYERR
+
+          # Detect APIs referenced by the pinned KSU tree but not implemented in this 4.19 kernel.
+          # This is a safety gate: never invent a prototype for a missing kernel implementation.
+          KSU_SRC="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
+          for api in path_mount path_umount; do
+            if grep -R -n --include='*.c' --include='*.h' --include='*.S' \
+              -E "^[[:space:]]*(static[[:space:]]+)?(int|long|void|bool|ssize_t|unsigned[[:space:]]+long|struct[[:space:]]+[^*]+[[:space:]]*\*)[[:space:]]+${api}[[:space:]]*\(" \
+              "$GITHUB_WORKSPACE/kernel/fs" "$GITHUB_WORKSPACE/kernel/include" 2>/dev/null | grep -v "$KSU_SRC" > "$RUNNER_TEMP/${api}-defs.txt"; then
+              echo "$api: a definition was found in the base kernel tree:" | tee -a "$API_REPORT"
+              tee -a "$API_REPORT" < "$RUNNER_TEMP/${api}-defs.txt"
+            elif grep -R -n --include='*.c' --include='*.h' "\b${api}[[:space:]]*(" "$KSU_SRC" >/dev/null 2>&1; then
+              echo "BLOCKER: pinned KernelSU-Next references $api, but no implementation was found in the Linux 4.19 base tree." | tee -a "$API_REPORT"
+              echo "A semantics-preserving port is required; refusing to guess a kernel API shim or proceed to full Image compilation." | tee -a "$API_REPORT"
+              printf '%s\n' "$api" >> "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt"
+            fi
+          done
+
+          if [[ "$KSU_MAKE_RC" -ne 0 ]]; then
+            echo 'KernelSU object preflight failed; see ksu-preflight-build.log and ksu-preflight-errors.txt.' >&2
+            exit "$KSU_MAKE_RC"
+          fi
+
+          # The Kbuild file derives KSU_VERSION from the nested KernelSU-Next Git
+          # checkout. A separate rev-list check is not enough: the actual Kbuild
+          # invocation must report 33333 or Manager/driver compatibility is unproven.
+          if ! grep -Fq -- '-- KernelSU-Next version: 33333' "$LOG"; then
+            echo 'BLOCKER: Kbuild did not report KernelSU-Next version 33333 during the actual object build.' >&2
+            echo 'Check whether drivers/kernelsu resolves to the pinned Git checkout and whether Kbuild detected that repository.' >&2
+            grep -F -- 'KernelSU-Next version:' "$LOG" >&2 || true
+            exit 1
+          fi
+
+          # Require real compiled objects for the init path and syscall hook manager,
+          # not just CONFIG_KSU=y or a changed kernel banner.
+          for obj in \
+            drivers/kernelsu/core/init.o \
+            drivers/kernelsu/hook/syscall_hook_manager.o \
+            drivers/kernelsu/hook/syscall_event_bridge.o \
+            drivers/kernelsu/hook/arm64/syscall_hook.o; do
+            if [[ ! -s "$obj" ]]; then
+              echo "BLOCKER: required KernelSU integration object was not produced: $obj" >&2
+              exit 1
+            fi
+            printf 'verified object: %s (%s bytes)\n' "$obj" "$(stat -c '%s' "$obj")" \
+              | tee -a "$API_REPORT"
+          done
+          echo 'Kbuild driver version and required syscall integration objects verified.' | tee -a "$API_REPORT"
+
+          # Catch the exact class of late vmlinux link failure seen in the previous run.
+          # Object compilation alone does not prove that every referenced kernel API exists.
+          APP_PROFILE_OBJ='drivers/kernelsu/policy/app_profile.o'
+          test -s "$APP_PROFILE_OBJ" || {
+            echo "Expected compiled object is missing: $APP_PROFILE_OBJ" >&2
+            exit 1
+          }
+          grep -Eq '^[[:space:]]*void[[:space:]]+put_seccomp_filter[[:space:]]*\(' kernel/seccomp.c || {
+            echo 'Linux 4.19 seccomp.c does not define put_seccomp_filter(); cannot safely select the legacy API.' >&2
+            exit 1
+          }
+          NM_TOOL="$(command -v llvm-nm || command -v nm || true)"
+          [[ -n "$NM_TOOL" ]] || { echo 'Neither llvm-nm nor nm is available for the link-symbol audit.' >&2; exit 1; }
+          "$NM_TOOL" -u "$APP_PROFILE_OBJ" | tee "$GITHUB_WORKSPACE/diagnostics/app-profile-undefined-symbols.txt"
+          if grep -Eq '(^|[[:space:]])seccomp_filter_release([[:space:]]|$)' "$GITHUB_WORKSPACE/diagnostics/app-profile-undefined-symbols.txt"; then
+            echo 'BLOCKER: app_profile.o still references seccomp_filter_release, which is absent from the Linux 4.19.325 base tree.' >&2
+            echo 'The full vmlinux link is blocked to avoid repeating the previous late linker failure.' >&2
+            exit 1
+          fi
+          if ! grep -Eq '(^|[[:space:]])put_seccomp_filter([[:space:]]|$)' "$GITHUB_WORKSPACE/diagnostics/app-profile-undefined-symbols.txt"; then
+            echo 'Expected app_profile.o to use the Linux 4.19 put_seccomp_filter API, but the symbol audit did not find it.' >&2
+            exit 1
+          fi
+          echo 'Seccomp link-symbol audit passed: app_profile.o references put_seccomp_filter and does not reference seccomp_filter_release.' | tee -a "$API_REPORT"
+
+          if [[ -s "$GITHUB_WORKSPACE/diagnostics/unresolved-kernel-apis.txt" ]]; then
+            echo 'Unresolved KernelSU kernel APIs remain; full kernel build is intentionally blocked.' >&2
+            exit 1
+          fi
+          {
+            echo
+            echo '--- Darknight compatibility markers in current sources ---'
+            grep -R -n --include='*.c' --include='*.h' 'DARKNIGHT_KERNELSU_PATH_\|DARKNIGHT_LINUX419_' \
+              fs/namespace.c KernelSU-Next/kernel 2>/dev/null || true
+          } >> "$API_REPORT"
+          echo 'KernelSU object compile and kernel API preflight passed.'
+
+      - name: Compile kernel Image
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "Build started (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Neutron tag: $NEUTRON_TAG"
+            clang --version
+            ld.lld --version
+            echo "Command: make V=1 -j${KERNEL_BUILD_JOBS} ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS CROSS_COMPILE=$CROSS_COMPILE Image (CONFIG_LOCALVERSION is set to -Darknight in .config)"
+          } | tee "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
+          make V=1 -j"$KERNEL_BUILD_JOBS" ARCH="$ARCH" LLVM="$LLVM" LLVM_IAS="$LLVM_IAS" \
+            CROSS_COMPILE="$CROSS_COMPILE" Image 2>&1 | tee -a "$GITHUB_WORKSPACE/diagnostics/kernel-build.log"
+          test -s arch/arm64/boot/Image
+          file arch/arm64/boot/Image | tee "$GITHUB_WORKSPACE/diagnostics/kernel-image-file.txt"
+          strings arch/arm64/boot/Image | grep -m1 'Linux version' | tee "$GITHUB_WORKSPACE/diagnostics/kernel-image-version.txt" || true
+          strings arch/arm64/boot/Image | grep -iE -m15 'KernelSU|ksu|grant root|Darknight' \
+            > "$GITHUB_WORKSPACE/diagnostics/kernel-image-ksu-strings.txt" || true
+
+      - name: Package TWRP-flashable AnyKernel3 ZIP
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          AK3="$RUNNER_TEMP/AnyKernel3"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3"
+          cp "$GITHUB_WORKSPACE/kernel/arch/arm64/boot/Image" "$AK3/Image"
+          cat > "$AK3/anykernel.sh" <<'AK3SCRIPT'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## Darknight KernelSU-Next for Samsung Galaxy A13X (SM-A135F / SM-A135M)
+          properties() { '
+          kernel.string=Darknight KernelSU-Next for Samsung Galaxy A13X by MAX ARAF
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=a13
+          device.name2=a13x
+          device.name3=a13nsxx
+          device.name4=SM-A135F
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          AK3SCRIPT
+          chmod 0755 "$AK3/anykernel.sh"
+          rm -rf "$AK3/.git" "$AK3/.github"
+          rm -f "$AK3/README.md" "$AK3/README" "$AK3/.gitignore"
+          find "$AK3" -name placeholder -type f -delete
+          cd "$AK3"
+          zip -qr "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-AnyKernel3.zip" . \
+            -x '*/.git/*' '*/README*' '*placeholder'
+          unzip -t "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-AnyKernel3.zip"
+
+          KRELEASE="$(cd "$GITHUB_WORKSPACE/kernel" && make -s ARCH=arm64 kernelrelease)"
+          KSU_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-parse HEAD)"
+          KSU_REV_COUNT="$(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-list --count HEAD)"
+          KSU_DRIVER_VERSION="$((30000 + KSU_REV_COUNT))"
+          KERNEL_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel" rev-parse HEAD)"
+          [[ "$KRELEASE" == "4.19.325-Darknight" ]] || { echo "Refusing to package kernel: expected 4.19.325-Darknight, got $KRELEASE" >&2; exit 1; }
+          [[ "$KSU_COMMIT" == "$EXPECTED_KSU_COMMIT" ]] || { echo "Refusing to package unexpected KernelSU-Next commit: $KSU_COMMIT" >&2; exit 1; }
+          [[ "$KSU_DRIVER_VERSION" == "33333" ]] || { echo "Refusing to package unexpected KSU driver version: $KSU_DRIVER_VERSION" >&2; exit 1; }
+          {
+            echo "Kernel release: $KRELEASE"
+            echo "Kernel source: https://github.com/$KERNEL_REPO/tree/$KERNEL_BRANCH"
+            echo "Kernel source commit: $KERNEL_COMMIT"
+            echo "KernelSU repository: https://github.com/$KSU_REPO"
+            echo "KernelSU ref requested: $KSU_REF"
+            echo "KernelSU commit: $KSU_COMMIT"
+            echo "KernelSU method: KernelSU-Next pinned source with built-in syscall dispatcher / tracepoint hooks; legacy manual hook script not applied"
+            echo "KSU build verification: Kbuild-reported version 33333 and core/syscall-hook objects required before Image build"
+            echo "KernelSU revision count: $KSU_REV_COUNT"
+            echo "KernelSU driver version: $KSU_DRIVER_VERSION"
+            echo "Neutron Clang tag: $NEUTRON_TAG"
+            echo "Architecture: arm64"
+            echo "Defconfig: $DEFCONFIG"
+            echo "AnyKernel3 target: boot (non-A/B setting; verify on-device partition layout)"
+            echo "SUSFS: disabled / not integrated"
+            echo "Root access: not asserted by CI; verify KernelSU Manager integration and su grant on-device"
+            echo "Flash safety: not verified by CI; retain a known-good boot image and recovery path before flashing"
+          } > "$GITHUB_WORKSPACE/build-info.txt"
+          (cd "$GITHUB_WORKSPACE" && sha256sum A13X-Darknight-KernelSU-Next-AnyKernel3.zip > sha256sum.txt)
+
+      - name: Upload flashable kernel ZIP and build info
+        uses: actions/upload-artifact@v7
         with:
-          name: M21-OneUI-Grass-Kernel
+          name: A13X-Darknight-KernelSU-Next-AnyKernel3
           path: |
-            kernel-src/out/arch/arm64/boot/Image
-            kernel-src/kernel_zip/GRASS*.zip
-            kernel-src/build-info.txt
-            kernel-src/SHA256SUMS.txt
+            A13X-Darknight-KernelSU-Next-AnyKernel3.zip
+            build-info.txt
+            sha256sum.txt
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
+
+      - name: Collect diagnostics (runs even after failed build)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          DIAG="$GITHUB_WORKSPACE/diagnostics"
+          mkdir -p "$DIAG"
+          {
+            echo "A13X Darknight Kernel build diagnostics"
+            echo "UTC time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "GitHub repository: $GITHUB_REPOSITORY"
+            echo "Workflow run ID: $GITHUB_RUN_ID"
+            echo "Workflow run attempt: $GITHUB_RUN_ATTEMPT"
+            echo "Runner OS: ${RUNNER_OS:-unknown}"
+            echo "Runner arch: ${RUNNER_ARCH:-unknown}"
+            echo "Kernel repo: $KERNEL_REPO"
+            echo "Kernel branch: $KERNEL_BRANCH"
+            echo "Defconfig: $DEFCONFIG"
+            echo "Neutron release tag: $NEUTRON_TAG"
+            echo "KernelSU repo: $KSU_REPO"
+            echo "KernelSU requested ref: $KSU_REF"
+            echo 'Legacy syscall hook patch: intentionally disabled; pinned KernelSU-Next revision owns its dispatcher hooks'
+            echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
+            echo 'KernelSU 4.19 seccomp compatibility: legacy put_seccomp_filter selected; seccomp_filter_release is kept only for kernel 6.6+'
+            echo 'Link-level preflight audits app_profile.o for missing seccomp_filter_release before full vmlinux build'
+            echo 'Preflight: compiles KernelSU objects before full Image, validates Kbuild-reported version 33333 and key hook objects, and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
+            echo 'SELinux compatibility: immutable non-GKI file backport; exact upstream bytes/hashes are preserved separately, working copies have trailing horizontal whitespace normalized, and APIs are validated by Kbuild object preflight; KSU HEAD and revision-derived driver version remain pinned.'
+            echo
+            echo '--- Toolchain ---'
+            if command -v clang >/dev/null 2>&1; then clang --version; else echo 'clang unavailable'; fi
+            if command -v ld.lld >/dev/null 2>&1; then ld.lld --version; else echo 'ld.lld unavailable'; fi
+            echo
+            echo '--- Kernel source ---'
+            if [[ -d "$GITHUB_WORKSPACE/kernel/.git" ]]; then
+              git -C "$GITHUB_WORKSPACE/kernel" rev-parse HEAD
+              git -C "$GITHUB_WORKSPACE/kernel" log -1 --format='%H%n%ad%n%s' --date=iso-strict
+              git -C "$GITHUB_WORKSPACE/kernel" status --short
+              git -C "$GITHUB_WORKSPACE/kernel" diff --check
+              git -C "$GITHUB_WORKSPACE/kernel" diff --binary > "$DIAG/all-kernel-source-diffs.patch"
+              if [[ -d "$GITHUB_WORKSPACE/kernel/KernelSU-Next/.git" ]]; then
+                echo '--- KernelSU-Next commit ---'
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-parse HEAD
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" log -1 --format='%H%n%ad%n%s' --date=iso-strict
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" grep -n -E 'KSU_VERSION|ksu_syscall_hook_manager_init|register_trace_prio_sys_enter|ksu_register_syscall_hook|ksu_handle_execveat_sucompat|ksu_handle_faccessat_sucompat' HEAD -- kernel 2>/dev/null | head -200
+                echo '--- KernelSU seccomp-cache compatibility source (working tree) ---'
+                grep -n -E 'DARKNIGHT_LEGACY_SECCOMP_CACHE_STUBS|SECCOMP_ARCH_NATIVE_NR|ksu_seccomp_(allow|clear)_cache' "$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel/infra/seccomp_cache.c" 2>/dev/null | head -100
+                git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" diff --binary > "$DIAG/ksu-all-source-diffs.patch"
+                echo "KSU Git revision count: $(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-list --count HEAD)"
+              fi
+              if [[ -f "$GITHUB_WORKSPACE/kernel/Makefile" ]]; then
+                echo "Kernel version: $(make -s -C "$GITHUB_WORKSPACE/kernel" kernelversion 2>&1)"
+                echo "Kernel release: $(make -s -C "$GITHUB_WORKSPACE/kernel" ARCH=arm64 kernelrelease 2>&1)"
+              fi
+            else
+              echo 'Kernel source checkout is unavailable.'
+            fi
+          } > "$DIAG/build-environment.txt" 2>&1
+
+          if [[ -f "$GITHUB_WORKSPACE/kernel/.config" ]]; then
+            cp "$GITHUB_WORKSPACE/kernel/.config" "$DIAG/kernel.config"
+            if [[ -f "$GITHUB_WORKSPACE/kernel/include/config/auto.conf" ]]; then
+              cp "$GITHUB_WORKSPACE/kernel/include/config/auto.conf" "$DIAG/kernel.auto.conf"
+              grep -E '^CONFIG_LOCALVERSION(=|_)' "$GITHUB_WORKSPACE/kernel/include/config/auto.conf" \
+                > "$DIAG/auto-localversion-summary.txt" || true
+            fi
+            grep -E '^(CONFIG_(KSU|KSU_DEBUG|KPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS|FTRACE|FTRACE_SYSCALLS|KRETPROBES|LOCALVERSION|LOCALVERSION_AUTO)|# CONFIG_.*SUSFS.* is not set|CONFIG_.*SUSFS.*=)' \
+              "$GITHUB_WORKSPACE/kernel/.config" > "$DIAG/config-summary.txt" || true
+          else
+            echo 'Kernel .config was not generated.' > "$DIAG/config-summary.txt"
+          fi
+
+          : > "$DIAG/errors-summary.txt"
+          for log in "$DIAG"/*.log; do
+            [[ -f "$log" ]] || continue
+            {
+              echo "===== $(basename "$log") ====="
+              grep -nE -i '(^|[[:space:]])(fatal )?error:|error generated|errors? generated|make(:|\[[0-9]+\]:) \*\*\*|No rule to make target|Error [0-9]+|undefined reference to|No such file or directory|LLVM ERROR:|Broken pipe|warning:|WARNING: unmet direct dependencies|warning: override:' "$log" || true
+              echo
+            } >> "$DIAG/errors-summary.txt"
+          done
+          if [[ -f "$DIAG/kernel-build.log" ]]; then
+            tail -n 250 "$DIAG/kernel-build.log" > "$DIAG/kernel-build-last-250-lines.txt" || true
+          fi
+          python3 - "$DIAG" <<'PYDIAG'
+          from pathlib import Path
+          import re, sys
+          d = Path(sys.argv[1])
+          sources = [p for p in d.glob('*.log') if p.is_file()]
+          primary = []
+          warnings = []
+          broken = 0
+          error_pat = re.compile(r'(?i)(?::\d+(?::\d+)?:\s*(?:fatal )?error:|undefined reference to|No such file or directory|No rule to make target|make(?:\[[0-9]+\])?: \*\*\*|Error [0-9]+|LLVM ERROR:|error generated|errors generated)')
+          for p in sources:
+              lines = p.read_text(errors='replace').splitlines()
+              for i, line in enumerate(lines):
+                  if 'Broken pipe' in line:
+                      broken += 1
+                      continue
+                  if error_pat.search(line):
+                      ctx = lines[max(0, i-1):min(len(lines), i+3)]
+                      primary.append((p.name, i+1, '\n'.join(ctx)))
+                  elif 'warning:' in line.lower():
+                      warnings.append(f'{p.name}:{i+1}: {line}')
+          seen = set()
+          out = []
+          for name, line_no, block in primary:
+              key = (name, block)
+              if key in seen:
+                  continue
+              seen.add(key)
+              out.extend([f'[{name}:{line_no}]', block, ''])
+          if not out:
+              out = ['No matching compiler/linker/make errors found in captured logs.']
+          out += ['', f'Broken-pipe messages (possibly secondary): {broken}', f'Warnings captured: {len(warnings)}', 'See errors-summary.txt and individual logs for full context.']
+          (d/'primary-errors.txt').write_text('\n'.join(out) + '\n')
+          (d/'warnings-summary.txt').write_text('\n'.join(warnings) + ('\n' if warnings else 'No warnings captured.\n'))
+          print(f'Primary diagnostic blocks: {len(seen)}; warnings: {len(warnings)}; broken pipes: {broken}')
+          PYDIAG
+          {
+            echo 'Diagnostics files:'
+            find "$DIAG" -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
+            echo
+            echo 'Includes toolchain info, source commit/diffs, KernelSU source/version/hook-manager inspection, config, KSU preflight compile, kernel compile, grouped primary errors, warnings, and full logs.'
+          } > "$DIAG/README.txt"
+
+      - name: Upload build diagnostics (always, including failures)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: A13X-Darknight-Build-Diagnostics-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
