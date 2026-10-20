@@ -1,4 +1,4 @@
-name: A13X Darknight KernelSU-Next Kernel (v14.3 regex replacement fix + UAPI guard + Origin-style installer)
+name: A13X Darknight KernelSU-Next Kernel (v14.4 manager hash audit fix + UAPI guard + Origin-style installer)
 
 on:
   workflow_dispatch:
@@ -1550,9 +1550,28 @@ jobs:
           grep -q 'DARKNIGHT_MANAGER_SECCOMP_FD_FIX' KernelSU-Next/kernel/hook/setuid_hook.c || {
             echo 'Manager seccomp FD compatibility patch is missing.' >&2; exit 1;
           }
-          grep -Fq "EXPECTED_MANAGER_HASH=\"\$(KSU_NEXT_MANAGER_HASH)\"" KernelSU-Next/kernel/Kbuild || {
-            echo 'Pinned Kbuild is not using the exact KSU_NEXT_MANAGER_HASH from workflow env.' >&2; exit 1;
-          }
+          # Do not grep Kbuild source text for one exact quote-escaping form:
+          # the source may contain backslash-escaped quotes while the effective
+          # compiler invocation already expands the environment value correctly.
+          # Audit the actual Kbuild command line recorded by the completed object
+          # preflight, which is the meaningful contract check.
+          python3 - "$GITHUB_WORKSPACE/diagnostics/ksu-preflight-build.log" \
+            "$KSU_NEXT_MANAGER_HASH" "$KSU_MANAGER_PACKAGE" <<'PYHASH'
+          from pathlib import Path
+          import sys
+          log_path = Path(sys.argv[1])
+          expected_hash, expected_package = sys.argv[2].lower(), sys.argv[3]
+          if not log_path.is_file():
+              raise SystemExit(f'Missing KernelSU object preflight log: {log_path}')
+          log = log_path.read_text(errors='replace')
+          hash_lines = [line for line in log.splitlines() if '-DEXPECTED_MANAGER_HASH' in line]
+          package_lines = [line for line in log.splitlines() if '-DKSU_MANAGER_PACKAGE' in line]
+          if not any(expected_hash in line.lower() for line in hash_lines):
+              raise SystemExit('Compiler invocation did not contain the pinned KSU-Next Manager signer hash')
+          if not any(expected_package in line for line in package_lines):
+              raise SystemExit('Compiler invocation did not contain the pinned KSU-Next Manager package')
+          print('Effective compiler flags verified: expected Manager signer hash and package are present.')
+          PYHASH
           grep -q '0cbd8ba08218d2f5a7fbe2820534f670f9c396199620845557185460d06b2d76' diagnostics/ksu-manager-fd-fix.txt || {
             echo 'Diagnostic record does not contain the exact installed KSU-Next Manager signer.' >&2; exit 1;
           }
