@@ -230,6 +230,12 @@ jobs:
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/Makefile
           test -d KernelSU-Next/.git
+          # KernelSU-Next keeps the shared UAPI at repository-root uapi/, not kernel/uapi/.
+          test -s KernelSU-Next/uapi/supercall.h || {
+            echo "Pinned KernelSU-Next shared UAPI header is missing: KernelSU-Next/uapi/supercall.h" >&2
+            find KernelSU-Next -maxdepth 4 -type f -name supercall.h -print >&2 || true
+            exit 1
+          }
           KSU_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
           echo "KernelSU-Next commit: $KSU_COMMIT" | tee "$GITHUB_WORKSPACE/diagnostics/ksu-commit.txt"
           if [[ "$KSU_COMMIT" != "$EXPECTED_KSU_COMMIT" ]]; then
@@ -1045,10 +1051,17 @@ jobs:
           APP_H="$KSU_ROOT/policy/app_profile.h"
           SETUID="$KSU_ROOT/hook/setuid_hook.c"
           KBUILD="$KSU_ROOT/Kbuild"
-          UAPI="$KSU_ROOT/uapi/supercall.h"
+          # UAPI is a shared header at the KernelSU-Next repository root.
+          # Kernel implementation files remain under the repository's kernel/ directory.
+          UAPI="$GITHUB_WORKSPACE/kernel/KernelSU-Next/uapi/supercall.h"
           DISPATCH="$KSU_ROOT/supercall/dispatch.c"
           DIAG="$GITHUB_WORKSPACE/diagnostics"
           mkdir -p "$DIAG"
+          test -s "$UAPI" || {
+            echo "Pinned KernelSU-Next UAPI header was not found at expected root-level path: $UAPI" >&2
+            find "$GITHUB_WORKSPACE/kernel/KernelSU-Next" -maxdepth 4 -type f -name supercall.h -print >&2 || true
+            exit 1
+          }
           python3 - "$APP" "$APP_H" "$SETUID" "$KBUILD" "$UAPI" "$DISPATCH" <<'PYMANAGER'
           from pathlib import Path
           import os, re, sys
