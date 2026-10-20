@@ -1572,8 +1572,18 @@ jobs:
               raise SystemExit('Compiler invocation did not contain the pinned KSU-Next Manager package')
           print('Effective compiler flags verified: expected Manager signer hash and package are present.')
           PYHASH
-          grep -q '0cbd8ba08218d2f5a7fbe2820534f670f9c396199620845557185460d06b2d76' diagnostics/ksu-manager-fd-fix.txt || {
-            echo 'Diagnostic record does not contain the exact installed KSU-Next Manager signer.' >&2; exit 1;
+          # This step runs with working-directory: kernel, while diagnostics are
+          # always written under GITHUB_WORKSPACE/diagnostics. Never use a relative
+          # diagnostics/ path here (it would resolve to kernel/diagnostics).
+          MANAGER_FIX_RECORD="$GITHUB_WORKSPACE/diagnostics/ksu-manager-fd-fix.txt"
+          test -s "$MANAGER_FIX_RECORD" || {
+            echo "Missing manager FD-fix audit record: $MANAGER_FIX_RECORD" >&2
+            exit 1
+          }
+          EXPECTED_MANAGER_HASH_LOWER="$(printf '%s' "$KSU_NEXT_MANAGER_HASH" | tr '[:upper:]' '[:lower:]')"
+          grep -Fq "Manager signer SHA-256: $EXPECTED_MANAGER_HASH_LOWER" "$MANAGER_FIX_RECORD" || {
+            echo 'Diagnostic record does not contain the exact installed KSU-Next Manager signer.' >&2
+            exit 1
           }
           grep -q 'KSU_MANAGER_PACKAGE' KernelSU-Next/kernel/Kbuild || {
             echo 'KSU Manager package restriction is missing.' >&2; exit 1;
