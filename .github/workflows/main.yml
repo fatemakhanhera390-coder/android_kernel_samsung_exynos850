@@ -1528,7 +1528,7 @@ jobs:
           grep -q 'DARKNIGHT_MANAGER_SECCOMP_FD_FIX' KernelSU-Next/kernel/hook/setuid_hook.c || {
             echo 'Manager seccomp FD compatibility patch is missing.' >&2; exit 1;
           }
-          grep -q 'EXPECTED_MANAGER_HASH=\"$(KSU_NEXT_MANAGER_HASH)\"' KernelSU-Next/kernel/Kbuild || {
+          grep -Fq "EXPECTED_MANAGER_HASH=\"\$(KSU_NEXT_MANAGER_HASH)\"" KernelSU-Next/kernel/Kbuild || {
             echo 'Pinned Kbuild is not using the exact KSU_NEXT_MANAGER_HASH from workflow env.' >&2; exit 1;
           }
           grep -q '0cbd8ba08218d2f5a7fbe2820534f670f9c396199620845557185460d06b2d76' diagnostics/ksu-manager-fd-fix.txt || {
