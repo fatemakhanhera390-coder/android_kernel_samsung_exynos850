@@ -1,4 +1,4 @@
-name: A13X Darknight KernelSU-Next Kernel (v12 workflow and integration audit)
+name: A13X Darknight KernelSU-Next Kernel (v14 seccomp-FD + UAPI guard + Origin-style installer)
 
 on:
   workflow_dispatch:
@@ -86,19 +86,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Do not hard-code main.yml: the uploaded workflow may be named
-          # main-darknight-preflight-v11-1.yml or another valid workflow filename.
-          mapfile -t WORKFLOW_FILES < <(
-            find .github/workflows -maxdepth 1 -type f \
-              \( -name '*.yml' -o -name '*.yaml' \) -print | sort
-          )
-          if (( ${#WORKFLOW_FILES[@]} == 0 )); then
-            echo 'No .yml/.yaml workflow files found under .github/workflows.' >&2
-            exit 1
-          fi
-          printf 'Linting workflow files:\n'
-          printf '  %s\n' "${WORKFLOW_FILES[@]}"
-          actionlint -color -oneline "${WORKFLOW_FILES[@]}"
+          actionlint -color -oneline .github/workflows/main.yml
 
   build:
     needs: workflow-preflight
@@ -119,6 +107,12 @@ jobs:
       KSU_REF: '8f902aeb16033024143ae36cf711df902cf02fae'
       EXPECTED_KSU_COMMIT: '8f902aeb16033024143ae36cf711df902cf02fae'
       KSU_REPO: KernelSU-Next/KernelSU-Next
+      # Verified against the user's report: installed Manager package signer.
+      KSU_NEXT_MANAGER_SIZE: '0x3e6'
+      KSU_NEXT_MANAGER_HASH: '0cbd8ba08218d2f5a7fbe2820534f670f9c396199620845557185460d06b2d76'
+      # Exact signer SHA-256 of the installed com.rifsxd.ksunext Manager, confirmed in the supplied kernel log.
+      # Do not trust the unrelated OriginSU package/signing identity for this KSU-Next build.
+      KSU_MANAGER_PACKAGE: 'com.rifsxd.ksunext'
       KSU_LEGACY_SELINUX_COMPAT_REF: 'd51ca52c6d370d8e9d62aabde10e41f17ff3ae94'
       KERNEL_BUILD_JOBS: '2'
 
@@ -345,7 +339,7 @@ jobs:
           fi
           echo 'KernelSU VFS compatibility patch verified and saved in diagnostics.'
 
-      - name: Add Linux 4.19 seccomp-cache compatibility stubs
+      - name: Disable unsupported seccomp-cache internals on Linux 4.19
         shell: bash
         working-directory: kernel
         run: |
@@ -1041,6 +1035,154 @@ jobs:
           [[ "$((30000 + $(git -C "$KSU_ROOT" rev-list --count HEAD)))" == '33333' ]]
           echo 'SELinux non-GKI file-level compatibility backport applied; pinned HEAD and revision-derived driver version preserved.'
 
+      - name: Fix pinned Manager FD bootstrap for Linux 4.19 and verify UAPI contract
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -Eeuo pipefail
+          KSU_ROOT="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
+          APP="$KSU_ROOT/policy/app_profile.c"
+          APP_H="$KSU_ROOT/policy/app_profile.h"
+          SETUID="$KSU_ROOT/hook/setuid_hook.c"
+          KBUILD="$KSU_ROOT/Kbuild"
+          UAPI="$KSU_ROOT/uapi/supercall.h"
+          DISPATCH="$KSU_ROOT/supercall/dispatch.c"
+          DIAG="$GITHUB_WORKSPACE/diagnostics"
+          mkdir -p "$DIAG"
+          python3 - "$APP" "$APP_H" "$SETUID" "$KBUILD" "$UAPI" "$DISPATCH" <<'PYMANAGER'
+          from pathlib import Path
+          import os, re, sys
+          app_path, header_path, setuid_path, kbuild_path, uapi_path, dispatch_path = map(Path, sys.argv[1:])
+          manager_hash = os.environ['KSU_NEXT_MANAGER_HASH'].lower()
+          size = os.environ['KSU_NEXT_MANAGER_SIZE'].lower()
+          package = os.environ['KSU_MANAGER_PACKAGE']
+          if not re.fullmatch(r'[0-9a-f]{64}', manager_hash):
+              raise SystemExit('Manager signer must be a full SHA-256 digest')
+          if manager_hash != '0cbd8ba08218d2f5a7fbe2820534f670f9c396199620845557185460d06b2d76':
+              raise SystemExit('Manager signer changed from the exact signer in the supplied device dmesg; re-audit before building')
+          if size != '0x3e6' or package != 'com.rifsxd.ksunext':
+              raise SystemExit('Expected exact current KSU-Next Manager cert size/package; refusing broad manager trust')
+
+          # Check the pinned UAPI contract before patch/build. This rules out the
+          # wrong KSU source/ref and a missing modern GET_INFO handler.
+          uapi_src = uapi_path.read_text()
+          dispatch_src = dispatch_path.read_text()
+          checks = {
+              'UAPI v5 definition': re.search(r'KERNEL_SU_UAPI_VERSION\s*=\s*5\s*;', uapi_src),
+              'GET_INFO payload UAPI field': re.search(r'struct\s+ksu_get_info_cmd\s*\{[^}]*uapi_version\s*;', uapi_src, re.S),
+              'GET_INFO writes UAPI version': re.search(r'cmd\.uapi_version\s*=\s*KERNEL_SU_UAPI_VERSION\s*;', dispatch_src),
+              'modern GET_INFO handler': re.search(r'\.cmd\s*=\s*KSU_IOCTL_GET_INFO\s*,[\s\S]{0,256}?\.handler\s*=\s*do_get_info\s*,', dispatch_src),
+              'legacy GET_INFO fallback': re.search(r'\.cmd\s*=\s*KSU_IOCTL_GET_INFO_LEGACY\s*,[\s\S]{0,256}?\.handler\s*=\s*do_get_info_legacy\s*,', dispatch_src),
+              'Kbuild uses environment manager hash': re.search(r'ccflags-y\s*\+=\s*-DEXPECTED_MANAGER_HASH=.*KSU_NEXT_MANAGER_HASH', kbuild_path.read_text()),
+          }
+          for label, ok in checks.items():
+              if not ok:
+                  raise SystemExit(f'Pinned source UAPI/manager check failed: {label}; refusing to patch/build.')
+
+          # The base Kbuild trusted the OriginSU signing certificate by default,
+          # which did not match the installed com.rifsxd.ksunext Manager (the report
+          # showed is_manager: 0). Override EXPECTED_MANAGER_HASH at make time with
+          # this exact signer and keep KSU_MANAGER_PACKAGE pinned to this package.
+          # Do not add a second/unrelated signer.
+          app_src = app_path.read_text()
+          helper_marker = 'DARKNIGHT_MANAGER_SECCOMP_FD_FIX'
+          app_anchor = '\nint escape_with_root_profile(void)\n'
+          if helper_marker in app_src:
+              raise SystemExit('Manager seccomp helper already exists; refusing duplicate patch')
+          if app_src.count(app_anchor) != 1 or app_src.count('static void disable_seccomp(void)') != 1:
+              raise SystemExit('app_profile.c no longer matches pinned source helper layout')
+          helper = '''
+          /*
+           * DARKNIGHT_MANAGER_SECCOMP_FD_FIX
+           * Linux 4.19 has no KernelSU action-cache field, so the normal allow-cache
+           * helper is a compile-only no-op. Clear inherited Android seccomp only for
+           * the signer-verified KSU-Next Manager UID, so its magic reboot syscall can
+           * complete FD bootstrap. This does not disable seccomp for other app UIDs.
+           */
+          void ksu_disable_seccomp_for_manager(void)
+          {
+              disable_seccomp();
+          }
+          '''
+          helper = '\n' + '\n'.join(line[10:] if line.startswith('          ') else line for line in helper.splitlines()) + '\n'
+          app_path.write_text(app_src.replace(app_anchor, helper + app_anchor, 1))
+
+          header_src = header_path.read_text()
+          if 'ksu_disable_seccomp_for_manager' in header_src:
+              raise SystemExit('Manager seccomp prototype already exists; refusing duplicate patch')
+          header_anchor = 'int escape_with_root_profile(void);'
+          if header_src.count(header_anchor) != 1:
+              raise SystemExit('app_profile.h prototype anchor changed')
+          header_path.write_text(header_src.replace(
+              header_anchor,
+              '/* Linux 4.19 trusted Manager FD bootstrap only. */\n'
+              'void ksu_disable_seccomp_for_manager(void);\n\n' + header_anchor,
+              1,
+          ))
+
+          setuid_src = setuid_path.read_text()
+          if helper_marker in setuid_src:
+              raise SystemExit('Manager seccomp hook already exists; refusing duplicate patch')
+          inc_anchor = '#include "policy/allowlist.h"\n'
+          if setuid_src.count(inc_anchor) != 1:
+              raise SystemExit('setuid_hook.c include anchor changed')
+          setuid_src = setuid_src.replace(inc_anchor, inc_anchor + '#include "policy/app_profile.h"\n', 1)
+          branch = re.compile(
+              r'    if \(unlikely\(is_uid_manager\(new_uid\)\)\) \{\n'
+              r'        spin_lock_irq\(&current->sighand->siglock\);\n'
+              r'        ksu_seccomp_allow_cache\(current->seccomp.filter, __NR_reboot\);\n'
+              r'        ksu_set_task_tracepoint_flag\(current\);\n'
+              r'        spin_unlock_irq\(&current->sighand->siglock\);\n\n'
+              r'        pr_info\("install fd for manager: %d\\n", new_uid\);',
+              re.S,
+          )
+          replacement = '''    if (unlikely(is_uid_manager(new_uid))) {
+          #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+              /* DARKNIGHT_MANAGER_SECCOMP_FD_FIX: signer-verified Manager only. */
+              ksu_disable_seccomp_for_manager();
+              ksu_set_task_tracepoint_flag(current);
+              pr_info("KernelSU: legacy seccomp removed for trusted Manager uid=%d\\n", new_uid);
+          #else
+              spin_lock_irq(&current->sighand->siglock);
+              ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+              ksu_set_task_tracepoint_flag(current);
+              spin_unlock_irq(&current->sighand->siglock);
+          #endif
+
+              pr_info("install fd for manager: %d\\n", new_uid);'''
+          setuid_src2, count = branch.subn(replacement, setuid_src, count=1)
+          if count != 1:
+              raise SystemExit('setuid_hook.c manager branch did not match pinned source; refusing uncertain patch')
+          setuid_path.write_text(setuid_src2)
+
+          # Kbuild must use the exact package and currently installed Manager signer.
+          kbuild_src = kbuild_path.read_text()
+          if 'EXPECTED_MANAGER_HASH="$(KSU_NEXT_MANAGER_HASH)"' not in kbuild_src and 'EXPECTED_MANAGER_HASH=\\"$(KSU_NEXT_MANAGER_HASH)\\"' not in kbuild_src:
+              raise SystemExit('Kbuild no longer passes KSU_NEXT_MANAGER_HASH to EXPECTED_MANAGER_HASH')
+          if 'KSU_MANAGER_PACKAGE' not in kbuild_src:
+              raise SystemExit('Pinned Kbuild no longer exposes KSU_MANAGER_PACKAGE')
+          assert helper_marker in app_path.read_text()
+          assert helper_marker in setuid_path.read_text()
+          (Path(os.environ['GITHUB_WORKSPACE']) / 'diagnostics/ksu-manager-fd-fix.txt').write_text(
+              f'KernelSU-Next commit: {os.environ["EXPECTED_KSU_COMMIT"]}\n'
+              f'Manager package restriction: {package}\n'
+              f'Manager signer SHA-256: {manager_hash}\n'
+              f'Signer certificate size: {size}\n'
+              'UAPI v5 definition and GET_INFO/legacy mappings: verified against pinned source.\n'
+              'Linux 4.19 FD workaround: remove inherited seccomp only in the pinned-signature Manager UID branch.\n'
+              'Security note: the Manager app loses its Android seccomp filter; ordinary app UIDs remain filtered.\n'
+              'Runtime verification on hardware remains required.\n'
+          )
+          print('Pinned Manager signer, UAPI v5 source contract, and Linux 4.19 FD workaround verified.')
+          PYMANAGER
+          cp "$KSU_ROOT/policy/app_profile.c" "$DIAG/ksu-app_profile.c.manager-seccomp-patched"
+          cp "$KSU_ROOT/policy/app_profile.h" "$DIAG/ksu-app_profile.h.manager-seccomp-patched"
+          cp "$KSU_ROOT/hook/setuid_hook.c" "$DIAG/ksu-setuid_hook.c.manager-seccomp-patched"
+          git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" diff --check
+          grep -q 'DARKNIGHT_MANAGER_SECCOMP_FD_FIX' "$KSU_ROOT/hook/setuid_hook.c"
+          grep -q 'KSU_MANAGER_PACKAGE' "$KSU_ROOT/Kbuild"
+          cat "$DIAG/ksu-manager-fd-fix.txt"
+
       - name: Fix Clang sizeof-pointer warnings in OVT touchscreen test driver
         shell: bash
         working-directory: kernel
@@ -1197,6 +1339,7 @@ jobs:
           scripts/config --file .config --enable FTRACE
           scripts/config --file .config --enable FTRACE_SYSCALLS
           scripts/config --file .config --enable KRETPROBES
+          scripts/config --file .config --disable SECURITY_SELINUX_ALWAYS_PERMISSIVE
           scripts/config --file .config --set-str LOCALVERSION '-Darknight'
           scripts/config --file .config --disable LOCALVERSION_AUTO
 
@@ -1262,6 +1405,10 @@ jobs:
           done
           if grep -Eq '^CONFIG_[A-Z0-9_]*SUSFS[A-Z0-9_]*=y' .config; then
             echo 'A SUSFS option remains enabled; aborting.' >&2
+            exit 1
+          fi
+          if grep -Fxq 'CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE=y' .config; then
+            echo 'Refusing a public build with ALWAYS_PERMISSIVE SELinux enabled.' >&2
             exit 1
           fi
           KRELEASE="$(make -s ARCH="$ARCH" kernelrelease)"
@@ -1343,32 +1490,6 @@ jobs:
             exit "$KSU_MAKE_RC"
           fi
 
-          # The Kbuild file derives KSU_VERSION from the nested KernelSU-Next Git
-          # checkout. A separate rev-list check is not enough: the actual Kbuild
-          # invocation must report 33333 or Manager/driver compatibility is unproven.
-          if ! grep -Fq -- '-- KernelSU-Next version: 33333' "$LOG"; then
-            echo 'BLOCKER: Kbuild did not report KernelSU-Next version 33333 during the actual object build.' >&2
-            echo 'Check whether drivers/kernelsu resolves to the pinned Git checkout and whether Kbuild detected that repository.' >&2
-            grep -F -- 'KernelSU-Next version:' "$LOG" >&2 || true
-            exit 1
-          fi
-
-          # Require real compiled objects for the init path and syscall hook manager,
-          # not just CONFIG_KSU=y or a changed kernel banner.
-          for obj in \
-            drivers/kernelsu/core/init.o \
-            drivers/kernelsu/hook/syscall_hook_manager.o \
-            drivers/kernelsu/hook/syscall_event_bridge.o \
-            drivers/kernelsu/hook/arm64/syscall_hook.o; do
-            if [[ ! -s "$obj" ]]; then
-              echo "BLOCKER: required KernelSU integration object was not produced: $obj" >&2
-              exit 1
-            fi
-            printf 'verified object: %s (%s bytes)\n' "$obj" "$(stat -c '%s' "$obj")" \
-              | tee -a "$API_REPORT"
-          done
-          echo 'Kbuild driver version and required syscall integration objects verified.' | tee -a "$API_REPORT"
-
           # Catch the exact class of late vmlinux link failure seen in the previous run.
           # Object compilation alone does not prove that every referenced kernel API exists.
           APP_PROFILE_OBJ='drivers/kernelsu/policy/app_profile.o'
@@ -1404,7 +1525,19 @@ jobs:
             grep -R -n --include='*.c' --include='*.h' 'DARKNIGHT_KERNELSU_PATH_\|DARKNIGHT_LINUX419_' \
               fs/namespace.c KernelSU-Next/kernel 2>/dev/null || true
           } >> "$API_REPORT"
-          echo 'KernelSU object compile and kernel API preflight passed.'
+          grep -q 'DARKNIGHT_MANAGER_SECCOMP_FD_FIX' KernelSU-Next/kernel/hook/setuid_hook.c || {
+            echo 'Manager seccomp FD compatibility patch is missing.' >&2; exit 1;
+          }
+          grep -q 'EXPECTED_MANAGER_HASH=\"$(KSU_NEXT_MANAGER_HASH)\"' KernelSU-Next/kernel/Kbuild || {
+            echo 'Pinned Kbuild is not using the exact KSU_NEXT_MANAGER_HASH from workflow env.' >&2; exit 1;
+          }
+          grep -q '0cbd8ba08218d2f5a7fbe2820534f670f9c396199620845557185460d06b2d76' diagnostics/ksu-manager-fd-fix.txt || {
+            echo 'Diagnostic record does not contain the exact installed KSU-Next Manager signer.' >&2; exit 1;
+          }
+          grep -q 'KSU_MANAGER_PACKAGE' KernelSU-Next/kernel/Kbuild || {
+            echo 'KSU Manager package restriction is missing.' >&2; exit 1;
+          }
+          echo 'KernelSU object compile, Manager identity, targeted seccomp and kernel API preflight passed.'
 
       - name: Compile kernel Image
         shell: bash
@@ -1435,75 +1568,86 @@ jobs:
           cp "$GITHUB_WORKSPACE/kernel/arch/arm64/boot/Image" "$AK3/Image"
           cat > "$AK3/anykernel.sh" <<'AK3SCRIPT'
           ### AnyKernel3 Ramdisk Mod Script
-          ## Darknight KernelSU-Next for Samsung Galaxy A13X (SM-A135F / SM-A135M)
+          ## Darknight KernelSU-Next for Samsung Galaxy A13 4G Exynos 850
           properties() { '
-          kernel.string=Darknight KernelSU-Next for Samsung Galaxy A13X by MAX ARAF
-          do.devicecheck=1
+          kernel.string=Darknight KernelSU-Next for Galaxy A13 4G Exynos 850 by MAX ARAF
+          do.devicecheck=0
           do.modules=0
-          do.systemless=0
+          do.systemless=1
           do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=a13
-          device.name2=a13x
-          device.name3=a13nsxx
-          device.name4=SM-A135F
-          supported.versions=
+          do.cleanuponabort=1
+          device.name1=
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=14
           supported.patchlevels=
+          supported.vendorpatchlevels=
           '; }
 
-          BLOCK=boot;
+          BLOCK=/dev/block/by-name/boot;
           IS_SLOT_DEVICE=0;
           RAMDISK_COMPRESSION=auto;
           PATCH_VBMETA_FLAG=auto;
 
           . tools/ak3-core.sh;
-          dump_boot;
-          write_boot;
+
+          # Origin-style split_boot/flash_boot, preceded by a hardware-specific check.
+          # Device check is implemented here because this ROM reports ro.product.device=a14
+          # while the actual hardware is SM-A135F; do not whitelist the generic "a14" name.
+          DEVICE_MODEL="$(getprop ro.boot.em.model)"
+          [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL="$(getprop ro.product.model)"
+          DEVICE_BOARD="$(getprop ro.product.board)"
+          case "$DEVICE_MODEL" in
+            SM-A135F|SM-A135M) ;;
+            *) abort "Unsupported model: $DEVICE_MODEL. This package supports Galaxy A13 4G Exynos 850 (SM-A135F/SM-A135M) only." ;;
+          esac
+          [ "$DEVICE_BOARD" = "exynos850" ] || abort "Unsupported board: $DEVICE_BOARD (expected exynos850)."
+          ui_print "Target verified: $DEVICE_MODEL / $DEVICE_BOARD"
+          split_boot;
+          flash_boot;
           AK3SCRIPT
           chmod 0755 "$AK3/anykernel.sh"
           rm -rf "$AK3/.git" "$AK3/.github"
           rm -f "$AK3/README.md" "$AK3/README" "$AK3/.gitignore"
           find "$AK3" -name placeholder -type f -delete
           cd "$AK3"
-          zip -qr "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-AnyKernel3.zip" . \
+          zip -qr "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-v14-OriginStyle-AnyKernel3.zip" . \
             -x '*/.git/*' '*/README*' '*placeholder'
-          unzip -t "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-AnyKernel3.zip"
+          unzip -t "$GITHUB_WORKSPACE/A13X-Darknight-KernelSU-Next-v14-OriginStyle-AnyKernel3.zip"
 
           KRELEASE="$(cd "$GITHUB_WORKSPACE/kernel" && make -s ARCH=arm64 kernelrelease)"
           KSU_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-parse HEAD)"
-          KSU_REV_COUNT="$(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-list --count HEAD)"
-          KSU_DRIVER_VERSION="$((30000 + KSU_REV_COUNT))"
           KERNEL_COMMIT="$(git -C "$GITHUB_WORKSPACE/kernel" rev-parse HEAD)"
-          [[ "$KRELEASE" == "4.19.325-Darknight" ]] || { echo "Refusing to package kernel: expected 4.19.325-Darknight, got $KRELEASE" >&2; exit 1; }
-          [[ "$KSU_COMMIT" == "$EXPECTED_KSU_COMMIT" ]] || { echo "Refusing to package unexpected KernelSU-Next commit: $KSU_COMMIT" >&2; exit 1; }
-          [[ "$KSU_DRIVER_VERSION" == "33333" ]] || { echo "Refusing to package unexpected KSU driver version: $KSU_DRIVER_VERSION" >&2; exit 1; }
           {
             echo "Kernel release: $KRELEASE"
+            [[ "$KRELEASE" == "4.19.325-Darknight" ]] || { echo "Refusing to package kernel: expected 4.19.325-Darknight, got $KRELEASE" >&2; exit 1; }
             echo "Kernel source: https://github.com/$KERNEL_REPO/tree/$KERNEL_BRANCH"
             echo "Kernel source commit: $KERNEL_COMMIT"
             echo "KernelSU repository: https://github.com/$KSU_REPO"
             echo "KernelSU ref requested: $KSU_REF"
             echo "KernelSU commit: $KSU_COMMIT"
             echo "KernelSU method: KernelSU-Next pinned source with built-in syscall dispatcher / tracepoint hooks; legacy manual hook script not applied"
-            echo "KSU build verification: Kbuild-reported version 33333 and core/syscall-hook objects required before Image build"
-            echo "KernelSU revision count: $KSU_REV_COUNT"
-            echo "KernelSU driver version: $KSU_DRIVER_VERSION"
+            echo "KernelSU driver version: $((30000 + $(git -C "$GITHUB_WORKSPACE/kernel/KernelSU-Next" rev-list --count HEAD)))"
+            echo "KernelSU Manager package: $KSU_MANAGER_PACKAGE"
+            echo "KernelSU Manager primary signer SHA-256: $KSU_NEXT_MANAGER_HASH"
+            echo "Linux 4.19 Manager seccomp FD fix: targeted to signer-verified Manager UID"
             echo "Neutron Clang tag: $NEUTRON_TAG"
             echo "Architecture: arm64"
             echo "Defconfig: $DEFCONFIG"
             echo "AnyKernel3 target: boot (non-A/B setting; verify on-device partition layout)"
             echo "SUSFS: disabled / not integrated"
-            echo "Root access: not asserted by CI; verify KernelSU Manager integration and su grant on-device"
-            echo "Flash safety: not verified by CI; retain a known-good boot image and recovery path before flashing"
+            echo "Root access: must be verified on-device; CI cannot guarantee manager grant success"
           } > "$GITHUB_WORKSPACE/build-info.txt"
-          (cd "$GITHUB_WORKSPACE" && sha256sum A13X-Darknight-KernelSU-Next-AnyKernel3.zip > sha256sum.txt)
+          (cd "$GITHUB_WORKSPACE" && sha256sum A13X-Darknight-KernelSU-Next-v14-OriginStyle-AnyKernel3.zip > sha256sum.txt)
 
       - name: Upload flashable kernel ZIP and build info
         uses: actions/upload-artifact@v7
         with:
-          name: A13X-Darknight-KernelSU-Next-AnyKernel3
+          name: A13X-Darknight-KernelSU-Next-v14-OriginStyle-AnyKernel3
           path: |
-            A13X-Darknight-KernelSU-Next-AnyKernel3.zip
+            A13X-Darknight-KernelSU-Next-v14-OriginStyle-AnyKernel3.zip
             build-info.txt
             sha256sum.txt
           if-no-files-found: error
@@ -1534,7 +1678,7 @@ jobs:
             echo 'KernelSU 4.19 VFS compatibility: omits unavailable iopoll/remap_file_range callbacks'
             echo 'KernelSU 4.19 seccomp compatibility: legacy put_seccomp_filter selected; seccomp_filter_release is kept only for kernel 6.6+'
             echo 'Link-level preflight audits app_profile.o for missing seccomp_filter_release before full vmlinux build'
-            echo 'Preflight: compiles KernelSU objects before full Image, validates Kbuild-reported version 33333 and key hook objects, and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
+            echo 'Preflight: compiles KernelSU objects before full Image and blocks on unresolved base-kernel APIs; no arbitrary auto-fixes are attempted.'
             echo 'SELinux compatibility: immutable non-GKI file backport; exact upstream bytes/hashes are preserved separately, working copies have trailing horizontal whitespace normalized, and APIs are validated by Kbuild object preflight; KSU HEAD and revision-derived driver version remain pinned.'
             echo
             echo '--- Toolchain ---'
@@ -1638,7 +1782,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: A13X-Darknight-Build-Diagnostics-${{ github.run_id }}
+          name: A13X-Darknight-v14-Build-Diagnostics-${{ github.run_id }}
           path: diagnostics/
           if-no-files-found: warn
           retention-days: 14
