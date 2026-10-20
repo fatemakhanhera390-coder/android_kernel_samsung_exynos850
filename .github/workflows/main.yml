@@ -1,4 +1,4 @@
-name: A13X Darknight KernelSU-Next Kernel (v14 seccomp-FD + UAPI guard + Origin-style installer)
+name: A13X Darknight KernelSU-Next Kernel (v14.3 regex replacement fix + UAPI guard + Origin-style installer)
 
 on:
   workflow_dispatch:
@@ -1163,9 +1163,18 @@ jobs:
           #endif
 
               pr_info("install fd for manager: %d\\n", new_uid);'''
-          setuid_src2, count = branch.subn(replacement, setuid_src, count=1)
+          # re.sub() treats backslash escapes in a replacement template specially;
+          # returning the text through a lambda preserves C's literal "\n" bytes.
+          setuid_src2, count = branch.subn(lambda _match: replacement, setuid_src, count=1)
           if count != 1:
               raise SystemExit('setuid_hook.c manager branch did not match pinned source; refusing uncertain patch')
+          required_c_strings = (
+              r'pr_info("KernelSU: legacy seccomp removed for trusted Manager uid=%d\n", new_uid);',
+              r'pr_info("install fd for manager: %d\n", new_uid);',
+          )
+          for required in required_c_strings:
+              if required not in setuid_src2:
+                  raise SystemExit(f'C string escaping validation failed after manager hook patch: {required}')
           setuid_path.write_text(setuid_src2)
 
           # Kbuild must use the exact package and currently installed Manager signer.
