@@ -1794,7 +1794,7 @@ jobs:
 
               # Hook SYSCALL_DEFINE1(newuname) for SUSFS uname spoofing
               sys_txt = re.sub(
-                  r"(memcpy\s*\(\s*&tmp\s*,\s*&utsname\s*\(\s*\)\s*->\s*sysname\s*,\s*sizeof\s*\(\s*tmp\s*\)\s*\)\s*;)",
+                  r"(memcpy\s*\(\s*&tmp\s*,\s*&?utsname\s*\(\s*\)(?:\s*->\s*sysname)?\s*,\s*sizeof\s*\(\s*tmp\s*\)\s*\)\s*;)",
                   r"\1\n#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif",
                   sys_txt,
                   count=1,
@@ -1917,7 +1917,8 @@ jobs:
 
           test -s fs/susfs.o
           test -s drivers/kernelsu/built-in.a
-          find drivers/kernelsu -name "*.o" | sort | tee "${DIAG_DIR}/ksu-compiled-objects.txt"
+          find -L drivers/kernelsu -name "*.o" | sort > "${DIAG_DIR}/ksu-compiled-objects.txt"
+          cat "${DIAG_DIR}/ksu-compiled-objects.txt"
 
       - name: F2. Build full arm64 Image and vmlinux and verify symbols/disassembly
         env:
@@ -1949,20 +1950,24 @@ jobs:
             exit 1
           fi
 
-          # Verify arm64 Image magic ("ARM\x64" at byte offset 56)
+          # Verify arm64 Image magic ("ARM\x64" at byte offset 56) and extract Linux version banner without llvm-strings SIGPIPE
           python3 - << 'PYEOF'
+          import os, re
           from pathlib import Path
+
+          diag = Path(os.environ["DIAG_DIR"])
           img = Path("arch/arm64/boot/Image").read_bytes()
           magic = img[56:60]
           assert magic == b"ARM\x64", f"Invalid ARM64 Image magic at offset 56: {magic!r}"
-          assert b"4.19.325-Darknight" in img, "Release string 4.19.325-Darknight not found in Image"
+          m = re.search(rb"Linux version 4\.19\.325-Darknight[^\x00\n]+", img)
+          assert m, "Release string 4.19.325-Darknight not found in Image"
+          banner = m.group(0).decode("utf-8", errors="replace").strip()
           print("Verified ARM64 Image magic and embedded 4.19.325-Darknight release string.")
+          print(banner)
+          (diag / "kernel-image-version.txt").write_text(banner + "\n", encoding="utf-8")
           PYEOF
 
-          strings "${IMAGE_PATH}" | grep -E "^Linux version 4\.19\.325-Darknight" | head -n 5 | tee "${DIAG_DIR}/kernel-image-version.txt"
-          grep -q "4.19.325-Darknight" "${DIAG_DIR}/kernel-image-version.txt"
-
-          # Audit vmlinux symbol table for mandatory KernelSU-Next and SUSFS symbols
+          # Audit vmlinux symbol table for mandatory KernelSU-Next and SUSFS symbols (redirect directly to file to avoid llvm-nm SIGPIPE)
           llvm-nm "${VMLINUX_PATH}" > "${DIAG_DIR}/vmlinux-all-symbols.txt"
           grep -E "(ksu_|kernelsu_|susfs_|track_throne|apply_kernelsu_rules|on_post_fs_data|phys_from_virt)" \
             "${DIAG_DIR}/vmlinux-all-symbols.txt" | sort > "${DIAG_DIR}/vmlinux-ksu-susfs-symbols.txt"
@@ -1982,18 +1987,23 @@ jobs:
             susfs_init \
             susfs_spoof_uname \
             susfs_add_sus_path; do
-            if ! awk '{print $3}' "${DIAG_DIR}/vmlinux-ksu-susfs-symbols.txt" | grep -qx "${sym}"; then
+            if ! awk -v s="${sym}" '$3 == s {found=1} END {exit !found}' "${DIAG_DIR}/vmlinux-ksu-susfs-symbols.txt"; then
               echo "ERROR: Mandatory symbol '${sym}' missing from vmlinux!" >&2
               exit 1
             fi
           done
-          rm -f "${DIAG_DIR}/vmlinux-all-symbols.txt"
 
-          # Disassemble __arm64_sys_reboot in vmlinux to prove direct call to ksu_handle_sys_reboot
-          REBOOT_VA="0x$(llvm-nm "${VMLINUX_PATH}" | awk '$3 == "__arm64_sys_reboot" {print $1; exit}')"
+          # Extract __arm64_sys_reboot address from the already-saved vmlinux-all-symbols.txt file (zero llvm-nm pipes!)
+          REBOOT_HEX="$(awk '$3 == "__arm64_sys_reboot" {print $1; exit}' "${DIAG_DIR}/vmlinux-all-symbols.txt")"
+          rm -f "${DIAG_DIR}/vmlinux-all-symbols.txt"
+          test -n "${REBOOT_HEX}"
+          REBOOT_VA="0x${REBOOT_HEX}"
           REBOOT_END="$(python3 -c "print(hex(int('${REBOOT_VA}', 16) + 0x120))")"
+
+          # Disassemble __arm64_sys_reboot directly to file to prove direct call to ksu_handle_sys_reboot
           llvm-objdump -d --start-address="${REBOOT_VA}" --stop-address="${REBOOT_END}" \
-            "${VMLINUX_PATH}" | tee "${DIAG_DIR}/reboot-disasm.txt"
+            "${VMLINUX_PATH}" > "${DIAG_DIR}/reboot-disasm.txt"
+          cat "${DIAG_DIR}/reboot-disasm.txt"
           grep -q "ksu_handle_sys_reboot" "${DIAG_DIR}/reboot-disasm.txt"
 
           BUILT_IMAGE_SHA256="$(sha256sum "${IMAGE_PATH}" | awk '{print $1}')"
