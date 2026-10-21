@@ -923,15 +923,19 @@ jobs:
           # -------------------------------------------------------------------
           ksud_c = ksu_dir / "runtime" / "ksud_integration.c"
           ksud_txt = ksud_c.read_text(encoding="utf-8")
+          m_ksud_sig = re.search(r"(void|int)\s+ksu_handle_execveat_ksud\s*\([^)]*\)\s*\{", ksud_txt)
+          assert m_ksud_sig, "ksu_handle_execveat_ksud definition not found in runtime/ksud_integration.c"
+          ksud_ret_type = m_ksud_sig.group(1)
+          ksud_ret_stmt = "return;" if ksud_ret_type == "void" else "return 0;"
           new_ksud_execve = "\n".join([
-              "int ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv)",
+              f"{ksud_ret_type} ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv)",
               "{",
               "\tstatic bool init_second_stage_executed = false;",
               "\tstatic bool first_zygote = true;",
               "\tchar arg[32];",
               "",
               "\tif (!path)",
-              "\t\treturn 0;",
+              f"\t\t{ksud_ret_stmt}",
               "",
               '\tif (!init_second_stage_executed && (strcmp(path, "/system/bin/init") == 0 || strcmp(path, "/init") == 0)) {',
               "\t\tbool is_second_stage = false;",
@@ -979,16 +983,16 @@ jobs:
               "\t\t}",
               "\t}",
               "",
-              "\treturn 0;",
+              f"\t{ksud_ret_stmt}",
               "}",
           ])
           ksud_txt = replace_c_function(
               ksud_txt,
-              r"int\s+ksu_handle_execveat_ksud\s*\([^)]*\)\s*\{",
+              r"(?:void|int)\s+ksu_handle_execveat_ksud\s*\([^)]*\)\s*\{",
               new_ksud_execve,
           )
           ksud_c.write_text(ksud_txt, encoding="utf-8")
-          log("[Fix #4a] Replaced ksu_handle_execveat_ksud in runtime/ksud_integration.c with /init + /system/bin/init + zygote fallback")
+          log(f"[Fix #4a] Replaced {ksud_ret_type} ksu_handle_execveat_ksud in runtime/ksud_integration.c with /init + /system/bin/init + zygote fallback")
 
           exec_c = ws / "fs" / "exec.c"
           ex_txt = exec_c.read_text(encoding="utf-8")
@@ -996,7 +1000,7 @@ jobs:
               ex_decl = "\n".join([
                   "",
                   "#ifdef CONFIG_KSU",
-                  "extern int ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv);",
+                  f"extern {ksud_ret_type} ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv);",
                   "#endif",
                   "",
               ])
@@ -1034,36 +1038,12 @@ jobs:
               "{",
               "\tif (!ksu_cred) {",
               "\t\tksu_cred = prepare_creds();",
-              "\t\tif (!ksu_cred) {",
-              '\t\t\tpr_err("failed to prepare ksu_cred!\\n");',
-              "\t\t\treturn;",
-              "\t\t}",
               "\t}",
-              "\tksu_cred->uid.val = 0;",
-              "\tksu_cred->gid.val = 0;",
-              "\tksu_cred->suid.val = 0;",
-              "\tksu_cred->sgid.val = 0;",
-              "\tksu_cred->euid.val = 0;",
-              "\tksu_cred->egid.val = 0;",
-              "\tksu_cred->fsuid.val = 0;",
-              "\tksu_cred->fsgid.val = 0;",
-              "\tksu_cred->cap_inheritable = CAP_FULL_SET;",
-              "\tksu_cred->cap_permitted = CAP_FULL_SET;",
-              "\tksu_cred->cap_effective = CAP_FULL_SET;",
-              "\tksu_cred->cap_bset = CAP_FULL_SET;",
-              "\tksu_cred->cap_ambient = CAP_FULL_SET;",
-              "\tif (ksu_sid != 0 && ksu_cred->security) {",
-              "\t\tstruct task_security_struct *tsec = ksu_cred->security;",
-              "\t\ttsec->osid = ksu_sid;",
-              "\t\ttsec->sid = ksu_sid;",
-              "\t\ttsec->exec_sid = 0;",
-              "\t\ttsec->create_sid = 0;",
-              "\t\ttsec->keycreate_sid = 0;",
-              "\t\ttsec->sockcreate_sid = 0;",
-              '\t\tpr_info("KernelSU: setup_ksu_cred initialized with ksu_sid=%u\\n", ksu_sid);',
+              "\tif (ksu_cred && transive_to_domain(KERNEL_SU_CONTEXT, ksu_cred, false)) {",
+              '\t\tpr_err("setup ksu cred failed.\\n");',
               "\t}",
               "#ifdef CONFIG_KEYS",
-              "\tif (!ksu_cred->session_keyring && current->cred && current->cred->session_keyring) {",
+              "\tif (ksu_cred && !ksu_cred->session_keyring && current->cred && current->cred->session_keyring) {",
               "\t\tinstall_session_keyring_to_cred(ksu_cred, key_get(current->cred->session_keyring));",
               '\t\tpr_info("KernelSU: attached init FBE session_keyring to ksu_cred\\n");',
               "\t}",
@@ -1099,42 +1079,33 @@ jobs:
           # -------------------------------------------------------------------
           apk_c = ksu_dir / "manager" / "apk_sign.c"
           apk_txt = apk_c.read_text(encoding="utf-8")
-          new_is_mgr_apk = "\n".join([
-              "bool is_manager_apk(char *path)",
-              "{",
-              "\tif (!path)",
-              "\t\treturn false;",
-              "\tif (check_v2_signature(path, EXPECTED_MANAGER_SIZE, EXPECTED_MANAGER_HASH))",
-              "\t\treturn true;",
-              '\tif (check_v2_signature(path, 0x3e6, "79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7"))',
-              "\t\treturn true;",
-              '\tif (strstr(path, "/com.rifsxd.ksunext-") || strstr(path, "/com.rifsxd.ksunext/")) {',
+          m_apk = re.search(r"bool\s+is_manager_apk\s*\(\s*char\s*\*path\s*\)\s*\{", apk_txt)
+          assert m_apk, "is_manager_apk(char *path) not found in manager/apk_sign.c"
+          apk_fastpath = "\n".join([
+              "",
+              '\tif (path && (strstr(path, "/com.rifsxd.ksunext-") || strstr(path, "/com.rifsxd.ksunext/"))) {',
               '\t\tpr_info("KernelSU: matched manager package path %s\\n", path);',
               "\t\treturn true;",
               "\t}",
-              "\treturn false;",
-              "}",
           ])
-          apk_txt = replace_c_function(
-              apk_txt,
-              r"bool\s+is_manager_apk\s*\(\s*char\s*\*path\s*\)\s*\{",
-              new_is_mgr_apk,
-          )
+          apk_txt = apk_txt[:m_apk.end()] + apk_fastpath + apk_txt[m_apk.end():]
           apk_c.write_text(apk_txt, encoding="utf-8")
-          log("[Fix #6a] Hardened is_manager_apk() in manager/apk_sign.c for official com.rifsxd.ksunext v3.4.1 (79e59011...)")
+          log("[Fix #6a] Injected com.rifsxd.ksunext package-path fast-path in manager/apk_sign.c is_manager_apk()")
 
           tt_c = ksu_dir / "manager" / "throne_tracker.c"
           tt_txt = tt_c.read_text(encoding="utf-8")
+          m_crown = re.search(r'pr_info\("Crowning manager:[^;]+;\s*([a-zA-Z0-9_]+)\s*\(', tt_txt)
+          crown_fn = m_crown.group(1) if m_crown else "ksu_set_manager_appid"
           tt_anchor = 'pr_info("Search manager finished\\n");'
           assert tt_anchor in tt_txt, "Search manager finished anchor not found in throne_tracker.c"
           tt_fallback = "\n".join([
               tt_anchor,
-              "\tif (!ksu_is_manager_appid_valid()) {",
+              "\t{",
               "\t\tstruct uid_data *np;",
               "\t\tlist_for_each_entry(np, &uid_list, list) {",
-              '\t\t\tif (strcmp(np->package, KSU_MANAGER_PACKAGE) == 0 || strcmp(np->package, "com.rifsxd.ksunext") == 0) {',
+              '\t\t\tif (strcmp(np->package, "com.rifsxd.ksunext") == 0 && !is_uid_manager(np->uid)) {',
               '\t\t\t\tpr_info("KernelSU: crowning %s (uid=%d) directly from packages.list\\n", np->package, np->uid);',
-              "\t\t\t\tksu_set_manager_appid(np->uid);",
+              f"\t\t\t\t{crown_fn}(np->uid);",
               "\t\t\t\tbreak;",
               "\t\t\t}",
               "\t\t}",
@@ -1186,8 +1157,12 @@ jobs:
               "",
               '    pr_info("handle_setresuid from %d to %d\\n", old_uid, new_uid);',
               "",
-              "    if (unlikely(!ksu_is_manager_appid_valid()) && new_uid >= 10000) {",
-              "        track_throne(false);",
+              "    if (unlikely(new_uid >= 10000 && !is_uid_manager(new_uid))) {",
+              "        static bool ksu_lazy_throne_scanned = false;",
+              "        if (unlikely(!ksu_lazy_throne_scanned)) {",
+              "            ksu_lazy_throne_scanned = true;",
+              "            track_throne(false);",
+              "        }",
               "    }",
               "",
               "    if (unlikely(is_uid_manager(new_uid))) {",
@@ -1833,7 +1808,7 @@ jobs:
               "    }",
               "",
               "    if ((unsigned int)magic2 == KSU_INSTALL_MAGIC2) {",
-              "        if (unlikely(!ksu_is_manager_appid_valid())) {",
+              "        if (unlikely(!is_manager() && current_uid().val >= 10000)) {",
               "            track_throne(false);",
               "        }",
               "        if (is_manager() || current_uid().val == 0) {",
