@@ -917,9 +917,8 @@ jobs:
 
           # -------------------------------------------------------------------
           # 4. Rewrite ksu_handle_execveat_ksud in runtime/ksud_integration.c
-          #    so stage-2 /init AND /system/bin/init (and app_process fallback)
-          #    are 100% guaranteed to execute apply_kernelsu_rules(), cache_sid(),
-          #    setup_ksu_cred(), and on_post_fs_data()
+          #    so it NEVER fires prematurely during selinux_setup (before policy load)
+          #    and ALWAYS verifies ksu_file_sid != 0 at second_stage & first_zygote
           # -------------------------------------------------------------------
           ksud_c = ksu_dir / "runtime" / "ksud_integration.c"
           ksud_txt = ksud_c.read_text(encoding="utf-8")
@@ -928,6 +927,8 @@ jobs:
           ksud_ret_type = m_ksud_sig.group(1)
           ksud_ret_stmt = "return;" if ksud_ret_type == "void" else "return 0;"
           new_ksud_execve = "\n".join([
+              "extern u32 ksu_file_sid;",
+              "",
               f"{ksud_ret_type} ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv)",
               "{",
               "\tstatic bool init_second_stage_executed = false;",
@@ -942,45 +943,34 @@ jobs:
               "\t\tif (argv) {",
               "\t\t\tmemset(arg, 0, sizeof(arg));",
               '\t\t\tif (check_argv(*argv, 1, "second_stage", arg, sizeof(arg)) ||',
-              '\t\t\t    check_argv(*argv, 1, "--second-stage", arg, sizeof(arg)) ||',
-              '\t\t\t    check_argv(*argv, 1, "selinux_setup", arg, sizeof(arg))) {',
+              '\t\t\t    check_argv(*argv, 1, "--second-stage", arg, sizeof(arg))) {',
               "\t\t\t\tis_second_stage = true;",
               "\t\t\t}",
               "\t\t}",
-              '\t\tif (!is_second_stage && strcmp(path, "/system/bin/init") == 0)',
-              "\t\t\tis_second_stage = true;",
               "\t\tif (is_second_stage) {",
               '\t\t\tpr_info("KernelSU: %s second_stage executed\\n", path);',
               "\t\t\tksu_selinux_hide_handle_second_stage();",
               "\t\t\tapply_kernelsu_rules();",
               "\t\t\tcache_sid();",
               "\t\t\tsetup_ksu_cred();",
-              "\t\t\tinit_second_stage_executed = true;",
+              "\t\t\tif (ksu_file_sid != 0)",
+              "\t\t\t\tinit_second_stage_executed = true;",
               "\t\t}",
               "\t}",
               "",
               '\tif (unlikely(first_zygote && strncmp(path, "/system/bin/app_process", 23) == 0)) {',
-              "\t\tbool is_zygote_spawn = true;",
-              "\t\tif (argv) {",
-              "\t\t\tmemset(arg, 0, sizeof(arg));",
-              '\t\t\tis_zygote_spawn = (check_argv(*argv, 1, "-Xzygote", arg, sizeof(arg)) ||',
-              '\t\t\t                   check_argv(*argv, 2, "-Xzygote", arg, sizeof(arg)) ||',
-              '\t\t\t                   check_argv(*argv, 3, "-Xzygote", arg, sizeof(arg)));',
+              "\t\tif (!init_second_stage_executed || ksu_file_sid == 0) {",
+              '\t\t\tpr_info("KernelSU: applying SELinux rules & ksu_cred before zygote on_post_fs_data\\n");',
+              "\t\t\tksu_selinux_hide_handle_second_stage();",
+              "\t\t\tapply_kernelsu_rules();",
+              "\t\t\tcache_sid();",
+              "\t\t\tsetup_ksu_cred();",
+              "\t\t\tinit_second_stage_executed = (ksu_file_sid != 0);",
               "\t\t}",
-              "\t\tif (is_zygote_spawn) {",
-              "\t\t\tif (!init_second_stage_executed) {",
-              '\t\t\t\tpr_info("KernelSU: late second_stage fallback before zygote on_post_fs_data\\n");',
-              "\t\t\t\tksu_selinux_hide_handle_second_stage();",
-              "\t\t\t\tapply_kernelsu_rules();",
-              "\t\t\t\tcache_sid();",
-              "\t\t\t\tsetup_ksu_cred();",
-              "\t\t\t\tinit_second_stage_executed = true;",
-              "\t\t\t}",
-              '\t\t\tpr_info("KernelSU: exec zygote (%s), /data prepared, second_stage: %d\\n", path, init_second_stage_executed);',
-              "\t\t\ton_post_fs_data();",
-              "\t\t\tfirst_zygote = false;",
-              "\t\t\tksu_stop_ksud_execve_hook();",
-              "\t\t}",
+              '\t\tpr_info("KernelSU: exec zygote (%s), /data prepared, second_stage: %d, ksu_file_sid: %u\\n", path, init_second_stage_executed, ksu_file_sid);',
+              "\t\ton_post_fs_data();",
+              "\t\tfirst_zygote = false;",
+              "\t\tksu_stop_ksud_execve_hook();",
               "\t}",
               "",
               f"\t{ksud_ret_stmt}",
@@ -992,7 +982,7 @@ jobs:
               new_ksud_execve,
           )
           ksud_c.write_text(ksud_txt, encoding="utf-8")
-          log(f"[Fix #4a] Replaced {ksud_ret_type} ksu_handle_execveat_ksud in runtime/ksud_integration.c with /init + /system/bin/init + zygote fallback")
+          log(f"[Fix #4a] Replaced {ksud_ret_type} ksu_handle_execveat_ksud in runtime/ksud_integration.c (post-policy second_stage & unconditional zygote SELinux init)")
 
           exec_c = ws / "fs" / "exec.c"
           ex_txt = exec_c.read_text(encoding="utf-8")
@@ -1069,10 +1059,10 @@ jobs:
           boot_c = ksu_dir / "runtime" / "boot_event.c"
           boot_txt = boot_c.read_text(encoding="utf-8")
           if '#include "selinux/selinux.h"' not in boot_txt:
-              boot_txt = '#include "selinux/selinux.h"\n' + boot_txt
+              boot_txt = '#include "selinux/selinux.h"\nextern u32 ksu_file_sid;\n' + boot_txt
           boot_txt, boot_cnt = re.subn(
               r"ksu_observer_init\s*\(\s*\)\s*;",
-              "setup_ksu_cred();\n\tksu_observer_init();\n\ttrack_throne(false);",
+              "if (ksu_file_sid == 0) { apply_kernelsu_rules(); cache_sid(); }\n\tsetup_ksu_cred();\n\tksu_observer_init();\n\ttrack_throne(false);",
               boot_txt,
               count=1,
           )
@@ -1136,10 +1126,26 @@ jobs:
           assert m_app, "escape_with_root_profile not found in policy/app_profile.c"
           helper = "\n".join([
               "",
+              "#include <linux/sched/signal.h>",
               "/* DARKNIGHT_MANAGER_SECCOMP_FD_FIX */",
               "void ksu_disable_seccomp_for_manager(void)",
               "{",
-              "    disable_seccomp();",
+              "    struct task_struct *t;",
+              "",
+              "    if (current->seccomp.mode != 0 || current->seccomp.filter != NULL) {",
+              "        disable_seccomp();",
+              "    }",
+              "    if (current->sighand) {",
+              "        spin_lock_irq(&current->sighand->siglock);",
+              "        for_each_thread(current, t) {",
+              "            clear_tsk_thread_flag(t, TIF_SECCOMP);",
+              "            t->seccomp.mode = 0;",
+              "        }",
+              "        spin_unlock_irq(&current->sighand->siglock);",
+              "    } else {",
+              "        clear_tsk_thread_flag(current, TIF_SECCOMP);",
+              "        current->seccomp.mode = 0;",
+              "    }",
               "}",
               "",
           ])
@@ -1154,10 +1160,13 @@ jobs:
           )
 
           su_src = setuid_c.read_text(encoding="utf-8")
-          for inc in ('#include "policy/app_profile.h"', '#include "manager/throne_tracker.h"'):
+          for inc in ('#include "policy/app_profile.h"', '#include "manager/throne_tracker.h"', '#include "selinux/selinux.h"'):
               if inc not in su_src:
                   su_src = su_src.replace('#include "policy/allowlist.h"', '#include "policy/allowlist.h"\n' + inc, 1)
           new_setresuid_fn = "\n".join([
+              "extern u32 ksu_file_sid;",
+              "extern void ksu_ensure_driver_fd_installed(void);",
+              "",
               "int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)",
               "{",
               "    if (old_uid != 0)",
@@ -1165,11 +1174,20 @@ jobs:
               "",
               '    pr_info("handle_setresuid from %d to %d\\n", old_uid, new_uid);',
               "",
+              "    if (unlikely(new_uid >= 10000 && ksu_file_sid == 0)) {",
+              "        apply_kernelsu_rules();",
+              "        cache_sid();",
+              "        setup_ksu_cred();",
+              "    }",
+              "",
               "    if (unlikely(new_uid >= 10000 && !is_uid_manager(new_uid))) {",
-              "        static bool ksu_lazy_throne_scanned = false;",
-              "        if (unlikely(!ksu_lazy_throne_scanned)) {",
-              "            ksu_lazy_throne_scanned = true;",
+              "        static int ksu_throne_retries = 128;",
+              "        if (ksu_throne_retries > 0) {",
+              "            ksu_throne_retries--;",
               "            track_throne(false);",
+              "        }",
+              '        if (!is_uid_manager(new_uid) && (strstr(current->comm, "rifsxd") || strstr(current->comm, "ksun"))) {',
+              "            ksu_set_manager_appid(new_uid % 100000);",
               "        }",
               "    }",
               "",
@@ -1177,7 +1195,7 @@ jobs:
               "        ksu_disable_seccomp_for_manager();",
               "        ksu_set_task_tracepoint_flag(current);",
               '        pr_info("KernelSU: seccomp disabled & installing fd for manager uid=%d\\n", new_uid);',
-              "        ksu_install_fd();",
+              "        ksu_ensure_driver_fd_installed();",
               "        return 0;",
               "    }",
               "",
@@ -2047,10 +2065,10 @@ jobs:
               init_c.write_text(init_txt, encoding="utf-8")
               log("[SUSFS] Wired susfs_init() into KernelSU-Next/kernel/core/init.c")
 
-          # Wire ksu_handle_sys_reboot & ksu_handle_susfs_command in supercall/supercall.c
+          # Wire ksu_handle_sys_reboot, ksu_handle_legacy_prctl & ksu_handle_susfs_command in supercall/supercall.c
           sc_c = ksu_dir / "supercall" / "supercall.c"
           sc_txt = sc_c.read_text(encoding="utf-8")
-          for inc in ('#include "policy/app_profile.h"', '#include "manager/throne_tracker.h"', '#include "manager/manager_identity.h"'):
+          for inc in ('#include "policy/app_profile.h"', '#include "policy/allowlist.h"', '#include "selinux/selinux.h"', '#include "manager/throne_tracker.h"', '#include "manager/manager_identity.h"'):
               if inc not in sc_txt:
                   sc_txt = inc + "\n" + sc_txt
           sc_txt = sc_txt.replace(
@@ -2159,6 +2177,133 @@ jobs:
               "#endif",
               "}",
               "",
+              "extern u32 ksu_file_sid;",
+              "",
+              "static bool ksu_has_driver_fd(void)",
+              "{",
+              "    struct files_struct *files = current->files;",
+              "    struct fdtable *fdt;",
+              "    unsigned int i;",
+              "    bool found = false;",
+              "",
+              "    if (!files)",
+              "        return false;",
+              "    rcu_read_lock();",
+              "    fdt = files_fdtable(files);",
+              "    if (fdt && fdt->fd) {",
+              "        unsigned int max_fds = fdt->max_fds;",
+              "        if (max_fds > 1024)",
+              "            max_fds = 1024;",
+              "        for (i = 0; i < max_fds; i++) {",
+              "            struct file *f = rcu_dereference(fdt->fd[i]);",
+              "            if (f && f->f_op == &anon_ksu_fops) {",
+              "                found = true;",
+              "                break;",
+              "            }",
+              "        }",
+              "    }",
+              "    rcu_read_unlock();",
+              "    return found;",
+              "}",
+              "",
+              "void ksu_ensure_driver_fd_installed(void)",
+              "{",
+              "    if (!ksu_has_driver_fd()) {",
+              "        int fd = ksu_install_fd();",
+              '        pr_info("KernelSU: ensured [ksu_driver] fd=%d for pid=%d uid=%u comm=%s\\n",',
+              "                fd, current->pid, current_uid().val, current->comm);",
+              "    }",
+              "}",
+              "",
+              "int ksu_handle_legacy_prctl(int option, unsigned long arg2, unsigned long arg3,",
+              "                            unsigned long arg4, unsigned long arg5)",
+              "{",
+              "    uid_t uid = current_uid().val;",
+              "",
+              "    /* 1. PR_SET_NAME (15): detect com.rifsxd.ksunext process specialization immediately */",
+              "    if (option == 15 && uid >= 10000 && arg2 != 0UL) {",
+              "        char kname[16];",
+              "        memset(kname, 0, sizeof(kname));",
+              "        if (strncpy_from_user(kname, (const char __user *)arg2, sizeof(kname) - 1) > 0) {",
+              '            if (strstr(kname, "rifsxd") || strstr(kname, "ksun")) {',
+              "                if (ksu_file_sid == 0) {",
+              "                    apply_kernelsu_rules();",
+              "                    cache_sid();",
+              "                    setup_ksu_cred();",
+              "                }",
+              "                if (!is_uid_manager(uid)) {",
+              '                    pr_info("KernelSU: crowning manager uid=%u from PR_SET_NAME (%s)\\n", uid, kname);',
+              "                    ksu_set_manager_appid(uid % 100000);",
+              "                }",
+              "                ksu_disable_seccomp_for_manager();",
+              "                ksu_ensure_driver_fd_installed();",
+              "            }",
+              "        }",
+              "        return -ENOSYS;",
+              "    }",
+              "",
+              "    /* 2. PR_GET_SECCOMP (21): ensure seccomp is disabled & fd installed when Manager queries status */",
+              "    if (option == 21 && uid >= 10000) {",
+              '        if (!is_uid_manager(uid) && (strstr(current->comm, "rifsxd") || strstr(current->comm, "ksun"))) {',
+              "            if (ksu_file_sid == 0) {",
+              "                apply_kernelsu_rules();",
+              "                cache_sid();",
+              "                setup_ksu_cred();",
+              "            }",
+              "            ksu_set_manager_appid(uid % 100000);",
+              "        }",
+              "        if (is_uid_manager(uid)) {",
+              "            ksu_disable_seccomp_for_manager();",
+              "            ksu_ensure_driver_fd_installed();",
+              "        }",
+              "        return -ENOSYS;",
+              "    }",
+              "",
+              "    /* 3. KernelSU-Next / SUSFS magic 0xdeadbeef */",
+              "    if ((unsigned int)option != 0xdeadbeefU)",
+              "        return -ENOSYS;",
+              "",
+              "    if (arg2 >= 0x55550UL && arg2 <= 0x60050UL) {",
+              "        if (ksu_handle_susfs_command((int)option, 0, (unsigned int)arg2,",
+              "                                     (void __user *)arg3, (void __user *)arg5) == 0)",
+              "            return 0;",
+              "        return -EINVAL;",
+              "    }",
+              "",
+              "    if (ksu_file_sid == 0) {",
+              "        apply_kernelsu_rules();",
+              "        cache_sid();",
+              "        setup_ksu_cred();",
+              "    }",
+              "",
+              "    if (!is_uid_manager(uid) && uid >= 10000) {",
+              "        track_throne(false);",
+              '        if (!is_uid_manager(uid) && (strstr(current->comm, "rifsxd") || strstr(current->comm, "ksun"))) {',
+              '            pr_info("KernelSU: crowning manager uid=%u from 0xdeadbeef prctl (%s)\\n", uid, current->comm);',
+              "            ksu_set_manager_appid(uid % 100000);",
+              "        }",
+              "    }",
+              "",
+              "    if (is_uid_manager(uid) || uid == 0 || ksu_is_allow_uid_for_current(uid)) {",
+              "        ksu_disable_seccomp_for_manager();",
+              "        ksu_ensure_driver_fd_installed();",
+              "        if (arg2 == 2UL) {",
+              "            u32 ver = KSU_VERSION;",
+              "            u32 flags = 0;",
+              "            u32 reply = 0xdeadbeefU;",
+              "            if (arg3)",
+              "                (void)copy_to_user((void __user *)arg3, &ver, sizeof(ver));",
+              "            if (arg4)",
+              "                (void)copy_to_user((void __user *)arg4, &flags, sizeof(flags));",
+              "            if (arg5)",
+              "                (void)copy_to_user((void __user *)arg5, &reply, sizeof(reply));",
+              "            return 0;",
+              "        }",
+              "    }",
+              "",
+              "    return -ENOSYS;",
+              "}",
+              "",
               "int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)",
               "{",
               "    struct pt_regs real_regs;",
@@ -2172,12 +2317,22 @@ jobs:
               "        return 0;",
               "    }",
               "",
+              "    if (ksu_file_sid == 0) {",
+              "        apply_kernelsu_rules();",
+              "        cache_sid();",
+              "        setup_ksu_cred();",
+              "    }",
+              "",
               "    if ((unsigned int)magic2 == KSU_INSTALL_MAGIC2) {",
               "        if (unlikely(!is_uid_manager(current_uid().val) && current_uid().val >= 10000)) {",
               "            track_throne(false);",
+              '            if (!is_uid_manager(current_uid().val) && (strstr(current->comm, "rifsxd") || strstr(current->comm, "ksun"))) {',
+              "                ksu_set_manager_appid(current_uid().val % 100000);",
+              "            }",
               "        }",
               "        if (is_uid_manager(current_uid().val) || current_uid().val == 0) {",
               "            ksu_disable_seccomp_for_manager();",
+              "            ksu_ensure_driver_fd_installed();",
               "        }",
               "    }",
               "",
@@ -2234,6 +2389,7 @@ jobs:
                   "#include <linux/thread_info.h>",
                   "extern int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid);",
                   "extern int ksu_handle_susfs_command(int magic1, int magic2, unsigned int cmd, void __user *arg, void __user *err_out);",
+                  "extern int ksu_handle_legacy_prctl(int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5);",
                   "#endif",
                   "#ifdef CONFIG_KSU_SUSFS",
                   "#include <linux/susfs.h>",
@@ -2290,11 +2446,9 @@ jobs:
               assert m_sec, "security_task_prctl call not found in SYSCALL_DEFINE5(prctl)"
               idx_pr = m_pr.end() + m_sec.start()
               pr_hook = "\n".join([
-                  "#if defined(CONFIG_KSU) && defined(CONFIG_KSU_SUSFS)",
-                  "\tif ((unsigned int)option == 0xdeadbeefU && arg2 >= 0x55550UL && arg2 <= 0x60050UL) {",
-                  "\t\tif (ksu_handle_susfs_command((int)option, 0, (unsigned int)arg2, (void __user *)arg3, (void __user *)arg5) == 0)",
-                  "\t\t\treturn 0;",
-                  "\t}",
+                  "#ifdef CONFIG_KSU",
+                  "\tif (ksu_handle_legacy_prctl(option, arg2, arg3, arg4, arg5) == 0)",
+                  "\t\treturn 0;",
                   "#endif",
                   "\t",
               ])
@@ -2462,6 +2616,8 @@ jobs:
             ksu_handle_setresuid \
             ksu_handle_execveat_ksud \
             ksu_disable_seccomp_for_manager \
+            ksu_ensure_driver_fd_installed \
+            ksu_handle_legacy_prctl \
             ksu_install_fd \
             track_throne \
             apply_kernelsu_rules \
