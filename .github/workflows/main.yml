@@ -1218,6 +1218,8 @@ jobs:
               "#include <linux/fs.h>",
               "#include <linux/stat.h>",
               "#include <linux/seq_file.h>",
+              "#include <linux/cred.h>",
+              "#include <linux/sched.h>",
               "",
               '#define SUSFS_VERSION "v2.3.0"',
               '#define SUSFS_VARIANT "NON-GKI"',
@@ -1913,31 +1915,41 @@ jobs:
               cl_txt = cmdline_c.read_text(encoding="utf-8")
               if "susfs_spoof_cmdline_or_bootconfig" not in cl_txt:
                   cl_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n" + cl_txt
-                  cl_txt, cl_cnt = re.subn(
-                      r"(seq_puts\s*\(\s*m\s*,\s*saved_command_line\s*\)\s*;)",
-                      "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n\tif (!susfs_spoof_cmdline_or_bootconfig(m)) {\n\t\tseq_putc(m, '\\n');\n\t\treturn 0;\n\t}\n#endif\n\t\1",
-                      cl_txt,
-                      count=1,
-                  )
-                  if cl_cnt:
-                      cmdline_c.write_text(cl_txt, encoding="utf-8")
-                      log("[SUSFS v2.3.0] Hooked cmdline_proc_show in fs/proc/cmdline.c for cmdline/bootconfig spoofing")
+                  cl_target = "seq_puts(m, saved_command_line);"
+                  assert cl_target in cl_txt, "seq_puts(m, saved_command_line); not found in fs/proc/cmdline.c"
+                  cl_hook = "\n".join([
+                      "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG",
+                      "\tif (!susfs_spoof_cmdline_or_bootconfig(m)) {",
+                      "\t\tseq_putc(m, 10);",
+                      "\t\treturn 0;",
+                      "\t}",
+                      "#endif",
+                      "\t" + cl_target,
+                  ])
+                  cl_txt = cl_txt.replace(cl_target, cl_hook, 1)
+                  cmdline_c.write_text(cl_txt, encoding="utf-8")
+                  log("[SUSFS v2.3.0] Hooked cmdline_proc_show in fs/proc/cmdline.c for cmdline/bootconfig spoofing")
 
           tmmu_c = ws / "fs" / "proc" / "task_mmu.c"
           if tmmu_c.exists():
               tm_txt = tmmu_c.read_text(encoding="utf-8")
               if "susfs_is_sus_maps_ino" not in tm_txt:
                   tm_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n" + tm_txt
-                  tm_txt, tm_cnt = re.subn(
-                      r"(static\s+void\s+show_map_vma\s*\([^)]*\)\s*\{.*?if\s*\(\s*file\s*\)\s*\{)",
-                      r"\1\n#ifdef CONFIG_KSU_SUSFS\n\t\tif (unlikely(current_uid().val >= 10000 && file_inode(file) && (susfs_is_sus_maps_ino(file_inode(file)->i_ino) || susfs_is_sus_path_ino(file_inode(file)->i_ino))))\n\t\t\treturn;\n#endif",
-                      tm_txt,
-                      count=1,
-                      flags=re.S,
-                  )
-                  if tm_cnt:
-                      tmmu_c.write_text(tm_txt, encoding="utf-8")
-                      log("[SUSFS v2.3.0] Hooked show_map_vma in fs/proc/task_mmu.c for sus_map / sus_path hiding")
+                  m_vma = re.search(r"static\s+void\s+\s*show_map_vma\s*\([^)]*\)\s*\{", tm_txt)
+                  assert m_vma, "show_map_vma not found in fs/proc/task_mmu.c"
+                  m_if_file = re.search(r"\bif\s*\(\s*file\s*\)\s*\{", tm_txt[m_vma.end():])
+                  assert m_if_file, "if (file) not found in show_map_vma"
+                  pos = m_vma.end() + m_if_file.start()
+                  tm_hook = "\n".join([
+                      "#ifdef CONFIG_KSU_SUSFS",
+                      "\tif (unlikely(file && current_uid().val >= 10000 && file_inode(file) && (susfs_is_sus_maps_ino(file_inode(file)->i_ino) || susfs_is_sus_path_ino(file_inode(file)->i_ino))))",
+                      "\t\treturn;",
+                      "#endif",
+                      "\t",
+                  ])
+                  tm_txt = tm_txt[:pos] + tm_hook + tm_txt[pos:]
+                  tmmu_c.write_text(tm_txt, encoding="utf-8")
+                  log("[SUSFS v2.3.0] Hooked show_map_vma in fs/proc/task_mmu.c for sus_map / sus_path hiding")
 
           kconfig_p = ksu_dir / "Kconfig"
           kc_txt = kconfig_p.read_text(encoding="utf-8")
