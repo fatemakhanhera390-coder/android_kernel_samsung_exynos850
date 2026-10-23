@@ -1,3 +1,4 @@
+
 name: Build Darknight Kernel with Official KernelSU & SuSFS for Galaxy M21 (OneUI 6.1)
 
 on:
@@ -66,6 +67,7 @@ jobs:
           cd toolchain
           curl -sLO https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
           chmod +x antman
+          # Sync latest Neutron Clang LLVM toolchain
           ./antman -S
           ./antman --patch=glibc
           
@@ -87,7 +89,7 @@ jobs:
           sed -i 's/CONFIG_THINLTO=y/# CONFIG_THINLTO is not set/g' arch/arm64/configs/vendor/grass.config
           echo "CONFIG_LTO_NONE=y" >> arch/arm64/configs/vendor/grass.config
 
-          echo "[*] Ingesting global compiler flags at end of Makefile (clean syntax)..."
+          echo "[*] Appending compiler compatibility flags to end of Makefile..."
           echo '' >> Makefile
           echo '# Clang Compatibility Flags' >> Makefile
           echo 'KBUILD_CFLAGS += -Wno-default-const-init-field-unsafe -Wno-error -Wno-unused-but-set-variable' >> Makefile
@@ -112,7 +114,7 @@ jobs:
           rm -rf KernelSU drivers/kernelsu /tmp/ksu_repo
           git clone --depth=1 https://github.com/tiann/KernelSU.git /tmp/ksu_repo
           
-          # Direct physical copy into drivers/kernelsu and KernelSU (avoids relative symlink breakage in O=out)
+          # Direct physical copy into drivers/kernelsu and KernelSU
           mkdir -p drivers/kernelsu KernelSU
           cp -r /tmp/ksu_repo/kernel/* drivers/kernelsu/
           cp -r /tmp/ksu_repo/kernel KernelSU/
@@ -121,12 +123,28 @@ jobs:
           grep -q "kernelsu" drivers/Makefile || echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
           grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-          # Force CONFIG_KSU=y in all config files
+          # CRITICAL ROOT CAUSE FIX: Remove 'depends on KPROBES' so Kconfig never disables KSU
+          sed -i '/depends on KPROBES/d' drivers/kernelsu/Kconfig 2>/dev/null || true
+          sed -i '/depends on KPROBES/d' KernelSU/kernel/Kconfig 2>/dev/null || true
+
+          # Force enable KPROBES, OVERLAY_FS, and KSU in both grass.config and ksu.config
           sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' arch/arm64/configs/vendor/grass.config
-          echo "CONFIG_KSU=y" >> arch/arm64/configs/vendor/grass.config
-          if [ -f "arch/arm64/configs/vendor/ksu.config" ]; then
-            echo "CONFIG_KSU=y" >> arch/arm64/configs/vendor/ksu.config
-          fi
+          cat << 'EOF' >> arch/arm64/configs/vendor/grass.config
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_KSU=y
+          EOF
+
+          mkdir -p arch/arm64/configs/vendor
+          cat << 'EOF' > arch/arm64/configs/vendor/ksu.config
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_KSU=y
+          EOF
 
           # 2. Integrate SuSFS for Linux 4.14
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
@@ -151,14 +169,26 @@ jobs:
               cd $KERNEL_DIR
             fi
 
-            # Enable SuSFS configs in defconfig
-            echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUMV=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> arch/arm64/configs/vendor/grass.config
+            # Enable SuSFS configs in defconfig and ksu.config
+            cat << 'EOF' >> arch/arm64/configs/vendor/grass.config
+            CONFIG_KSU_SUSFS=y
+            CONFIG_KSU_SUSFS_SUS_PATH=y
+            CONFIG_KSU_SUSFS_SUS_MOUNT=y
+            CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUMV=y
+            CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+            CONFIG_KSU_SUSFS_SUS_KSTAT=y
+            CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+            EOF
+
+            cat << 'EOF' >> arch/arm64/configs/vendor/ksu.config
+            CONFIG_KSU_SUSFS=y
+            CONFIG_KSU_SUSFS_SUS_PATH=y
+            CONFIG_KSU_SUSFS_SUS_MOUNT=y
+            CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUMV=y
+            CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+            CONFIG_KSU_SUSFS_SUS_KSTAT=y
+            CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+            EOF
           fi
 
       - name: Build Kernel Image & AnyKernel3 Zip
@@ -191,7 +221,7 @@ jobs:
             echo "[-] CRITICAL ERROR: KernelSU was not compiled into Image!"
             exit 1
           fi
-          echo "[+] KernelSU verified successfully inside Image!"
+          echo "[+] KernelSU verified successfully inside Image ($KSU_COUNT occurrences)!"
 
       - name: Package Darknight AnyKernel3 Zip
         id: locate_zip
