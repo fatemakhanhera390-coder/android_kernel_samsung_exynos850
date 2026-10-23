@@ -126,34 +126,29 @@ jobs:
           rm -rf KernelSU drivers/kernelsu /tmp/ksu_repo
           git clone --depth=1 https://github.com/tiann/KernelSU.git /tmp/ksu_repo
           
-          # Direct physical copy into drivers/kernelsu and KernelSU
-          mkdir -p drivers/kernelsu KernelSU
+          # Direct physical copy into drivers/kernelsu, drivers/android/kernelsu, and KernelSU
+          mkdir -p drivers/kernelsu KernelSU drivers/android/kernelsu
           cp -r /tmp/ksu_repo/kernel/* drivers/kernelsu/
+          cp -r /tmp/ksu_repo/kernel/* drivers/android/kernelsu/
           cp -r /tmp/ksu_repo/kernel KernelSU/
 
-          # Wire up drivers/Makefile and drivers/Kconfig
-          grep -q "kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          # FIX FOR UAPI APP_PROFILE.H: Replicate uapi into policy/ and core/ subdirectories
+          python3 -c "
+          import os, shutil
+          for root_dir in ['drivers/android/kernelsu', 'drivers/kernelsu', 'KernelSU/kernel']:
+              if os.path.exists(root_dir):
+                  uapi_src = os.path.join(root_dir, 'uapi')
+                  if os.path.exists(uapi_src):
+                      for sub in ['policy', 'core']:
+                          dest = os.path.join(root_dir, sub, 'uapi')
+                          shutil.copytree(uapi_src, dest, dirs_exist_ok=True)
+                      os.makedirs('include/uapi', exist_ok=True)
+                      shutil.copytree(uapi_src, 'include/uapi', dirs_exist_ok=True)
+          "
 
-          # Remove 'depends on KPROBES' so Kconfig never disables KSU
-          find drivers/kernelsu KernelSU -name "Kconfig" -exec sed -i '/depends on KPROBES/d' {} + 2>/dev/null || true
-
-          # Force enable KPROBES, OVERLAY_FS, and KSU in configs
-          sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' arch/arm64/configs/vendor/grass.config
-          printf '%s\n' \
-            'CONFIG_KPROBES=y' \
-            'CONFIG_HAVE_KPROBES=y' \
-            'CONFIG_KPROBE_EVENTS=y' \
-            'CONFIG_OVERLAY_FS=y' \
-            'CONFIG_KSU=y' >> arch/arm64/configs/vendor/grass.config
-
-          mkdir -p arch/arm64/configs/vendor
-          printf '%s\n' \
-            'CONFIG_KPROBES=y' \
-            'CONFIG_HAVE_KPROBES=y' \
-            'CONFIG_KPROBE_EVENTS=y' \
-            'CONFIG_OVERLAY_FS=y' \
-            'CONFIG_KSU=y' > arch/arm64/configs/vendor/ksu.config
+          # Add include flags to Kbuild files
+          echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core' >> drivers/android/kernelsu/Kbuild 2>/dev/null || true
+          echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core' >> drivers/kernelsu/Kbuild 2>/dev/null || true
 
           # Generate ksu_hook.h with all manual hook prototypes
           python3 -c "
@@ -184,11 +179,35 @@ jobs:
           #endif
           '''
           import os
-          for path in ['include/ksu_hook.h', 'include/linux/ksu_hook.h', 'drivers/kernelsu/ksu_hook.h', 'KernelSU/kernel/ksu_hook.h']:
+          for path in ['include/ksu_hook.h', 'include/linux/ksu_hook.h', 'drivers/kernelsu/ksu_hook.h', 'drivers/android/kernelsu/ksu_hook.h', 'KernelSU/kernel/ksu_hook.h']:
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, 'w') as f:
                   f.write(content)
           "
+
+          # Wire up drivers/Makefile and drivers/Kconfig
+          grep -q "kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          # Remove 'depends on KPROBES' so Kconfig never disables KSU
+          find drivers/kernelsu drivers/android/kernelsu KernelSU -name "Kconfig" -exec sed -i '/depends on KPROBES/d' {} + 2>/dev/null || true
+
+          # Force enable KPROBES, OVERLAY_FS, and KSU in configs
+          sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' arch/arm64/configs/vendor/grass.config
+          printf '%s\n' \
+            'CONFIG_KPROBES=y' \
+            'CONFIG_HAVE_KPROBES=y' \
+            'CONFIG_KPROBE_EVENTS=y' \
+            'CONFIG_OVERLAY_FS=y' \
+            'CONFIG_KSU=y' >> arch/arm64/configs/vendor/grass.config
+
+          mkdir -p arch/arm64/configs/vendor
+          printf '%s\n' \
+            'CONFIG_KPROBES=y' \
+            'CONFIG_HAVE_KPROBES=y' \
+            'CONFIG_KPROBE_EVENTS=y' \
+            'CONFIG_OVERLAY_FS=y' \
+            'CONFIG_KSU=y' > arch/arm64/configs/vendor/ksu.config
 
           # 2. Integrate SuSFS for Linux 4.14
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
@@ -207,16 +226,13 @@ jobs:
             grep -q "susfs.o" fs/Makefile || echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
 
             echo "[*] Applying SuSFS patch to KernelSU..."
-            if [ -d "drivers/kernelsu" ]; then
-              cd drivers/kernelsu
-              patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-              cd $KERNEL_DIR
-            fi
-            if [ -d "KernelSU/kernel" ]; then
-              cd KernelSU/kernel
-              patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-              cd $KERNEL_DIR
-            fi
+            for target_ksu in drivers/kernelsu drivers/android/kernelsu KernelSU/kernel; do
+              if [ -d "$target_ksu" ]; then
+                cd "$target_ksu"
+                patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
+                cd $KERNEL_DIR
+              fi
+            done
 
             # Enable SuSFS configs in defconfig and ksu.config
             printf '%s\n' \
