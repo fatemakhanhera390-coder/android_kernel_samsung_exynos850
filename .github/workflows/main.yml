@@ -118,9 +118,6 @@ jobs:
           cp -r /tmp/ksu_repo/kernel/* drivers/kernelsu/
           cp -r /tmp/ksu_repo/kernel KernelSU/
 
-          # ONLY copy ksu_hook.h into include/ (DO NOT copy *.h into include/linux/ as that overwrites linux sched.h!)
-          find /tmp/ksu_repo/kernel -name "ksu_hook.h" -exec cp {} include/ksu_hook.h \;
-
           # Wire up drivers/Makefile and drivers/Kconfig
           grep -q "kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
@@ -144,6 +141,39 @@ jobs:
             'CONFIG_KPROBE_EVENTS=y' \
             'CONFIG_OVERLAY_FS=y' \
             'CONFIG_KSU=y' > arch/arm64/configs/vendor/ksu.config
+
+          # PERMANENT FIX: Generate ksu_hook.h in all include paths to satisfy fs/open.c
+          python3 -c "
+          content = '''#ifndef __KSU_HOOK_H
+          #define __KSU_HOOK_H
+
+          #include <linux/types.h>
+          #include <linux/fs.h>
+
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          extern int ksu_handle_openat(int *dfd, const char __user **filename_user, int *flags, umode_t *mode);
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
+          extern int ksu_handle_devpts(struct inode *inode);
+          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+          #else
+          static inline int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags) { return 0; }
+          static inline int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags) { return 0; }
+          static inline int ksu_handle_openat(int *dfd, const char __user **filename_user, int *flags, umode_t *mode) { return 0; }
+          static inline int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }
+          static inline int ksu_handle_devpts(struct inode *inode) { return 0; }
+          static inline int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value) { return 0; }
+          #endif
+
+          #endif
+          '''
+          import os
+          for path in ['include/ksu_hook.h', 'include/linux/ksu_hook.h', 'drivers/kernelsu/ksu_hook.h', 'KernelSU/kernel/ksu_hook.h']:
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, 'w') as f:
+                  f.write(content)
+          "
 
           # 2. Integrate SuSFS for Linux 4.14
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
