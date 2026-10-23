@@ -64,40 +64,42 @@ jobs:
           cd kernel_source
           echo "KERNEL_DIR=$(pwd)" >> $GITHUB_ENV
 
-      - name: Setup Toolchain inside kernel_source/toolchain
+      - name: Setup Latest Neutron Clang Toolchain (AntMan)
         run: |
           cd $KERNEL_DIR
           mkdir -p toolchain
           cd toolchain
           curl -sLO https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
           chmod +x antman
+          # Download latest Neutron Clang (Clang 24 / bleeding edge)
           ./antman -S
           ./antman --patch=glibc
           
           echo "$KERNEL_DIR/toolchain/bin" >> $GITHUB_PATH
           echo "CC=clang" >> $GITHUB_ENV
 
-      - name: Configure Kernel Name to Darknight & Apply Clang 19+ Fixes
+      - name: Configure Kernel Name to Darknight & Apply Clang Fixes
         run: |
           cd $KERNEL_DIR
 
           echo "[*] Setting Kernel Name to Darknight..."
-          # Set localversion in configs
           sed -i 's/CONFIG_LOCALVERSION="-Grass"/CONFIG_LOCALVERSION="-Darknight"/g' arch/arm64/configs/vendor/grass.config
           sed -i 's/CONFIG_LOCALVERSION_BRANCH_SHA=y/# CONFIG_LOCALVERSION_BRANCH_SHA is not set/g' arch/arm64/configs/vendor/grass.config
           echo 'CONFIG_LOCALVERSION="-Darknight"' >> arch/arm64/configs/vendor/grass.config
 
-          echo "[*] Bypassing LTO compiler check in Makefile..."
+          echo "[*] Disabling LTO to prevent brittle compiler checks and broken pipes..."
           sed -i 's/$(error Cannot use CONFIG_LTO/# $(error Cannot use CONFIG_LTO/g' Makefile
           sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_NONE=y/g' arch/arm64/configs/vendor/grass.config
           sed -i 's/CONFIG_THINLTO=y/# CONFIG_THINLTO is not set/g' arch/arm64/configs/vendor/grass.config
           echo "CONFIG_LTO_NONE=y" >> arch/arm64/configs/vendor/grass.config
 
-          echo "[*] Fixing Clang 19 const-init warnings across the tree..."
-          # 1. Global compiler flags in Makefile to completely disable default-const-init-field-unsafe error
-          sed -i '/KBUILD_CFLAGS.*:=/a KBUILD_CFLAGS += -Wno-default-const-init-field-unsafe -Wno-error -Wno-unused-but-set-variable' Makefile
-          
-          # 2. Source-level patches for kernel/params.c, sdfat, and sdcardfs
+          echo "[*] Ingesting global compiler flags at end of Makefile (clean syntax)..."
+          # Safely append to end of Makefile so no multi-line backslash syntax is broken
+          echo '' >> Makefile
+          echo '# Clang 19/24 Compatibility Flags' >> Makefile
+          echo 'KBUILD_CFLAGS += -Wno-default-const-init-field-unsafe -Wno-error -Wno-unused-but-set-variable' >> Makefile
+
+          echo "[*] Source patches for uninitialized const structs..."
           if [ -f "kernel/params.c" ]; then
             sed -i 's/struct kernel_param dummy;/struct kernel_param dummy = { .perm = 0 };/g' kernel/params.c
             sed -i 's/struct kernel_param kp;/struct kernel_param kp = { .perm = 0 };/g' kernel/params.c
@@ -216,7 +218,7 @@ jobs:
             - **Kernel Name:** Darknight
             - **Target ROM:** OneUI 6.1 (Android 14 DisturbedUI / Ports)
             - **Base Kernel:** Linux 4.14.246 (Exynos 9611)
-            - **Compiler:** Neutron Clang
+            - **Compiler:** Latest Neutron Clang
             - **Root:** KernelSU v3.3.1 (32680) + SuSFS 2.3.0 Integrated
             - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip
           files: ${{ env.FLASHABLE_ZIP }}
