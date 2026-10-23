@@ -104,19 +104,29 @@ jobs:
             sed -i 's/struct inode tmp;/struct inode tmp = { .i_nlink = 0 };/g' fs/sdcardfs/inode.c
           fi
 
-      - name: Setup Official Tiann KernelSU & SuSFS 2.3.0 Patches
+      - name: Setup Official KernelSU & SuSFS Direct Tree Integration
         run: |
           cd $KERNEL_DIR
 
-          echo "[*] Integrating Official Tiann KernelSU (main)..."
-          rm -rf KernelSU drivers/kernelsu
+          echo "[*] Cloning Official Tiann KernelSU..."
+          rm -rf KernelSU drivers/kernelsu /tmp/ksu_repo
+          git clone --depth=1 https://github.com/tiann/KernelSU.git /tmp/ksu_repo
           
-          # Setup Official tiann/KernelSU
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          # Direct physical copy into drivers/kernelsu and KernelSU (avoids relative symlink breakage in O=out)
+          mkdir -p drivers/kernelsu KernelSU
+          cp -r /tmp/ksu_repo/kernel/* drivers/kernelsu/
+          cp -r /tmp/ksu_repo/kernel KernelSU/
 
-          # Explicitly turn on CONFIG_KSU in grass.config (overriding default CONFIG_KSU=n)
+          # Wire up drivers/Makefile and drivers/Kconfig
+          grep -q "kernelsu" drivers/Makefile || echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          # Force CONFIG_KSU=y in all config files
           sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' arch/arm64/configs/vendor/grass.config
           echo "CONFIG_KSU=y" >> arch/arm64/configs/vendor/grass.config
+          if [ -f "arch/arm64/configs/vendor/ksu.config" ]; then
+            echo "CONFIG_KSU=y" >> arch/arm64/configs/vendor/ksu.config
+          fi
 
           # 2. Integrate SuSFS for Linux 4.14
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
@@ -132,13 +142,9 @@ jobs:
             echo "[*] Copying SuSFS source files..."
             cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
             cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+            grep -q "susfs.o" fs/Makefile || echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
 
             echo "[*] Applying SuSFS patch to KernelSU..."
-            if [ -d "KernelSU" ]; then
-              cd KernelSU
-              patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-              cd $KERNEL_DIR
-            fi
             if [ -d "drivers/kernelsu" ]; then
               cd drivers/kernelsu
               patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
@@ -178,8 +184,14 @@ jobs:
       - name: Verify KernelSU & SuSFS in Image Binary
         run: |
           cd $KERNEL_DIR
-          echo "[*] Scanning Image binary for KernelSU and SuSFS..."
-          strings out/arch/arm64/boot/Image | grep -E "KernelSU|kernelsu|ksu|susfs" | head -n 10 || true
+          echo "[*] Verifying KernelSU inside compiled Image..."
+          KSU_COUNT=$(strings out/arch/arm64/boot/Image | grep -c "KernelSU" || true)
+          echo "Found KernelSU occurrences in Image: $KSU_COUNT"
+          if [ "$KSU_COUNT" -eq 0 ]; then
+            echo "[-] CRITICAL ERROR: KernelSU was not compiled into Image!"
+            exit 1
+          fi
+          echo "[+] KernelSU verified successfully inside Image!"
 
       - name: Package Darknight AnyKernel3 Zip
         id: locate_zip
@@ -224,7 +236,7 @@ jobs:
             - **Kernel Name:** Darknight
             - **Target ROM:** OneUI 6.1 (Android 14 DisturbedUI / Ports)
             - **Base Kernel:** Linux 4.14.246 (Exynos 9611)
-            - **Compiler:** Neutron Clang
+            - **Compiler:** Latest Neutron Clang (Clang 24)
             - **Root:** Official Tiann KernelSU + SuSFS 2.3.0 Integrated
             - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip
           files: ${{ env.FLASHABLE_ZIP }}
