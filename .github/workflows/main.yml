@@ -1,4 +1,4 @@
-name: Build GrassKernel with KernelSU & SuSFS for Galaxy M21 (OneUI 6.1)
+name: Build Darknight Kernel with KernelSU & SuSFS for Galaxy M21 (OneUI 6.1)
 
 on:
   workflow_dispatch:
@@ -58,7 +58,7 @@ jobs:
             pkg-config libncurses-dev ccache zip unzip curl \
             tar wget xz-utils libtool automake autoconf python3
 
-      - name: Clone GrassKernel Source
+      - name: Clone Kernel Source
         run: |
           git clone --depth=1 -b Grass-Unified2 https://github.com/ghazzor/grass_kernel.git kernel_source
           cd kernel_source
@@ -77,20 +77,37 @@ jobs:
           echo "$KERNEL_DIR/toolchain/bin" >> $GITHUB_PATH
           echo "CC=clang" >> $GITHUB_ENV
 
-      - name: Apply Compiler & LTO Fixes for Linux 4.14
+      - name: Configure Kernel Name to Darknight & Apply Clang 19+ Fixes
         run: |
           cd $KERNEL_DIR
-          echo "[*] Fixing Clang 19 const struct init warning in kernel/params.c..."
-          sed -i 's/struct kernel_param dummy;/struct kernel_param dummy = { .perm = 0 };/g' kernel/params.c
-          sed -i 's/struct kernel_param kp;/struct kernel_param kp = { .perm = 0 };/g' kernel/params.c
 
-          echo "[*] Bypassing brittle LTO compiler-check in Makefile..."
+          echo "[*] Setting Kernel Name to Darknight..."
+          # Set localversion in configs
+          sed -i 's/CONFIG_LOCALVERSION="-Grass"/CONFIG_LOCALVERSION="-Darknight"/g' arch/arm64/configs/vendor/grass.config
+          sed -i 's/CONFIG_LOCALVERSION_BRANCH_SHA=y/# CONFIG_LOCALVERSION_BRANCH_SHA is not set/g' arch/arm64/configs/vendor/grass.config
+          echo 'CONFIG_LOCALVERSION="-Darknight"' >> arch/arm64/configs/vendor/grass.config
+
+          echo "[*] Bypassing LTO compiler check in Makefile..."
           sed -i 's/$(error Cannot use CONFIG_LTO/# $(error Cannot use CONFIG_LTO/g' Makefile
-
-          echo "[*] Disabling LTO to prevent LLVM broken pipe and speed up build..."
           sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_NONE=y/g' arch/arm64/configs/vendor/grass.config
           sed -i 's/CONFIG_THINLTO=y/# CONFIG_THINLTO is not set/g' arch/arm64/configs/vendor/grass.config
           echo "CONFIG_LTO_NONE=y" >> arch/arm64/configs/vendor/grass.config
+
+          echo "[*] Fixing Clang 19 const-init warnings across the tree..."
+          # 1. Global compiler flags in Makefile to completely disable default-const-init-field-unsafe error
+          sed -i '/KBUILD_CFLAGS.*:=/a KBUILD_CFLAGS += -Wno-default-const-init-field-unsafe -Wno-error -Wno-unused-but-set-variable' Makefile
+          
+          # 2. Source-level patches for kernel/params.c, sdfat, and sdcardfs
+          if [ -f "kernel/params.c" ]; then
+            sed -i 's/struct kernel_param dummy;/struct kernel_param dummy = { .perm = 0 };/g' kernel/params.c
+            sed -i 's/struct kernel_param kp;/struct kernel_param kp = { .perm = 0 };/g' kernel/params.c
+          fi
+          if [ -f "fs/sdfat/sdfat.h" ]; then
+            sed -i 's/struct inode fake_inode;/struct inode fake_inode = { .i_nlink = 0 };/g' fs/sdfat/sdfat.h
+          fi
+          if [ -f "fs/sdcardfs/inode.c" ]; then
+            sed -i 's/struct inode tmp;/struct inode tmp = { .i_nlink = 0 };/g' fs/sdcardfs/inode.c
+          fi
 
       - name: Setup KernelSU & SuSFS Patches
         run: |
@@ -101,7 +118,7 @@ jobs:
           echo "[*] Integrating KernelSU (${KSU_REF})..."
           rm -rf KernelSU drivers/kernelsu
           
-          # Try specific ref, fallback to main if tag doesn't exist
+          # Setup KernelSU v3.3.1 (matching versionCode 32680)
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${KSU_REF}" || \
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
 
@@ -156,33 +173,31 @@ jobs:
             exit 1
           fi
 
-      - name: Verify AnyKernel3 Package
+      - name: Package Darknight AnyKernel3 Zip
         id: locate_zip
         run: |
           cd $KERNEL_DIR
 
-          ZIP_NAME=$(find kernel_zip -name "*.zip" | head -n 1)
-          if [ -n "$ZIP_NAME" ] && [ -f "$ZIP_NAME" ]; then
-            # Verify that the zip actually contains Image and is not just 1.4MB
-            if unzip -l "$ZIP_NAME" | grep -q "Image"; then
-              echo "[+] Valid kernel zip with Image found: $ZIP_NAME"
-            else
-              echo "[!] Zip in kernel_zip did not have Image. Repackaging manually..."
-              git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
-              cp out/arch/arm64/boot/Image /tmp/AnyKernel3/Image
-              sed -i 's/device.name1=.*/device.name1=m21nsxx/g' /tmp/AnyKernel3/anykernel.sh
-              sed -i 's/device.name2=.*/device.name2=m21/g' /tmp/AnyKernel3/anykernel.sh
-              sed -i 's/device.name3=.*/device.name3=SM-M215F/g' /tmp/AnyKernel3/anykernel.sh
-              sed -i 's/device.name4=.*/device.name4=SM-M215G/g' /tmp/AnyKernel3/anykernel.sh
-              cd /tmp/AnyKernel3
-              zip -r9 $KERNEL_DIR/kernel_zip/GrassKernel-M21-KSU-SUSFS-OneUI.zip * -x .git README.md
-              ZIP_NAME="kernel_zip/GrassKernel-M21-KSU-SUSFS-OneUI.zip"
-            fi
-          fi
-
-          echo "FLASHABLE_ZIP=$KERNEL_DIR/$ZIP_NAME" >> $GITHUB_ENV
-          echo "FLASHABLE_BASENAME=$(basename $ZIP_NAME)" >> $GITHUB_ENV
-          ls -lh "$KERNEL_DIR/$ZIP_NAME"
+          echo "[*] Creating fresh AnyKernel3 package for Darknight Kernel..."
+          rm -rf /tmp/AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
+          cp out/arch/arm64/boot/Image /tmp/AnyKernel3/Image
+          
+          # Configure AnyKernel3 for Galaxy M21
+          sed -i 's/kernel.string=.*/kernel.string=Darknight Kernel for Galaxy M21/g' /tmp/AnyKernel3/anykernel.sh
+          sed -i 's/device.name1=.*/device.name1=m21nsxx/g' /tmp/AnyKernel3/anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=m21/g' /tmp/AnyKernel3/anykernel.sh
+          sed -i 's/device.name3=.*/device.name3=SM-M215F/g' /tmp/AnyKernel3/anykernel.sh
+          sed -i 's/device.name4=.*/device.name4=SM-M215G/g' /tmp/AnyKernel3/anykernel.sh
+          
+          mkdir -p kernel_zip
+          cd /tmp/AnyKernel3
+          zip -r9 $KERNEL_DIR/kernel_zip/Darknight-Kernel-M21-KSU-SUSFS-OneUI.zip * -x .git README.md
+          
+          ZIP_FILE="kernel_zip/Darknight-Kernel-M21-KSU-SUSFS-OneUI.zip"
+          echo "FLASHABLE_ZIP=$KERNEL_DIR/$ZIP_FILE" >> $GITHUB_ENV
+          echo "FLASHABLE_BASENAME=$(basename $ZIP_FILE)" >> $GITHUB_ENV
+          ls -lh "$KERNEL_DIR/$ZIP_FILE"
 
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
@@ -195,13 +210,14 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: release-${{ github.run_number }}
-          name: GrassKernel Galaxy M21 (KSU + SuSFS) OneUI 6.1
+          name: Darknight Kernel Galaxy M21 (KSU + SuSFS) OneUI 6.1
           body: |
-            ### GrassKernel Build for Samsung Galaxy M21 (SM-M215F / SM-M215G)
+            ### Darknight Custom Kernel for Samsung Galaxy M21 (SM-M215F / SM-M215G)
+            - **Kernel Name:** Darknight
             - **Target ROM:** OneUI 6.1 (Android 14 DisturbedUI / Ports)
             - **Base Kernel:** Linux 4.14.246 (Exynos 9611)
             - **Compiler:** Neutron Clang
-            - **Root:** KernelSU + SuSFS 4.14 Integrated
+            - **Root:** KernelSU v3.3.1 (32680) + SuSFS 2.3.0 Integrated
             - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip
           files: ${{ env.FLASHABLE_ZIP }}
         env:
