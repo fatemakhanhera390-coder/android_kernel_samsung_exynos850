@@ -118,12 +118,8 @@ jobs:
           cp -r /tmp/ksu_repo/kernel/* drivers/kernelsu/
           cp -r /tmp/ksu_repo/kernel KernelSU/
 
-          # CRITICAL FIX: Expose ksu_hook.h to the kernel include directories so fs/open.c can find <ksu_hook.h>
-          mkdir -p include include/linux
-          find /tmp/ksu_repo/kernel -name "*.h" -exec cp {} include/ \; 2>/dev/null || true
-          find /tmp/ksu_repo/kernel -name "*.h" -exec cp {} include/linux/ \; 2>/dev/null || true
-          [ -f "drivers/kernelsu/ksu_hook.h" ] && cp drivers/kernelsu/ksu_hook.h include/ && cp drivers/kernelsu/ksu_hook.h include/linux/
-          [ -f "KernelSU/kernel/ksu_hook.h" ] && cp KernelSU/kernel/ksu_hook.h include/ && cp KernelSU/kernel/ksu_hook.h include/linux/
+          # ONLY copy ksu_hook.h into include/ (DO NOT copy *.h into include/linux/ as that overwrites linux sched.h!)
+          find /tmp/ksu_repo/kernel -name "ksu_hook.h" -exec cp {} include/ksu_hook.h \;
 
           # Wire up drivers/Makefile and drivers/Kconfig
           grep -q "kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
@@ -162,8 +158,7 @@ jobs:
 
             echo "[*] Copying SuSFS source files..."
             cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
-            cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
-            cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/ 2>/dev/null || true
+            cp -r /tmp/susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || true
             grep -q "susfs.o" fs/Makefile || echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
 
             echo "[*] Applying SuSFS patch to KernelSU..."
