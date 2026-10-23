@@ -91,7 +91,7 @@ jobs:
           echo "[*] Appending compiler compatibility flags to end of Makefile..."
           echo '' >> Makefile
           echo '# Clang Compatibility Flags' >> Makefile
-          echo 'KBUILD_CFLAGS += -Wno-default-const-init-field-unsafe -Wno-error -Wno-unused-but-set-variable -Wno-implicit-function-declaration -Wno-error=implicit-function-declaration' >> Makefile
+          echo 'KBUILD_CFLAGS += -Wno-default-const-init-field-unsafe -Wno-default-const-init-var-unsafe -Wno-error -Wno-unused-but-set-variable -Wno-implicit-function-declaration -Wno-error=implicit-function-declaration' >> Makefile
 
           echo "[*] Source patches for uninitialized const structs..."
           if [ -f "kernel/params.c" ]; then
@@ -134,7 +134,7 @@ jobs:
           cp -r /tmp/ksu_repo/kernel/* drivers/android/kernelsu/
           cp -r /tmp/ksu_repo/kernel KernelSU/
 
-          # PRO-LEVEL COMPREHENSIVE FIX: Find app_profile.h and replicate across all subdirectories
+          # PRO-LEVEL COMPREHENSIVE FIX: Find app_profile.h and replicate safely (with SameFileError prevention)
           python3 -c "
           import os, shutil
           app_profiles = []
@@ -147,7 +147,7 @@ jobs:
           
           if app_profiles:
               src = app_profiles[0]
-              print(f'[+] Found source app_profile.h at {src}')
+              print(f'[+] Source app_profile.h located at {src}')
               targets = [
                   'drivers/android/kernelsu/policy/uapi/app_profile.h',
                   'drivers/android/kernelsu/policy/app_profile.h',
@@ -166,8 +166,14 @@ jobs:
               ]
               for t in targets:
                   os.makedirs(os.path.dirname(t), exist_ok=True)
-                  shutil.copyfile(src, t)
-                  print(f'[+] Placed {t}')
+                  try:
+                      if os.path.abspath(src) != os.path.abspath(t):
+                          shutil.copyfile(src, t)
+                          print(f'[+] Successfully placed {t}')
+                      else:
+                          print(f'[*] Skipped identical source file at {t}')
+                  except Exception as e:
+                      print(f'[!] Note on {t}: {e}')
           "
 
           # Add compiler include paths to all Kbuild files
@@ -203,7 +209,7 @@ jobs:
           #endif
           '''
           import os
-          for path in ['include/ksu_hook.h', 'include/linux/ksu_hook.h', 'drivers/kernelsu/ksu_hook.h', 'drivers/android/kernelsu/ksu_hook.h', 'KernelSU/kernel/ksu_hook.h']:
+          for path in ['fs/ksu_hook.h', 'include/ksu_hook.h', 'include/linux/ksu_hook.h', 'drivers/kernelsu/ksu_hook.h', 'drivers/android/kernelsu/ksu_hook.h', 'KernelSU/kernel/ksu_hook.h']:
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, 'w') as f:
                   f.write(content)
