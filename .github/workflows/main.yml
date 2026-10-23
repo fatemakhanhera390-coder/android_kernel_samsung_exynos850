@@ -134,23 +134,45 @@ jobs:
           cp -r /tmp/ksu_repo/kernel/* drivers/android/kernelsu/
           cp -r /tmp/ksu_repo/kernel KernelSU/
 
-          # FIX FOR UAPI APP_PROFILE.H: Replicate uapi into policy/ and core/ subdirectories
+          # PRO-LEVEL COMPREHENSIVE FIX: Find app_profile.h and replicate across all subdirectories
           python3 -c "
           import os, shutil
-          for root_dir in ['drivers/android/kernelsu', 'drivers/kernelsu', 'KernelSU/kernel']:
-              if os.path.exists(root_dir):
-                  uapi_src = os.path.join(root_dir, 'uapi')
-                  if os.path.exists(uapi_src):
-                      for sub in ['policy', 'core']:
-                          dest = os.path.join(root_dir, sub, 'uapi')
-                          shutil.copytree(uapi_src, dest, dirs_exist_ok=True)
-                      os.makedirs('include/uapi', exist_ok=True)
-                      shutil.copytree(uapi_src, 'include/uapi', dirs_exist_ok=True)
+          app_profiles = []
+          for root, dirs, files in os.walk('.'):
+              if 'app_profile.h' in files:
+                  app_profiles.append(os.path.join(root, 'app_profile.h'))
+          for root, dirs, files in os.walk('/tmp/ksu_repo'):
+              if 'app_profile.h' in files:
+                  app_profiles.append(os.path.join(root, 'app_profile.h'))
+          
+          if app_profiles:
+              src = app_profiles[0]
+              print(f'[+] Found source app_profile.h at {src}')
+              targets = [
+                  'drivers/android/kernelsu/policy/uapi/app_profile.h',
+                  'drivers/android/kernelsu/policy/app_profile.h',
+                  'drivers/android/kernelsu/core/uapi/app_profile.h',
+                  'drivers/android/kernelsu/uapi/app_profile.h',
+                  'drivers/android/kernelsu/app_profile.h',
+                  'drivers/kernelsu/policy/uapi/app_profile.h',
+                  'drivers/kernelsu/policy/app_profile.h',
+                  'drivers/kernelsu/core/uapi/app_profile.h',
+                  'drivers/kernelsu/uapi/app_profile.h',
+                  'KernelSU/kernel/policy/uapi/app_profile.h',
+                  'KernelSU/kernel/policy/app_profile.h',
+                  'KernelSU/kernel/uapi/app_profile.h',
+                  'include/uapi/app_profile.h',
+                  'include/app_profile.h'
+              ]
+              for t in targets:
+                  os.makedirs(os.path.dirname(t), exist_ok=True)
+                  shutil.copyfile(src, t)
+                  print(f'[+] Placed {t}')
           "
 
-          # Add include flags to Kbuild files
-          echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core' >> drivers/android/kernelsu/Kbuild 2>/dev/null || true
-          echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core' >> drivers/kernelsu/Kbuild 2>/dev/null || true
+          # Add compiler include paths to all Kbuild files
+          echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core -I$(src)/uapi -I$(src)/policy/uapi' >> drivers/android/kernelsu/Kbuild 2>/dev/null || true
+          echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core -I$(src)/uapi -I$(src)/policy/uapi' >> drivers/kernelsu/Kbuild 2>/dev/null || true
 
           # Generate ksu_hook.h with all manual hook prototypes across include paths
           python3 -c "
@@ -270,7 +292,7 @@ jobs:
           chmod +x build_kernel.sh
           ./build_kernel.sh 2>&1 | tee build.log
 
-          # ADVANCED ERROR CATCHER SYSTEM: Diagnoses exact compilation issues directly on GitHub summary
+          # ADVANCED ERROR CATCHER SYSTEM
           if [ ! -f "out/arch/arm64/boot/Image" ]; then
             echo "### ❌ Kernel Build Failed" >> $GITHUB_STEP_SUMMARY
             echo "The kernel Image was not created. Diagnostic error summary:" >> $GITHUB_STEP_SUMMARY
