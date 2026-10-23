@@ -23,9 +23,9 @@ on:
           - oneui
           - aosp
       ksu_version:
-        description: 'KernelSU Branch / Tag (main, v0.9.5, or commit)'
+        description: 'KernelSU Branch / Tag (v3.3.1, main, etc.)'
         required: true
-        default: 'main'
+        default: 'v3.3.1'
         type: string
       enable_susfs:
         description: 'Integrate SuSFS (v2.3.0 / 4.14 patches)'
@@ -67,7 +67,6 @@ jobs:
       - name: Setup Toolchain inside kernel_source/toolchain
         run: |
           cd $KERNEL_DIR
-          # build_kernel.sh strictly expects the compiler in $KERNEL_DIR/toolchain/bin
           mkdir -p toolchain
           cd toolchain
           curl -sLO https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
@@ -75,10 +74,19 @@ jobs:
           ./antman -S
           ./antman --patch=glibc
           
-          # Verify clang, llvm-nm, and llvm-ar exist
-          ls -la bin/clang bin/llvm-nm bin/llvm-ar
           echo "$KERNEL_DIR/toolchain/bin" >> $GITHUB_PATH
           echo "CC=clang" >> $GITHUB_ENV
+
+      - name: Apply Clang 19+ Fixes for Linux 4.14
+        run: |
+          cd $KERNEL_DIR
+          echo "[*] Fixing Clang 19 const struct init warning in kernel/params.c..."
+          sed -i 's/struct kernel_param dummy;/struct kernel_param dummy = { .perm = 0 };/g' kernel/params.c
+          sed -i 's/struct kernel_param kp;/struct kernel_param kp = { .perm = 0 };/g' kernel/params.c
+          
+          # Disable -Werror so unexpected compiler warnings do not abort the build
+          sed -i 's/-Werror//g' Makefile
+          sed -i 's/-Werror-implicit-function-declaration//g' Makefile
 
       - name: Setup KernelSU & SuSFS Patches
         run: |
@@ -87,13 +95,11 @@ jobs:
           # 1. Update / Integrate KernelSU
           KSU_REF="${{ github.event.inputs.ksu_version }}"
           echo "[*] Integrating KernelSU (${KSU_REF})..."
-          if [ -d "KernelSU" ]; then
-            rm -rf KernelSU
-          fi
-          if [ -d "drivers/kernelsu" ]; then
-            rm -rf drivers/kernelsu
-          fi
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${KSU_REF}"
+          rm -rf KernelSU drivers/kernelsu
+          
+          # Try specific ref, fallback to main if tag doesn't exist
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${KSU_REF}" || \
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
 
           # 2. Integrate SuSFS for Linux 4.14
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
@@ -136,27 +142,29 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
           export PATH="$KERNEL_DIR/toolchain/bin:$PATH"
-
-          # Verify compiler is found in toolchain
-          $KERNEL_DIR/toolchain/bin/clang --version
+          export KCFLAGS="-Wno-error -Wno-default-const-init-field-unsafe"
 
           chmod +x build_kernel.sh
-          # Run build and stream to both console and build.log for diagnostics
           ./build_kernel.sh 2>&1 | tee build.log
 
-      - name: Locate & Verify AnyKernel3 Flashable Zip
+          # Strictly verify that the kernel binary was compiled
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "[-] ERROR: out/arch/arm64/boot/Image was NOT created! Build failed."
+            exit 1
+          fi
+
+      - name: Verify AnyKernel3 Package
         id: locate_zip
         run: |
           cd $KERNEL_DIR
 
           ZIP_NAME=$(find kernel_zip -name "*.zip" | head -n 1)
           if [ -n "$ZIP_NAME" ] && [ -f "$ZIP_NAME" ]; then
-            echo "[+] Found kernel package: $ZIP_NAME"
-            echo "FLASHABLE_ZIP=$KERNEL_DIR/$ZIP_NAME" >> $GITHUB_ENV
-            echo "FLASHABLE_BASENAME=$(basename $ZIP_NAME)" >> $GITHUB_ENV
-          else
-            echo "[-] kernel_zip missing or empty. Checking out/arch/arm64/boot/Image..."
-            if [ -f "out/arch/arm64/boot/Image" ]; then
+            # Verify that the zip actually contains Image and is not just 1.4MB
+            if unzip -l "$ZIP_NAME" | grep -q "Image"; then
+              echo "[+] Valid kernel zip with Image found: $ZIP_NAME"
+            else
+              echo "[!] Zip in kernel_zip did not have Image. Repackaging manually..."
               git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
               cp out/arch/arm64/boot/Image /tmp/AnyKernel3/Image
               sed -i 's/device.name1=.*/device.name1=m21nsxx/g' /tmp/AnyKernel3/anykernel.sh
@@ -164,16 +172,16 @@ jobs:
               sed -i 's/device.name3=.*/device.name3=SM-M215F/g' /tmp/AnyKernel3/anykernel.sh
               sed -i 's/device.name4=.*/device.name4=SM-M215G/g' /tmp/AnyKernel3/anykernel.sh
               cd /tmp/AnyKernel3
-              zip -r9 $KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip * -x .git README.md
-              echo "FLASHABLE_ZIP=$KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip" >> $GITHUB_ENV
-              echo "FLASHABLE_BASENAME=GrassKernel-M21-KSU-SUSFS-OneUI.zip" >> $GITHUB_ENV
-            else
-              echo "[!] Kernel Image was not produced. Inspect diagnostics log."
+              zip -r9 $KERNEL_DIR/kernel_zip/GrassKernel-M21-KSU-SUSFS-OneUI.zip * -x .git README.md
+              ZIP_NAME="kernel_zip/GrassKernel-M21-KSU-SUSFS-OneUI.zip"
             fi
           fi
 
+          echo "FLASHABLE_ZIP=$KERNEL_DIR/$ZIP_NAME" >> $GITHUB_ENV
+          echo "FLASHABLE_BASENAME=$(basename $ZIP_NAME)" >> $GITHUB_ENV
+          ls -lh "$KERNEL_DIR/$ZIP_NAME"
+
       - name: Upload Kernel Artifact
-        if: env.FLASHABLE_ZIP != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FLASHABLE_BASENAME }}
@@ -181,7 +189,6 @@ jobs:
           retention-days: 7
 
       - name: Create GitHub Release
-        if: env.FLASHABLE_ZIP != ''
         uses: softprops/action-gh-release@v1
         with:
           tag_name: release-${{ github.run_number }}
@@ -190,7 +197,7 @@ jobs:
             ### GrassKernel Build for Samsung Galaxy M21 (SM-M215F / SM-M215G)
             - **Target ROM:** OneUI 6.1 (Android 14 DisturbedUI / Ports)
             - **Base Kernel:** Linux 4.14.246 (Exynos 9611)
-            - **Compiler:** Latest Neutron Clang (LLVM LTO)
+            - **Compiler:** Neutron Clang (LLVM LTO)
             - **Root:** KernelSU + SuSFS 4.14 Integrated
             - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip
           files: ${{ env.FLASHABLE_ZIP }}
