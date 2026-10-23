@@ -22,11 +22,19 @@ on:
         options:
           - oneui
           - aosp
+      ksu_version:
+        description: 'KernelSU Branch / Tag (main, v0.9.5, or commit)'
+        required: true
+        default: 'main'
+        type: string
       enable_susfs:
         description: 'Integrate SuSFS (v2.3.0 / 4.14 patches)'
         required: true
         default: true
         type: boolean
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -56,17 +64,20 @@ jobs:
           cd kernel_source
           echo "KERNEL_DIR=$(pwd)" >> $GITHUB_ENV
 
-      - name: Setup Neutron Clang Toolchain (Bleeding-Edge)
+      - name: Setup Toolchain inside kernel_source/toolchain
         run: |
-          mkdir -p $HOME/toolchain/neutron
-          cd $HOME/toolchain/neutron
-          # Download AntMan (Neutron Toolchain Manager)
+          cd $KERNEL_DIR
+          # build_kernel.sh strictly expects the compiler in $KERNEL_DIR/toolchain/bin
+          mkdir -p toolchain
+          cd toolchain
           curl -sLO https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
           chmod +x antman
-          # Sync latest Neutron Clang LLVM toolchain
           ./antman -S
           ./antman --patch=glibc
-          echo "$HOME/toolchain/neutron/bin" >> $GITHUB_PATH
+          
+          # Verify clang, llvm-nm, and llvm-ar exist
+          ls -la bin/clang bin/llvm-nm bin/llvm-ar
+          echo "$KERNEL_DIR/toolchain/bin" >> $GITHUB_PATH
           echo "CC=clang" >> $GITHUB_ENV
 
       - name: Setup KernelSU & SuSFS Patches
@@ -74,11 +85,15 @@ jobs:
           cd $KERNEL_DIR
 
           # 1. Update / Integrate KernelSU
-          echo "[*] Integrating KernelSU..."
+          KSU_REF="${{ github.event.inputs.ksu_version }}"
+          echo "[*] Integrating KernelSU (${KSU_REF})..."
           if [ -d "KernelSU" ]; then
             rm -rf KernelSU
           fi
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          if [ -d "drivers/kernelsu" ]; then
+            rm -rf drivers/kernelsu
+          fi
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${KSU_REF}"
 
           # 2. Integrate SuSFS for Linux 4.14
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
@@ -115,45 +130,50 @@ jobs:
         run: |
           cd $KERNEL_DIR
 
-          # Set build parameters matching the user's M21 OneUI 6.1 Disturbed ROM
           export DEVICE="${{ github.event.inputs.device }}"
           export ROM="${{ github.event.inputs.rom_type }}"
           export KSU=1
           export ARCH=arm64
           export SUBARCH=arm64
-          export PATH="$HOME/toolchain/neutron/bin:$PATH"
+          export PATH="$KERNEL_DIR/toolchain/bin:$PATH"
 
-          # Verify Clang version
-          clang --version
+          # Verify compiler is found in toolchain
+          $KERNEL_DIR/toolchain/bin/clang --version
 
-          # Execute GrassKernel build script
           chmod +x build_kernel.sh
-          ./build_kernel.sh
+          # Run build and stream to both console and build.log for diagnostics
+          ./build_kernel.sh 2>&1 | tee build.log
 
-      - name: Package AnyKernel3 Flashable Zip
-        id: package
+      - name: Locate & Verify AnyKernel3 Flashable Zip
+        id: locate_zip
         run: |
           cd $KERNEL_DIR
 
-          # Locate generated flashable zip or AnyKernel3 package
           ZIP_NAME=$(find kernel_zip -name "*.zip" | head -n 1)
-          if [ -z "$ZIP_NAME" ]; then
-            echo "[*] Packaging with AnyKernel3 manually..."
-            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
-            cp out/arch/arm64/boot/Image /tmp/AnyKernel3/Image
-            sed -i 's/device.name1=.*/device.name1=m21nsxx/g' /tmp/AnyKernel3/anykernel.sh
-            sed -i 's/device.name2=.*/device.name2=m21/g' /tmp/AnyKernel3/anykernel.sh
-            sed -i 's/device.name3=.*/device.name3=SM-M215F/g' /tmp/AnyKernel3/anykernel.sh
-            sed -i 's/device.name4=.*/device.name4=SM-M215G/g' /tmp/AnyKernel3/anykernel.sh
-            cd /tmp/AnyKernel3
-            zip -r9 $KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip * -x .git README.md
-            ZIP_NAME="$KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip"
+          if [ -n "$ZIP_NAME" ] && [ -f "$ZIP_NAME" ]; then
+            echo "[+] Found kernel package: $ZIP_NAME"
+            echo "FLASHABLE_ZIP=$KERNEL_DIR/$ZIP_NAME" >> $GITHUB_ENV
+            echo "FLASHABLE_BASENAME=$(basename $ZIP_NAME)" >> $GITHUB_ENV
+          else
+            echo "[-] kernel_zip missing or empty. Checking out/arch/arm64/boot/Image..."
+            if [ -f "out/arch/arm64/boot/Image" ]; then
+              git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
+              cp out/arch/arm64/boot/Image /tmp/AnyKernel3/Image
+              sed -i 's/device.name1=.*/device.name1=m21nsxx/g' /tmp/AnyKernel3/anykernel.sh
+              sed -i 's/device.name2=.*/device.name2=m21/g' /tmp/AnyKernel3/anykernel.sh
+              sed -i 's/device.name3=.*/device.name3=SM-M215F/g' /tmp/AnyKernel3/anykernel.sh
+              sed -i 's/device.name4=.*/device.name4=SM-M215G/g' /tmp/AnyKernel3/anykernel.sh
+              cd /tmp/AnyKernel3
+              zip -r9 $KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip * -x .git README.md
+              echo "FLASHABLE_ZIP=$KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip" >> $GITHUB_ENV
+              echo "FLASHABLE_BASENAME=GrassKernel-M21-KSU-SUSFS-OneUI.zip" >> $GITHUB_ENV
+            else
+              echo "[!] Kernel Image was not produced. Inspect diagnostics log."
+            fi
           fi
 
-          echo "FLASHABLE_ZIP=$ZIP_NAME" >> $GITHUB_ENV
-          echo "FLASHABLE_BASENAME=$(basename $ZIP_NAME)" >> $GITHUB_ENV
-
       - name: Upload Kernel Artifact
+        if: env.FLASHABLE_ZIP != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FLASHABLE_BASENAME }}
@@ -161,18 +181,28 @@ jobs:
           retention-days: 7
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: env.FLASHABLE_ZIP != ''
         uses: softprops/action-gh-release@v1
         with:
           tag_name: release-${{ github.run_number }}
           name: GrassKernel Galaxy M21 (KSU + SuSFS) OneUI 6.1
           body: |
-            ### GrassKernel Custom Build for Samsung Galaxy M21 (SM-M215F / SM-M215G)
+            ### GrassKernel Build for Samsung Galaxy M21 (SM-M215F / SM-M215G)
             - **Target ROM:** OneUI 6.1 (Android 14 DisturbedUI / Ports)
             - **Base Kernel:** Linux 4.14.246 (Exynos 9611)
-            - **Compiler:** Latest Neutron Clang (LLVM LTO Optimized)
+            - **Compiler:** Latest Neutron Clang (LLVM LTO)
             - **Root:** KernelSU + SuSFS 4.14 Integrated
             - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip
           files: ${{ env.FLASHABLE_ZIP }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Build Diagnostics Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-log
+          path: |
+            kernel_source/build.log
+            kernel_source/arch/arm64/configs/vendor/grass.config
+          retention-days: 7
