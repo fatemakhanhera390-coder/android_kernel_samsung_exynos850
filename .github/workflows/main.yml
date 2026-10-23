@@ -77,16 +77,20 @@ jobs:
           echo "$KERNEL_DIR/toolchain/bin" >> $GITHUB_PATH
           echo "CC=clang" >> $GITHUB_ENV
 
-      - name: Apply Clang 19+ Fixes for Linux 4.14
+      - name: Apply Compiler & LTO Fixes for Linux 4.14
         run: |
           cd $KERNEL_DIR
           echo "[*] Fixing Clang 19 const struct init warning in kernel/params.c..."
           sed -i 's/struct kernel_param dummy;/struct kernel_param dummy = { .perm = 0 };/g' kernel/params.c
           sed -i 's/struct kernel_param kp;/struct kernel_param kp = { .perm = 0 };/g' kernel/params.c
-          
-          # Disable -Werror so unexpected compiler warnings do not abort the build
-          sed -i 's/-Werror//g' Makefile
-          sed -i 's/-Werror-implicit-function-declaration//g' Makefile
+
+          echo "[*] Bypassing brittle LTO compiler-check in Makefile..."
+          sed -i 's/$(error Cannot use CONFIG_LTO/# $(error Cannot use CONFIG_LTO/g' Makefile
+
+          echo "[*] Disabling LTO to prevent LLVM broken pipe and speed up build..."
+          sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_NONE=y/g' arch/arm64/configs/vendor/grass.config
+          sed -i 's/CONFIG_THINLTO=y/# CONFIG_THINLTO is not set/g' arch/arm64/configs/vendor/grass.config
+          echo "CONFIG_LTO_NONE=y" >> arch/arm64/configs/vendor/grass.config
 
       - name: Setup KernelSU & SuSFS Patches
         run: |
@@ -142,7 +146,6 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
           export PATH="$KERNEL_DIR/toolchain/bin:$PATH"
-          export KCFLAGS="-Wno-error -Wno-default-const-init-field-unsafe"
 
           chmod +x build_kernel.sh
           ./build_kernel.sh 2>&1 | tee build.log
@@ -197,7 +200,7 @@ jobs:
             ### GrassKernel Build for Samsung Galaxy M21 (SM-M215F / SM-M215G)
             - **Target ROM:** OneUI 6.1 (Android 14 DisturbedUI / Ports)
             - **Base Kernel:** Linux 4.14.246 (Exynos 9611)
-            - **Compiler:** Neutron Clang (LLVM LTO)
+            - **Compiler:** Neutron Clang
             - **Root:** KernelSU + SuSFS 4.14 Integrated
             - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip
           files: ${{ env.FLASHABLE_ZIP }}
