@@ -122,8 +122,10 @@ jobs:
         run: |
           cd $KERNEL_DIR
 
+          echo "[*] Cleaning any stale broken symlinks and directories..."
+          rm -rf KernelSU drivers/kernelsu drivers/android/kernelsu /tmp/ksu_repo
+
           echo "[*] Cloning Official Tiann KernelSU..."
-          rm -rf KernelSU drivers/kernelsu /tmp/ksu_repo
           git clone --depth=1 https://github.com/tiann/KernelSU.git /tmp/ksu_repo
           
           # Direct physical copy into drivers/kernelsu, drivers/android/kernelsu, and KernelSU
@@ -150,7 +152,7 @@ jobs:
           echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core' >> drivers/android/kernelsu/Kbuild 2>/dev/null || true
           echo 'ccflags-y += -I$(src) -I$(src)/.. -I$(src)/policy -I$(src)/core' >> drivers/kernelsu/Kbuild 2>/dev/null || true
 
-          # Generate ksu_hook.h with all manual hook prototypes
+          # Generate ksu_hook.h with all manual hook prototypes across include paths
           python3 -c "
           content = '''#ifndef __KSU_HOOK_H
           #define __KSU_HOOK_H
@@ -254,7 +256,7 @@ jobs:
               'CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y' >> arch/arm64/configs/vendor/ksu.config
           fi
 
-      - name: Build Kernel Image & AnyKernel3 Zip
+      - name: Build Kernel Image & Error Catcher System
         run: |
           cd $KERNEL_DIR
 
@@ -268,8 +270,13 @@ jobs:
           chmod +x build_kernel.sh
           ./build_kernel.sh 2>&1 | tee build.log
 
-          # Strictly verify that the kernel binary was compiled
+          # ADVANCED ERROR CATCHER SYSTEM: Diagnoses exact compilation issues directly on GitHub summary
           if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "### ❌ Kernel Build Failed" >> $GITHUB_STEP_SUMMARY
+            echo "The kernel Image was not created. Diagnostic error summary:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "error:|fatal error:|recipe commences" build.log | tail -n 20 >> $GITHUB_STEP_SUMMARY || tail -n 30 build.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
             echo "[-] ERROR: out/arch/arm64/boot/Image was NOT created! Build failed."
             exit 1
           fi
@@ -281,10 +288,14 @@ jobs:
           KSU_COUNT=$(strings out/arch/arm64/boot/Image | grep -c "KernelSU" || true)
           echo "Found KernelSU occurrences in Image: $KSU_COUNT"
           if [ "$KSU_COUNT" -eq 0 ]; then
+            echo "### ⚠️ KernelSU Verification Failed" >> $GITHUB_STEP_SUMMARY
+            echo "KernelSU symbols not found in Image." >> $GITHUB_STEP_SUMMARY
             echo "[-] CRITICAL ERROR: KernelSU was not compiled into Image!"
             exit 1
           fi
           echo "[+] KernelSU verified successfully inside Image ($KSU_COUNT occurrences)!"
+          echo "### ✅ Build & Root Verification Passed" >> $GITHUB_STEP_SUMMARY
+          echo "Kernel compiled successfully with Darknight branding, KernelSU, and SuSFS 2.3.0!" >> $GITHUB_STEP_SUMMARY
 
       - name: Package Darknight AnyKernel3 Zip
         id: locate_zip
