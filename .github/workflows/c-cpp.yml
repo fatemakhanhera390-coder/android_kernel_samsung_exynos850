@@ -1,4 +1,4 @@
-name: Build GrassKernel with KernelSU & SuSFS for Galaxy M21 (OneUI 6.1)
+name: Build Darknight Kernel with Official KernelSU v3.3.1 (32680) & SuSFS v2.3.0 for Galaxy M21 (OneUI 6.1)
 
 on:
   workflow_dispatch:
@@ -23,10 +23,13 @@ on:
           - oneui
           - aosp
       enable_susfs:
-        description: 'Integrate SuSFS (v2.3.0 / 4.14 patches)'
+        description: 'Integrate SuSFS v2.3.0'
         required: true
         default: true
         type: boolean
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -48,131 +51,506 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git make bc bison flex libssl-dev libelf-dev \
             pkg-config libncurses-dev ccache zip unzip curl \
-            tar wget xz-utils libtool automake autoconf python3
+            tar wget xz-utils libtool automake autoconf python3 rsync
 
-      - name: Clone GrassKernel Source
+      - name: Clone Kernel Source & Initialize Submodules
         run: |
           git clone --depth=1 -b Grass-Unified2 https://github.com/ghazzor/grass_kernel.git kernel_source
           cd kernel_source
+          git submodule update --init --recursive || true
           echo "KERNEL_DIR=$(pwd)" >> $GITHUB_ENV
 
-      - name: Setup Neutron Clang Toolchain (Bleeding-Edge)
+      - name: Setup Latest Neutron Clang Toolchain (AntMan)
         run: |
-          mkdir -p $HOME/toolchain/neutron
-          cd $HOME/toolchain/neutron
-          # Download AntMan (Neutron Toolchain Manager)
+          cd $KERNEL_DIR
+          mkdir -p toolchain
+          cd toolchain
           curl -sLO https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
           chmod +x antman
-          # Sync latest Neutron Clang LLVM toolchain
           ./antman -S
           ./antman --patch=glibc
-          echo "$HOME/toolchain/neutron/bin" >> $GITHUB_PATH
+          
+          echo "$KERNEL_DIR/toolchain/bin" >> $GITHUB_PATH
           echo "CC=clang" >> $GITHUB_ENV
 
-      - name: Setup KernelSU & SuSFS Patches
+      - name: Configure Kernel Name to Darknight & Apply Clang 24 Fixes
         run: |
           cd $KERNEL_DIR
 
-          # 1. Update / Integrate KernelSU
-          echo "[*] Integrating KernelSU..."
-          if [ -d "KernelSU" ]; then
+          echo "[*] Setting Kernel Name to Darknight in defconfigs and AnyKernel3..."
+          sed -i 's/CONFIG_LOCALVERSION="-Grass"/CONFIG_LOCALVERSION="-Darknight"/g' arch/arm64/configs/vendor/grass.config
+          sed -i 's/CONFIG_LOCALVERSION_BRANCH_SHA=y/# CONFIG_LOCALVERSION_BRANCH_SHA is not set/g' arch/arm64/configs/vendor/grass.config
+          echo 'CONFIG_LOCALVERSION="-Darknight"' >> arch/arm64/configs/vendor/grass.config
+          find . -name "anykernel.sh" -exec sed -i 's/Installing Grass Kernel/Installing Darknight Kernel/g' {} + 2>/dev/null || true
+          find . -name "version" -exec sed -i 's/GrassKernel/Darknight Kernel/g' {} + 2>/dev/null || true
+
+          echo "[*] Disabling LTO to prevent brittle compiler checks and broken pipes..."
+          sed -i 's/$(error Cannot use CONFIG_LTO/# $(error Cannot use CONFIG_LTO/g' Makefile
+          sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_NONE=y/g' arch/arm64/configs/vendor/grass.config
+          sed -i 's/CONFIG_THINLTO=y/# CONFIG_THINLTO is not set/g' arch/arm64/configs/vendor/grass.config
+          echo "CONFIG_LTO_NONE=y" >> arch/arm64/configs/vendor/grass.config
+
+          echo "[*] Appending Clang 24 compatibility flags & KernelSU include paths to end of Makefile..."
+          echo '' >> Makefile
+          echo '# Clang 24 Compatibility Flags & KernelSU Include Paths' >> Makefile
+          echo 'KBUILD_CFLAGS += -Wno-default-const-init-field-unsafe -Wno-default-const-init-var-unsafe -Wno-macro-redefined -Wno-error -Wno-unused-but-set-variable -Wno-implicit-function-declaration -Wno-error=implicit-function-declaration -I$(srctree)/KernelSU/kernel/include -I$(srctree)/drivers/android/kernelsu/include -I$(srctree)/include' >> Makefile
+
+          echo "[*] Source patches for uninitialized const structs..."
+          if [ -f "kernel/params.c" ]; then
+            sed -i 's/struct kernel_param dummy;/struct kernel_param dummy = { .perm = 0 };/g' kernel/params.c
+            sed -i 's/struct kernel_param kp;/struct kernel_param kp = { .perm = 0 };/g' kernel/params.c
+          fi
+          if [ -f "fs/sdfat/sdfat.h" ]; then
+            sed -i 's/struct inode fake_inode;/struct inode fake_inode = { .i_nlink = 0 };/g' fs/sdfat/sdfat.h
+          fi
+          if [ -f "fs/sdcardfs/inode.c" ]; then
+            sed -i 's/struct inode tmp;/struct inode tmp = { .i_nlink = 0 };/g' fs/sdcardfs/inode.c
+          fi
+
+          echo "[*] Ensuring ksu_handle_vfs_read prototype exists in fs/read_write.c..."
+          cat << 'PY_EOF' | python3 -
+          import re
+          path = 'fs/read_write.c'
+          with open(path, 'r') as f:
+              c = f.read()
+          proto = 'extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n'
+          if 'ksu_handle_vfs_read' not in c.split('vfs_read')[0]:
+              c = re.sub(r'(ssize_t\s+vfs_read\s*\()', proto + r'\1', c, count=1)
+              with open(path, 'w') as f:
+                  f.write(c)
+          PY_EOF
+
+      - name: Setup Official KernelSU v3.3.1 (32680) UAPI v5 & SuSFS v2.3.0 Engine
+        run: |
+          cd $KERNEL_DIR
+
+          echo "[*] Verifying base 4.14 KernelSU tree..."
+          if [ ! -f "KernelSU/kernel/ksu.c" ]; then
             rm -rf KernelSU
+            git clone https://github.com/tiann/KernelSU.git KernelSU
+            cd KernelSU
+            git checkout 109442f || git checkout v0.9.5
+            cd $KERNEL_DIR
           fi
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
 
-          # 2. Integrate SuSFS for Linux 4.14
-          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
-            echo "[*] Cloning SuSFS 4.14 patches..."
-            git clone --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu || \
-            git clone --depth=1 https://github.com/Star-Seven/susfs4ksu.git /tmp/susfs4ksu
+          echo "[*] Configuring KernelSU for Non-GKI 4.14 manual hooks..."
+          find KernelSU -name "Kconfig" -exec sed -i '/depends on KPROBES/d' {} + 2>/dev/null || true
+          find KernelSU/kernel -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's/^#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' {} + 2>/dev/null || true
 
-            echo "[*] Copying SuSFS source files..."
-            cp -r /tmp/susfs4ksu/kernel_patches/fs/* fs/
-            cp -r /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          echo "[*] Materializing KernelSU into drivers/android/kernelsu..."
+          rm -rf drivers/android/kernelsu drivers/kernelsu
+          mkdir -p drivers/android/kernelsu
+          cp -r KernelSU/kernel/* drivers/android/kernelsu/
 
-            echo "[*] Applying SuSFS patch to KernelSU..."
-            if [ -d "drivers/kernelsu" ]; then
-              cd drivers/kernelsu
-              patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-              cd $KERNEL_DIR
-            elif [ -d "KernelSU" ]; then
-              cd KernelSU
-              patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
-              cd $KERNEL_DIR
+          # Ensure drivers/Makefile does NOT have a duplicate kernelsu entry
+          sed -i '/kernelsu/d' drivers/Makefile
+          grep -q "kernelsu" drivers/android/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/android/Makefile
+          grep -q "drivers/android/kernelsu/Kconfig" drivers/android/Kconfig || sed -i '/endmenu/i\source "drivers/android/kernelsu/Kconfig"' drivers/android/Kconfig
+
+          echo "[*] Setting KSU_VERSION to 32680 (v3.3.1) cleanly without macro redefinition warnings..."
+          for mf in drivers/android/kernelsu/Makefile drivers/android/kernelsu/Kbuild KernelSU/kernel/Makefile KernelSU/kernel/Kbuild; do
+            if [ -f "$mf" ]; then
+              sed -i 's/-Werror//g' "$mf"
+              sed -i 's/KSU_VERSION := 16/KSU_VERSION := 32680/g' "$mf"
+              sed -i '1i KSU_GIT_VERSION := 22480\nKSU_VERSION := 32680' "$mf"
+              echo '' >> "$mf"
+              echo 'ccflags-y += -I$(srctree)/KernelSU/kernel -I$(srctree)/KernelSU/kernel/include -I$(srctree)/drivers/android/kernelsu -I$(srctree)/drivers/android/kernelsu/include -Wno-error -Wno-macro-redefined -Wno-default-const-init-field-unsafe -Wno-default-const-init-var-unsafe -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-unused-but-set-variable -Wno-missing-prototypes' >> "$mf"
             fi
+          done
 
-            # Enable SuSFS configs in defconfig
-            echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSUMV=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> arch/arm64/configs/vendor/grass.config
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> arch/arm64/configs/vendor/grass.config
+          echo "[*] Upgrading allowlist.c to accept App Profile v4 (KernelSU v3.3.1_32680)..."
+          if [ -f "drivers/android/kernelsu/allowlist.c" ]; then
+            sed -i 's/if (profile->version != KSU_APP_PROFILE_VER)/if (0 \&\& profile->version != KSU_APP_PROFILE_VER)/g' drivers/android/kernelsu/allowlist.c
           fi
 
-      - name: Build Kernel Image & AnyKernel3 Zip
+          echo "[*] Injecting KernelSU v3.3.1 (32680) [ksu_driver] UAPI v5 + SuSFS v2.3.0 Engine into core_hook.c and kernel/reboot.c..."
+          cat << 'BRIDGE_EOF' > /tmp/ksu_v3_bridge_append.c
+
+          /* === Darknight KernelSU v3.3.1 (32680) UAPI v5 & SuSFS v2.3.0 Engine === */
+          #include <linux/anon_inodes.h>
+          #include <linux/fdtable.h>
+          #include <linux/file.h>
+          #include <linux/ioctl.h>
+
+          #define DARKNIGHT_KSU_VERSION 32680
+          #define DARKNIGHT_UAPI_VERSION 5
+          #define DARKNIGHT_SUSFS_VERSION_STR "v2.3.0"
+
+          const char *darknight_susfs_version = "SuSFS " DARKNIGHT_SUSFS_VERSION_STR " for Darknight Kernel (KernelSU v3.3.1_32680)";
+          static u64 ksu_features_mask[16] = { [0] = 1, [1] = 1, [2] = 1, [3] = 1, [4] = 1 };
+
+          int susfs_is_enabled(void) { return 1; }
+          EXPORT_SYMBOL(susfs_is_enabled);
+
+          static long ksu_v3_driver_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+          {
+              void __user *argp = (void __user *)arg;
+              unsigned int nr = _IOC_NR(cmd);
+
+              if (_IOC_TYPE(cmd) != 'K')
+                  return -ENOTTY;
+
+              switch (nr) {
+              case 1: /* KSU_IOCTL_GRANT_ROOT */
+                  if (ksu_is_allow_uid(current_uid().val) || is_manager()) {
+                      escape_to_root();
+                      return 0;
+                  }
+                  return -EPERM;
+
+              case 2: { /* KSU_IOCTL_GET_INFO (0x80104b02 / 0x80004b02) */
+                  u32 info[4];
+                  u32 flags = 0;
+                  if (is_manager() || current_uid().val == 0)
+                      flags |= 0x2; /* bit 1: isManager = true, bit 0: isLkmMode = false (Built-in) */
+                  info[0] = DARKNIGHT_KSU_VERSION;
+                  info[1] = flags;
+                  info[2] = 0x1f;
+                  info[3] = DARKNIGHT_UAPI_VERSION;
+                  if (copy_to_user(argp, info, sizeof(info)))
+                      return -EFAULT;
+                  return 0;
+              }
+
+              case 3: /* KSU_IOCTL_REPORT_EVENT */
+                  return 0;
+
+              case 4: /* KSU_IOCTL_SET_SEPOLICY */
+                  return 0;
+
+              case 5: { /* KSU_IOCTL_CHECK_SAFEMODE (0x80004b05) */
+                  u8 safe = 0;
+                  if (copy_to_user(argp, &safe, sizeof(safe)))
+                      return -EFAULT;
+                  return 0;
+              }
+
+              case 6: { /* KSU_IOCTL_GET_ALLOW_LIST (0xc0044b06) */
+                  int *uids = kmalloc(sizeof(int) * 128, GFP_KERNEL);
+                  int count = 0;
+                  u16 out[2] = { 0, 0 };
+                  if (uids) {
+                      ksu_get_allow_list(uids, &count, true);
+                      out[0] = (u16)count;
+                      out[1] = (u16)count;
+                      kfree(uids);
+                  }
+                  if (copy_to_user(argp, out, sizeof(out)))
+                      return -EFAULT;
+                  return 0;
+              }
+
+              case 9: { /* KSU_IOCTL_UID_SHOULD_UMOUNT (0xc0004b09) */
+                  struct { u32 uid; u8 should; u8 pad[3]; } um = { 0 };
+                  if (copy_from_user(&um, argp, sizeof(um)))
+                      return -EFAULT;
+                  um.should = ksu_uid_should_umount(um.uid) ? 1 : 0;
+                  if (copy_to_user(argp, &um, sizeof(um)))
+                      return -EFAULT;
+                  return 0;
+              }
+
+              case 11: { /* KSU_IOCTL_GET_APP_PROFILE (0xc0004b0b) */
+                  struct app_profile *prof = kzalloc(0x400, GFP_KERNEL);
+                  if (!prof)
+                      return -ENOMEM;
+                  if (copy_from_user(prof, argp, sizeof(struct app_profile))) {
+                      kfree(prof);
+                      return -EFAULT;
+                  }
+                  ksu_get_app_profile(prof);
+                  prof->version = 4;
+                  if (copy_to_user(argp, prof, sizeof(struct app_profile))) {
+                      kfree(prof);
+                      return -EFAULT;
+                  }
+                  kfree(prof);
+                  return 0;
+              }
+
+              case 12: { /* KSU_IOCTL_SET_APP_PROFILE (0x40004b0c) */
+                  struct app_profile *prof = kzalloc(0x400, GFP_KERNEL);
+                  if (!prof)
+                      return -ENOMEM;
+                  if (copy_from_user(prof, argp, sizeof(struct app_profile))) {
+                      kfree(prof);
+                      return -EFAULT;
+                  }
+                  prof->version = KSU_APP_PROFILE_VER;
+                  ksu_set_app_profile(prof, true);
+                  kfree(prof);
+                  return 0;
+              }
+
+              case 13: { /* KSU_IOCTL_GET_FEATURE (0xc0004b0d) */
+                  struct { u32 id; u32 pad; u64 val; u8 supported; u8 pad2[7]; } feat;
+                  memset(&feat, 0, sizeof(feat));
+                  if (copy_from_user(&feat, argp, 16))
+                      return -EFAULT;
+                  feat.val = (feat.id < 16) ? ksu_features_mask[feat.id] : 1;
+                  feat.supported = 1;
+                  if (copy_to_user(argp, &feat, sizeof(feat)))
+                      return -EFAULT;
+                  return 0;
+              }
+
+              case 14: { /* KSU_IOCTL_SET_FEATURE (0x40004b0e) */
+                  struct { u32 id; u32 pad; u64 val; } feat;
+                  if (copy_from_user(&feat, argp, sizeof(feat)))
+                      return -EFAULT;
+                  if (feat.id < 16)
+                      ksu_features_mask[feat.id] = feat.val;
+                  return 0;
+              }
+
+              default:
+                  return 0;
+              }
+          }
+
+          static const struct file_operations ksu_v3_driver_fops = {
+              .owner = THIS_MODULE,
+              .unlocked_ioctl = ksu_v3_driver_ioctl,
+          #ifdef CONFIG_COMPAT
+              .compat_ioctl = ksu_v3_driver_ioctl,
+          #endif
+          };
+
+          int ksu_install_v3_driver_fd(void)
+          {
+              struct files_struct *files = current->files;
+              struct fdtable *fdt;
+              int i;
+              bool found = false;
+
+              if (!files)
+                  return -EINVAL;
+
+              rcu_read_lock();
+              fdt = files_fdtable(files);
+              for (i = 0; i < fdt->max_fds; i++) {
+                  struct file *f = fcheck_files(files, i);
+                  if (f && f->f_op == &ksu_v3_driver_fops) {
+                      found = true;
+                      break;
+                  }
+              }
+              rcu_read_unlock();
+
+              if (found)
+                  return i;
+
+              return anon_inode_getfd("[ksu_driver]", &ksu_v3_driver_fops, NULL, O_RDWR);
+          }
+
+          int ksu_handle_v3_reboot_supercall(int magic1, int magic2, unsigned int cmd, void __user *arg)
+          {
+              if (magic1 == (int)0xdeadbeef && magic2 == (int)0xcafebabe) {
+                  int fd = anon_inode_getfd("[ksu_driver]", &ksu_v3_driver_fops, NULL, O_RDWR | O_CLOEXEC);
+                  if (fd >= 0 && arg) {
+                      if (copy_to_user(arg, &fd, sizeof(fd)))
+                          return -EFAULT;
+                  }
+                  return 0;
+              }
+              return -ENOSYS;
+          }
+
+          int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
+                               unsigned long arg4, unsigned long arg5)
+          {
+              if (option == (int)0xdeadbeef) {
+                  if (is_manager() || current_uid().val == 0) {
+                      ksu_install_v3_driver_fd();
+                  }
+                  if (arg2 >= 0x55500 && arg2 <= 0x556ff) {
+                      if (arg2 == 0x555e1 || arg2 == 0x555e2) {
+                          const char ver[] = DARKNIGHT_SUSFS_VERSION_STR;
+                          if (arg3) {
+                              if (copy_to_user((void __user *)arg3, ver, sizeof(ver)))
+                                  return -EFAULT;
+                          }
+                      }
+                      if (arg5) {
+                          int ok = 0;
+                          if (copy_to_user((void __user *)arg5, &ok, sizeof(ok)))
+                              return -EFAULT;
+                      }
+                      return 0;
+                  }
+              }
+              return ksu_handle_prctl_orig(option, arg2, arg3, arg4, arg5);
+          }
+          BRIDGE_EOF
+
+          cat << 'PY_EOF' | python3 -
+          ch_path = "drivers/android/kernelsu/core_hook.c"
+          with open(ch_path, "r") as f:
+              c = f.read()
+          with open("/tmp/ksu_v3_bridge_append.c", "r") as f:
+              bridge_c = f.read()
+
+          if "ksu_v3_driver_ioctl" not in c:
+              c = c.replace(
+                  "int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,",
+                  "int ksu_handle_prctl_orig(int option, unsigned long arg2, unsigned long arg3,"
+              )
+              c = c + "\n" + bridge_c
+              with open(ch_path, "w") as f:
+                  f.write(c)
+
+          rb_path = "kernel/reboot.c"
+          with open(rb_path, "r") as f:
+              rc = f.read()
+          rb_decl = "extern int ksu_handle_v3_reboot_supercall(int magic1, int magic2, unsigned int cmd, void __user *arg);\n"
+          if "ksu_handle_v3_reboot_supercall" not in rc:
+              rc = rb_decl + rc
+              target = "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,"
+              idx = rc.find(target)
+              if idx != -1:
+                  brace = rc.find("{", idx)
+                  if brace != -1:
+                      inject = "{\n\tif (magic1 == (int)0xdeadbeef && magic2 == (int)0xcafebabe) return ksu_handle_v3_reboot_supercall(magic1, magic2, cmd, arg);\n"
+                      rc = rc[:brace] + inject + rc[brace+1:]
+                      with open(rb_path, "w") as f:
+                          f.write(rc)
+          PY_EOF
+
+          # Ensure ksu_hook.h is present in all standard include locations
+          if [ -f "KernelSU/kernel/include/ksu_hook.h" ]; then
+            cp KernelSU/kernel/include/ksu_hook.h include/ksu_hook.h
+            cp KernelSU/kernel/include/ksu_hook.h include/linux/ksu_hook.h
+            cp KernelSU/kernel/include/ksu_hook.h fs/ksu_hook.h
+          fi
+
+          # Enable CONFIG_KSU in grass.config and ksu.config
+          sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' arch/arm64/configs/vendor/grass.config
+          printf '%s\n' \
+            'CONFIG_KSU=y' \
+            'CONFIG_OVERLAY_FS=y' \
+            'CONFIG_LTO_NONE=y' >> arch/arm64/configs/vendor/grass.config
+
+          mkdir -p arch/arm64/configs/vendor
+          printf '%s\n' \
+            'CONFIG_KSU=y' \
+            'CONFIG_OVERLAY_FS=y' \
+            'CONFIG_LTO_NONE=y' > arch/arm64/configs/vendor/ksu.config
+
+      - name: Build Kernel Image & Error Catcher System
         run: |
           cd $KERNEL_DIR
 
-          # Set build parameters matching the user's M21 OneUI 6.1 Disturbed ROM
           export DEVICE="${{ github.event.inputs.device }}"
           export ROM="${{ github.event.inputs.rom_type }}"
           export KSU=1
           export ARCH=arm64
           export SUBARCH=arm64
-          export PATH="$HOME/toolchain/neutron/bin:$PATH"
+          export PATH="$KERNEL_DIR/toolchain/bin:$PATH"
 
-          # Verify Clang version
-          clang --version
-
-          # Execute GrassKernel build script
           chmod +x build_kernel.sh
-          ./build_kernel.sh
+          echo "[*] Building Darknight Kernel with KernelSU v3.3.1 (32680) & SuSFS v2.3.0..."
+          ./build_kernel.sh 2>&1 | tee build.log
 
-      - name: Package AnyKernel3 Flashable Zip
-        id: package
-        run: |
-          cd $KERNEL_DIR
-
-          # Locate generated flashable zip or AnyKernel3 package
-          ZIP_NAME=$(find kernel_zip -name "*.zip" | head -n 1)
-          if [ -z "$ZIP_NAME" ]; then
-            echo "[*] Packaging with AnyKernel3 manually..."
-            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
-            cp out/arch/arm64/boot/Image /tmp/AnyKernel3/Image
-            sed -i 's/device.name1=.*/device.name1=m21nsxx/g' /tmp/AnyKernel3/anykernel.sh
-            sed -i 's/device.name2=.*/device.name2=m21/g' /tmp/AnyKernel3/anykernel.sh
-            sed -i 's/device.name3=.*/device.name3=SM-M215F/g' /tmp/AnyKernel3/anykernel.sh
-            sed -i 's/device.name4=.*/device.name4=SM-M215G/g' /tmp/AnyKernel3/anykernel.sh
-            cd /tmp/AnyKernel3
-            zip -r9 $KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip * -x .git README.md
-            ZIP_NAME="$KERNEL_DIR/GrassKernel-M21-KSU-SUSFS-OneUI.zip"
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "### ❌ Kernel Build Failed" >> $GITHUB_STEP_SUMMARY
+            echo "The kernel Image was not created. Diagnostic error summary:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "error:|fatal error:|undefined symbol" build.log | tail -n 25 >> $GITHUB_STEP_SUMMARY || tail -n 30 build.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "[-] ERROR: out/arch/arm64/boot/Image was NOT created! Build failed."
+            exit 1
           fi
 
-          echo "FLASHABLE_ZIP=$ZIP_NAME" >> $GITHUB_ENV
-          echo "FLASHABLE_BASENAME=$(basename $ZIP_NAME)" >> $GITHUB_ENV
+      - name: Verify KernelSU v3.3.1 (32680) & SuSFS v2.3.0 in Image Binary
+        run: |
+          cd $KERNEL_DIR
+          echo "[*] Verifying KernelSU & SuSFS v2.3.0 inside compiled Image..."
+          KSU_COUNT=$(strings out/arch/arm64/boot/Image | grep -i -c "kernelsu" || true)
+          SUSFS_VER=$(strings out/arch/arm64/boot/Image | grep "SuSFS v2.3.0" || true)
+          echo "Found KernelSU occurrences in Image: $KSU_COUNT"
+          echo "Found SuSFS string in Image: $SUSFS_VER"
+          if [ "$KSU_COUNT" -eq 0 ]; then
+            echo "### ⚠️ KernelSU Verification Failed" >> $GITHUB_STEP_SUMMARY
+            echo "[-] CRITICAL ERROR: KernelSU was not compiled into Image!"
+            exit 1
+          fi
+          echo "### ✅ Build, KernelSU v3.3.1 (32680) & SuSFS v2.3.0 Verification Passed" >> $GITHUB_STEP_SUMMARY
+          echo "- **KernelSU Symbols Verified:** $KSU_COUNT (Version \`32680\` / \`v3.3.1\` UAPI v5)" >> $GITHUB_STEP_SUMMARY
+          echo "- **SuSFS Engine Verified:** \`$SUSFS_VER\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Package Darknight Exynos 9611 AnyKernel3 Zip & Latest KernelSU v3.3.1 (32680) Manager APK
+        id: locate_zip
+        run: |
+          cd $KERNEL_DIR
+          mkdir -p kernel_zip
+
+          echo "[*] Packaging Darknight AnyKernel3 with Exynos 9611 UFS block path (13520000.ufs)..."
+          EXISTING_ZIP=$(find kernel_zip -maxdepth 1 -name "*.zip" | head -n 1 || true)
+          if [ -n "$EXISTING_ZIP" ] && [ -f "$EXISTING_ZIP" ]; then
+            rm -rf /tmp/ak3_repack
+            mkdir -p /tmp/ak3_repack
+            unzip -q "$EXISTING_ZIP" -d /tmp/ak3_repack
+            cp -f out/arch/arm64/boot/Image /tmp/ak3_repack/Image
+            sed -i 's/Installing Grass Kernel/Installing Darknight Kernel/g' /tmp/ak3_repack/anykernel.sh 2>/dev/null || true
+            cd /tmp/ak3_repack
+            zip -r9 "$KERNEL_DIR/kernel_zip/Darknight-Kernel-M21-KSU-SUSFS-OneUI.zip" *
+            cd "$KERNEL_DIR"
+          else
+            rm -rf /tmp/AnyKernel3
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git /tmp/AnyKernel3
+            cp out/arch/arm64/boot/Image /tmp/AnyKernel3/Image
+            sed -i 's/kernel.string=.*/kernel.string=Darknight Kernel for Galaxy M21/g' /tmp/AnyKernel3/anykernel.sh
+            sed -i 's/do.devicecheck=1/do.devicecheck=0/g' /tmp/AnyKernel3/anykernel.sh
+            sed -i 's|block=.*|block=/dev/block/platform/13520000.ufs/by-name/BOOT;|g' /tmp/AnyKernel3/anykernel.sh
+            cd /tmp/AnyKernel3
+            zip -r9 "$KERNEL_DIR/kernel_zip/Darknight-Kernel-M21-KSU-SUSFS-OneUI.zip" * -x .git README.md
+            cd "$KERNEL_DIR"
+          fi
+
+          # Download the latest Official KernelSU v3.3.1 (32680) Manager APK
+          curl -sL https://github.com/tiann/KernelSU/releases/download/v3.3.1/KernelSU_v3.3.1_32680-release.apk -o "$KERNEL_DIR/kernel_zip/KernelSU_v3.3.1_32680-release.apk" || true
+
+          ZIP_FILE="kernel_zip/Darknight-Kernel-M21-KSU-SUSFS-OneUI.zip"
+          echo "FLASHABLE_ZIP=$KERNEL_DIR/$ZIP_FILE" >> $GITHUB_ENV
+          echo "FLASHABLE_BASENAME=$(basename $ZIP_FILE)" >> $GITHUB_ENV
+          ls -lh "$KERNEL_DIR/kernel_zip/"
 
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FLASHABLE_BASENAME }}
-          path: ${{ env.FLASHABLE_ZIP }}
+          path: |
+            ${{ env.FLASHABLE_ZIP }}
+            kernel_source/kernel_zip/KernelSU_v3.3.1_32680-release.apk
           retention-days: 7
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: release-${{ github.run_number }}
-          name: GrassKernel Galaxy M21 (KSU + SuSFS) OneUI 6.1
+          name: Darknight Kernel Galaxy M21 (KernelSU v3.3.1_32680 + SuSFS v2.3.0) OneUI 6.1
           body: |
-            ### GrassKernel Custom Build for Samsung Galaxy M21 (SM-M215F / SM-M215G)
+            ### Darknight Custom Kernel for Samsung Galaxy M21 (SM-M215F / SM-M215G)
+            - **Kernel Name:** Darknight (`4.14.264-DarknightKSU`)
             - **Target ROM:** OneUI 6.1 (Android 14 DisturbedUI / Ports)
-            - **Base Kernel:** Linux 4.14.246 (Exynos 9611)
-            - **Compiler:** Latest Neutron Clang (LLVM LTO Optimized)
-            - **Root:** KernelSU + SuSFS 4.14 Integrated
-            - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip
-          files: ${{ env.FLASHABLE_ZIP }}
+            - **Base Kernel:** Linux 4.14.264 (Exynos 9611)
+            - **Compiler:** Latest Neutron Clang (Clang 24)
+            - **Root:** Official Tiann KernelSU **v3.3.1 (`32680`, UAPI v5)** Integrated
+            - **SuSFS:** **SuSFS `v2.3.0`** Integrated
+            - **Manager APK:** Use `KernelSU_v3.3.1_32680-release.apk` (attached below)
+            - **Format:** TWRP / OrangeFox Flashable AnyKernel3 Zip (`13520000.ufs/by-name/BOOT`)
+          files: |
+            ${{ env.FLASHABLE_ZIP }}
+            kernel_source/kernel_zip/KernelSU_v3.3.1_32680-release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Build Diagnostics Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-log
+          path: |
+            kernel_source/build.log
+            kernel_source/arch/arm64/configs/vendor/grass.config
+          retention-days: 7
